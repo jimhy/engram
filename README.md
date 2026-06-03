@@ -78,10 +78,13 @@ Claude Code allows only **one** status line. If you already use another (e.g. [c
 
 - `ENGRAM_REVIEWER_CLI` — which CLI the `SessionEnd` reviewer launches (default `claude`). Set it if your CLI isn't named `claude` (e.g. a local build).
 
-## Limitations
+## Platforms & releases
 
-- Ships a Windows `bin/engram.exe` today; other platforms need a cross-compiled binary (Linux / macOS) — contributions welcome.
-- On Windows, hooks run under bash, so paths use forward slashes (handled by the bundled scripts).
+`bin/engram` is a small launcher that picks the right binary for your OS. Pushing a tag (`v*`) runs GitHub Actions ([`.github/workflows/release.yml`](./.github/workflows/release.yml)) to cross-compile **Windows / Linux x86_64 / macOS x86_64 / macOS arm64**, commit the binaries into `bin/`, and attach them to a GitHub Release. (Linux arm64 isn't built yet — PRs welcome.)
+
+Engine source lives in [`engine/`](./engine) (Rust). Build locally with `cargo build --release` inside `engine/`.
+
+On Windows, hooks run under bash, so paths use forward slashes (handled by the bundled launcher/scripts).
 
 ## License
 

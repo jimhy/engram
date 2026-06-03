@@ -78,10 +78,13 @@ Claude Code 全局只允许**一个** statusLine。若你已在用别的（如 [
 
 - `ENGRAM_REVIEWER_CLI` —— `SessionEnd` 复盘者启动哪个 CLI（默认 `claude`）。若你的 CLI 不叫 `claude`（比如某个本地版），设这个变量指向它。
 
-## 局限
+## 平台与发布
 
-- 目前 `bin/` 只带 Windows 的 `engram.exe`；其它平台需交叉编译的二进制（Linux / macOS）——欢迎贡献。
-- Windows 上 hook 经 bash 执行，路径用正斜杠（随附脚本已处理）。
+`bin/engram` 是个小启动器，按你的操作系统挑对应二进制。**打 tag（`v*`）会触发 GitHub Actions**（[`.github/workflows/release.yml`](./.github/workflows/release.yml)）交叉编译 **Windows / Linux x86_64 / macOS x86_64 / macOS arm64**，把二进制提交进 `bin/` 并发布到 GitHub Release。（Linux arm64 暂未构建——欢迎 PR。）
+
+引擎源码在 [`engine/`](./engine)（Rust）。本地构建：在 `engine/` 里 `cargo build --release`。
+
+Windows 上 hook 经 bash 执行，路径用正斜杠（随附启动器/脚本已处理）。
 
 ## 许可证
 

@@ -1,0 +1,89 @@
+name: release
+
+# 打 tag（v*）时交叉编译各平台二进制，提交进 bin/ 并发布 Release。
+# 也可在 Actions 页手动触发（workflow_dispatch）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            out: engram.exe
+            asset: engram-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            out: engram
+            asset: engram-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            out: engram
+            asset: engram-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            out: engram
+            asset: engram-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build engine
+        working-directory: engine
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "engine/target/${{ matrix.target }}/release/${{ matrix.out }}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  publish:
+    name: commit binaries + release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect binaries into bin/
+        shell: bash
+        run: |
+          mkdir -p bin
+          find artifacts -type f -exec cp {} bin/ \;
+          chmod +x bin/engram-linux-* bin/engram-macos-* 2>/dev/null || true
+          ls -la bin
+      - name: Commit binaries to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin
+          if git diff --cached --quiet; then
+            echo "no binary changes"
+          else
+            git commit -m "ci: cross-platform binaries for ${GITHUB_REF_NAME:-manual}"
+            git push
+          fi
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/engram-*

@@ -10,7 +10,7 @@ if ($env:ENGRAM_REVIEWER -eq '1') { exit 0 }
 
 $root = $env:CLAUDE_PLUGIN_ROOT
 if (-not $root) { exit 0 }
-$ENGRAM = Join-Path $root 'bin\engram.exe'
+$ENGRAM = Join-Path $root 'bin\engram-windows-x86_64.exe'
 $PROMPT_TEMPLATE = Join-Path $root 'scripts\reviewer-prompt.md'
 $CLAUDE = if ($env:ENGRAM_REVIEWER_CLI) { $env:ENGRAM_REVIEWER_CLI } else { 'claude' }
 

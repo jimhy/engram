@@ -4,5 +4,9 @@ Thumbs.db
 *.swp
 *~
 
-# local logs (engram writes runtime files under ~/.engram and TEMP, not in-repo)
+# Rust build output (engine source committed, build artifacts not)
+engine/target/
+
+# local runtime / data - never commit dbs or logs
+*.redb
 *.log

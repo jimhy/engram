@@ -1,0 +1,20 @@
+[package]
+name = "engram"
+version = "0.1.0"
+edition = "2021"
+description = "Engram 类人分层记忆系统引擎"
+
+# 同时提供库 target（供集成测试直接调用 store 等模块）与二进制 target（CLI 入口）。
+[lib]
+name = "engram"
+path = "src/lib.rs"
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+redb = "2"

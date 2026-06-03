@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# engram launcher — picks the right platform binary and execs it.
+# Hooks / commands call this (via bash) so one config works on win / linux / macOS.
+set -e
+dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    bin="$dir/engram-windows-x86_64.exe" ;;
+  Darwin)
+    if [ "$(uname -m)" = "arm64" ]; then bin="$dir/engram-macos-aarch64"; else bin="$dir/engram-macos-x86_64"; fi ;;
+  Linux)
+    if [ "$(uname -m)" = "aarch64" ]; then bin="$dir/engram-linux-aarch64"; else bin="$dir/engram-linux-x86_64"; fi ;;
+  *)
+    bin="$dir/engram-windows-x86_64.exe" ;;
+esac
+if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
+  echo "engram: no binary for this platform at $bin (run a tagged release to build it)" >&2
+  exit 127
+fi
+exec "$bin" "$@"

@@ -1,0 +1,6 @@
+# redb 用内存映射文件；Windows 上多个测试线程并行 mmap/munmap 偶发
+# STATUS_ACCESS_VIOLATION（崩在测试二进制里，与被测逻辑、与生产无关——生产是
+# 各自独立进程 + redb 跨进程文件锁的并发模型）。
+# 强制测试单线程运行，保证套件稳定、不弹崩溃弹窗。
+[env]
+RUST_TEST_THREADS = "1"
