@@ -25,6 +25,16 @@
 
 重启一个会话；若提示就在 `/hooks` 里批准。引擎是随插件携带的单个自包含 Rust 二进制——别的什么都不用装。
 
+## 更新
+
+```
+/plugin marketplace update engram-marketplace
+/plugin update engram
+/reload-plugins
+```
+
+之后 `/doctor` 应无插件报错。（若 `/plugin update` 没拉到新版本，就 `/plugin uninstall engram` 再 `/plugin install engram` 重新克隆最新版。）
+
 ## 你会得到什么
 
 **全自动记忆，读写双向：**

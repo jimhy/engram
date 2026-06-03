@@ -25,6 +25,16 @@ The result: a tiny, always-relevant **hot index** in your context, plus a much l
 
 Restart a session; approve the hooks in `/hooks` if prompted. The engine is a single self-contained Rust binary shipped with the plugin — nothing else to install.
 
+## Update
+
+```
+/plugin marketplace update engram-marketplace
+/plugin update engram
+/reload-plugins
+```
+
+Then `/doctor` should report no plugin errors. (If `/plugin update` doesn't pick up the new version, `/plugin uninstall engram` then `/plugin install engram` re-clones the latest.)
+
 ## What you get
 
 **Automatic memory, both directions:**
