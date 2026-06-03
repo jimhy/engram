@@ -1,0 +1,8 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# local logs (engram writes runtime files under ~/.engram and TEMP, not in-repo)
+*.log

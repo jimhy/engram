@@ -1,0 +1,35 @@
+{
+  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/engram.exe\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-file \"$HOME/.engram/status.txt\" --log \"$HOME/.engram/hook.log\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/engram.exe\" hot-index --from-hook-stdin --emit json --hook-event UserPromptSubmit --state \"$HOME/.engram/active.state\" --status-file \"$HOME/.engram/status.txt\" --log \"$HOME/.engram/hook.log\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-review.ps1\""
+          }
+        ]
+      }
+    ]
+  }
+}

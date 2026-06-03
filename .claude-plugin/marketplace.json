@@ -1,0 +1,14 @@
+{
+  "name": "engram-marketplace",
+  "owner": { "name": "jimhyliu", "email": "jimhyliu@gmail.com" },
+  "plugins": [
+    {
+      "name": "engram",
+      "source": "./",
+      "description": "仿人脑分层长期记忆系统：会话注入记忆、自动复盘巩固、动态挂载子项目记忆。单 Rust 二进制、零依赖。",
+      "category": "productivity",
+      "keywords": ["memory", "engram", "rust", "recall"],
+      "tags": ["memory", "persistence", "productivity"]
+    }
+  ]
+}
