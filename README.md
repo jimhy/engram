@@ -41,9 +41,9 @@ Then `/doctor` should report no plugin errors. (If `/plugin update` doesn't pick
 
 | Hook | What it does |
 |------|--------------|
-| `SessionStart` | Injects the **hot index** (relevant memory) into context |
+| `SessionStart` | Injects the **hot index** (relevant memory) into context; also **catches up** any consolidation a previous session didn't finish (crash / abrupt exit) |
 | `UserPromptSubmit` | **Dynamically mounts** the L4 memory of whichever sub-project you're working on — re-injects only when the active project changes |
-| `SessionEnd` | Spins up an **independent reviewer** that reads the transcript and consolidates: writes new memories, promotes/demotes, supersedes, merges |
+| `SessionEnd` | Spins up an **independent reviewer** that consolidates only the **increment since the last watermark** (token-thrifty on long / resumed sessions): writes new memories, promotes/demotes, supersedes, merges |
 
 **Slash commands:** `/engram list` · `/engram recall <query>` · `/engram status` · `/engram render`
 
