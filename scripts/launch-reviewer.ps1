@@ -53,4 +53,16 @@ Set-Content -LiteralPath $promptFile -Value $prompt -Encoding UTF8
 $env:ENGRAM_REVIEWER = '1'
 $outFile = Join-Path $env:TEMP ("engram-review-out-" + $PID + ".txt")
 $errFile = Join-Path $env:TEMP ("engram-review-err-" + $PID + ".txt")
-Start-Process -FilePath $Cli -ArgumentList '-p' -RedirectStandardInput $promptFile -RedirectStandardOutput $outFile -RedirectStandardError $errFile -NoNewWindow
+# Launch via cmd.exe so npm shims resolve: Start-Process -FilePath 'claude' would grab
+# the extension-less bash shim (npm installs claude / claude.cmd / claude.ps1 side by side)
+# and fail with "%1 is not a valid Win32 application". cmd's own command resolution finds
+# claude.cmd, and the prompt is piped in via redirected stdin. Wrapped so a launch failure
+# never bubbles up and breaks the session (esp. SessionStart catch-up).
+$comspec = if ($env:ComSpec) { $env:ComSpec } else { 'cmd.exe' }
+try {
+    Start-Process -FilePath $comspec -ArgumentList '/c', $Cli, '-p' `
+        -RedirectStandardInput $promptFile -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+        -NoNewWindow -ErrorAction Stop
+} catch {
+    Write-Host ("engram: failed to launch reviewer: " + $_.Exception.Message)
+}
