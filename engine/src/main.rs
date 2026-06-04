@@ -47,6 +47,7 @@ use engram::commands::{
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::model::{Level, Memory, Pointer, Status};
 use engram::render::{load_store_entries, render};
+use engram::session::{self, Pending};
 use engram::store::{self, StoreError};
 use redb::Database;
 
@@ -370,6 +371,47 @@ enum Command {
         #[arg(long)]
         now: Option<f64>,
     },
+    /// hook 用（SessionEnd）：算 transcript 相对水位线的增量，切片 + 落 pending 标记，
+    /// 输出复盘所需单行 JSON（`action`=`review` 带切片/库路径，或 `skip` 表无新增）。
+    ReviewPrepare {
+        /// 原始 transcript（JSONL）路径。
+        #[arg(long)]
+        transcript: PathBuf,
+        /// 会话 id（pending / 切片文件名前缀）。
+        #[arg(long)]
+        session_id: String,
+        /// 水位线文件路径（记录各 transcript 已巩固行数）。
+        #[arg(long)]
+        watermark: PathBuf,
+        /// pending 与切片的存放目录（如 `~/.engram/pending`）。
+        #[arg(long)]
+        work_dir: PathBuf,
+        /// 公共库路径（透传给复盘者）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库路径（透传给复盘者）。
+        #[arg(long)]
+        project_db: PathBuf,
+        /// 项目名（透传给复盘者）。
+        #[arg(long)]
+        project_name: String,
+    },
+    /// hook 用（SessionStart）：扫 `work-dir` 残留 pending（上次起了复盘者却没收尾），
+    /// 挑**最近一场**补跑、清掉更早的，输出复盘所需单行 JSON（`action`=`review`|`none`）。
+    CatchupScan {
+        /// pending 与切片的存放目录（如 `~/.engram/pending`）。
+        #[arg(long)]
+        work_dir: PathBuf,
+    },
+    /// 复盘者收尾：把水位线推进到 pending 的 `end_line`，删除该 pending 与其切片。
+    ConsolidateDone {
+        /// 待收尾的 pending 标记文件路径。
+        #[arg(long)]
+        pending: PathBuf,
+        /// 水位线文件路径。
+        #[arg(long)]
+        watermark: PathBuf,
+    },
 }
 
 /// 取系统当前时间的 unix 秒（f64）。
@@ -679,6 +721,27 @@ fn main() -> ExitCode {
             format: &format,
             now,
         }),
+        Command::ReviewPrepare {
+            transcript,
+            session_id,
+            watermark,
+            work_dir,
+            general_db,
+            project_db,
+            project_name,
+        } => run_review_prepare(ReviewPrepareArgs {
+            transcript: &transcript,
+            session_id: &session_id,
+            watermark: &watermark,
+            work_dir: &work_dir,
+            general_db: &general_db,
+            project_db: &project_db,
+            project_name: &project_name,
+        }),
+        Command::CatchupScan { work_dir } => run_catchup_scan(&work_dir),
+        Command::ConsolidateDone { pending, watermark } => {
+            run_consolidate_done(&pending, &watermark)
+        }
     }
 }
 
@@ -953,6 +1016,174 @@ fn run_resolve(project_dir: Option<&Path>, general_db: Option<&Path>, format: &s
         }
         other => {
             eprintln!("resolve 失败：未知 --format {other}（应为 env|json）");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `review-prepare` 子命令的全部参数（聚成结构体，规避过多形参）。
+struct ReviewPrepareArgs<'a> {
+    transcript: &'a Path,
+    session_id: &'a str,
+    watermark: &'a Path,
+    work_dir: &'a Path,
+    general_db: &'a Path,
+    project_db: &'a Path,
+    project_name: &'a str,
+}
+
+/// 执行 `review-prepare`（SessionEnd 调）：算增量 → 切片 → 落 pending → 打印复盘 JSON。
+///
+/// 无新增（transcript 行数 ≤ 水位线）时打印 `{"action":"skip"}` 并成功退出；否则把
+/// `[水位线+1 .. 末尾]` 切到 `<work-dir>/<sid>.slice.jsonl`、写 `<work-dir>/<sid>.json`
+/// pending 标记，再打印 `{"action":"review", ...}`（含切片、pending、库路径等），供
+/// 调用脚本据以起复盘者。
+fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
+    let end = match session::count_lines(args.transcript) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("review-prepare 失败：数 transcript 行数失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let transcript_key = args.transcript.to_string_lossy().to_string();
+    let wm = session::read_watermark(args.watermark);
+    let start = wm.get(&transcript_key).copied().unwrap_or(0);
+    if end <= start {
+        println!(r#"{{"action":"skip"}}"#);
+        return ExitCode::SUCCESS;
+    }
+
+    let slice_path = args
+        .work_dir
+        .join(format!("{}.slice.jsonl", args.session_id));
+    if let Err(e) = session::slice_lines(args.transcript, start, end, &slice_path) {
+        eprintln!("review-prepare 失败：切片失败：{e}");
+        return ExitCode::FAILURE;
+    }
+
+    let Some(now) = resolve_now(None) else {
+        return ExitCode::FAILURE;
+    };
+    let pending_path = args.work_dir.join(format!("{}.json", args.session_id));
+    let pending = Pending {
+        session_id: args.session_id.to_string(),
+        transcript: transcript_key,
+        slice: slice_path.to_string_lossy().to_string(),
+        start_line: start,
+        end_line: end,
+        general_db: args.general_db.to_string_lossy().to_string(),
+        project_db: args.project_db.to_string_lossy().to_string(),
+        project_name: args.project_name.to_string(),
+        created_at: now,
+    };
+    if let Err(e) = session::write_pending(&pending_path, &pending) {
+        eprintln!("review-prepare 失败：写 pending 失败：{e}");
+        return ExitCode::FAILURE;
+    }
+
+    print_review_json(&pending, &pending_path)
+}
+
+/// 执行 `catchup-scan`（SessionStart 调）：补最近一场残留 pending、清掉更早的。
+///
+/// 无残留时打印 `{"action":"none"}`。有残留时取 `created_at` 最大的一条补跑（其余
+/// 连切片一并删除——轻量策略只补最近一场）；若其切片已不在则据 pending 区间重切，
+/// 再打印 `{"action":"review", ...}`。
+fn run_catchup_scan(work_dir: &Path) -> ExitCode {
+    let mut list = match session::list_pending(work_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("catchup-scan 失败：扫描 pending 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // 升序排列，末尾即最近一场。
+    let Some((pending_path, pending)) = list.pop() else {
+        println!(r#"{{"action":"none"}}"#);
+        return ExitCode::SUCCESS;
+    };
+    // 其余（更早的）残留连切片一并清掉：轻量策略只补最近一场。
+    for (pp, p) in &list {
+        session::remove_pending(pp, Path::new(&p.slice));
+    }
+
+    // 切片可能已被清理；不在就据 pending 记录的区间重切，保证复盘者有增量可读。
+    let slice_path = PathBuf::from(&pending.slice);
+    if !slice_path.exists() {
+        let transcript = PathBuf::from(&pending.transcript);
+        if let Err(e) =
+            session::slice_lines(&transcript, pending.start_line, pending.end_line, &slice_path)
+        {
+            eprintln!("catchup-scan 失败：重切增量失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    print_review_json(&pending, &pending_path)
+}
+
+/// 执行 `consolidate-done`（复盘者收尾调）：推进水位线 + 删 pending 与切片。
+///
+/// 读 pending → 把 `watermark[transcript]` 抬到 `end_line`（取较大值，幂等）→ 写回 →
+/// 删 pending 与切片，最后打印 `{"action":"done", ...}`。
+fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
+    let pending = match session::read_pending(pending_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("consolidate-done 失败：读 pending 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut wm = session::read_watermark(watermark);
+    let cur = wm.get(&pending.transcript).copied().unwrap_or(0);
+    if pending.end_line > cur {
+        wm.insert(pending.transcript.clone(), pending.end_line);
+    }
+    if let Err(e) = session::write_watermark(watermark, &wm) {
+        eprintln!("consolidate-done 失败：写水位线失败：{e}");
+        return ExitCode::FAILURE;
+    }
+    session::remove_pending(pending_path, Path::new(&pending.slice));
+
+    let obj = serde_json::json!({
+        "action": "done",
+        "transcript": pending.transcript,
+        "watermark_line": pending.end_line,
+    });
+    match serde_json::to_string(&obj) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("consolidate-done 失败：序列化输出失败：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 打印 `action=review` 的复盘 JSON（`review-prepare` 与 `catchup-scan` 共用）。
+///
+/// 含复盘者所需的一切：增量切片路径、待收尾的 pending 路径、库路径与项目名、行区间。
+fn print_review_json(pending: &Pending, pending_path: &Path) -> ExitCode {
+    let obj = serde_json::json!({
+        "action": "review",
+        "slice": pending.slice,
+        "pending": pending_path.to_string_lossy(),
+        "general_db": pending.general_db,
+        "project_db": pending.project_db,
+        "project_name": pending.project_name,
+        "start_line": pending.start_line,
+        "end_line": pending.end_line,
+    });
+    match serde_json::to_string(&obj) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("序列化复盘 JSON 失败：{e}");
             ExitCode::FAILURE
         }
     }

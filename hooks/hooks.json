@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-file \"$HOME/.engram/status.txt\" --log \"$HOME/.engram/hook.log\""
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start-catchup.ps1\""
           }
         ]
       }

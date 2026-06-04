@@ -1,18 +1,19 @@
 # engram plugin SessionEnd reviewer - thin glue (ASCII-only so PS 5.1 parses it).
-#   - locates the bundled binary + prompt via $env:CLAUDE_PLUGIN_ROOT
-#   - launches a headless reviewer via $env:ENGRAM_REVIEWER_CLI (default: claude)
-#   - all paths handed to the reviewer's bash are forward-slashed (bash eats backslashes)
-# Anti-recursion: the reviewer is itself a claude session; we mark it ENGRAM_REVIEWER=1 so its
-# own SessionEnd bails out here.
-
+#   - reads the hook stdin (transcript_path / cwd / session_id)
+#   - resolves db paths via the engine
+#   - review-prepare: computes the incremental slice (since the last watermark) + a pending
+#     marker, so the reviewer only consolidates NEW transcript lines (saves tokens on long
+#     / resumed sessions) and an abnormal exit can be caught up next start.
+#   - launches a headless reviewer on that slice via launch-reviewer.ps1
+# Anti-recursion: the reviewer is itself a claude session; ENGRAM_REVIEWER=1 makes its own
+# SessionEnd bail out here.
 $ErrorActionPreference = 'Stop'
 if ($env:ENGRAM_REVIEWER -eq '1') { exit 0 }
 
 $root = $env:CLAUDE_PLUGIN_ROOT
 if (-not $root) { exit 0 }
 $ENGRAM = Join-Path $root 'bin\engram-windows-x86_64.exe'
-$PROMPT_TEMPLATE = Join-Path $root 'scripts\reviewer-prompt.md'
-$CLAUDE = if ($env:ENGRAM_REVIEWER_CLI) { $env:ENGRAM_REVIEWER_CLI } else { 'claude' }
+$CLI = if ($env:ENGRAM_REVIEWER_CLI) { $env:ENGRAM_REVIEWER_CLI } else { 'claude' }
 
 # read hook stdin JSON
 $raw = [Console]::In.ReadToEnd()
@@ -20,39 +21,25 @@ $hook = $null
 if ($raw) { try { $hook = $raw | ConvertFrom-Json } catch { $hook = $null } }
 $transcript = if ($hook -and $hook.transcript_path) { $hook.transcript_path } else { '' }
 $cwd = if ($hook -and $hook.cwd) { $hook.cwd } else { (Get-Location).Path }
+$sid = if ($hook -and $hook.session_id) { $hook.session_id } else { [System.IO.Path]::GetFileNameWithoutExtension($transcript) }
+if (-not $transcript) { exit 0 }
+if (-not $sid) { $sid = 'session' }
 
 # resolve db paths via the engine
 $paths = & $ENGRAM resolve --project-dir $cwd --format json | ConvertFrom-Json
 
-# forward-slash everything that goes into the reviewer's bash commands
-$fs = { param($p) if ($p) { $p -replace '\\','/' } else { $p } }
-$general    = & $fs $paths.general_db
-$project    = & $fs $paths.project_db
-$pname      = $paths.project_name
-$transcript = & $fs $transcript
-$engramFwd  = & $fs $ENGRAM
+$work = Join-Path $env:USERPROFILE '.engram\pending'
+$wm = Join-Path $env:USERPROFILE '.engram\watermark.json'
 
-$tpl = Get-Content -Raw -Encoding UTF8 -LiteralPath $PROMPT_TEMPLATE
-$prompt = $tpl
-$prompt = $prompt.Replace('{{TRANSCRIPT}}', $transcript)
-$prompt = $prompt.Replace('{{GENERAL_DB}}', $general)
-$prompt = $prompt.Replace('{{PROJECT_DB}}', $project)
-$prompt = $prompt.Replace('{{PROJECT_NAME}}', $pname)
-$prompt = $prompt.Replace('{{ENGRAM}}', $engramFwd)
+# compute the incremental slice + drop a pending marker
+$planRaw = & $ENGRAM review-prepare --transcript $transcript --session-id $sid --watermark $wm --work-dir $work --general-db $paths.general_db --project-db $paths.project_db --project-name $paths.project_name
+$plan = $null
+if ($planRaw) { try { $plan = $planRaw | ConvertFrom-Json } catch { $plan = $null } }
+if (-not $plan -or $plan.action -ne 'review') { exit 0 }   # skip (no new lines) / parse error -> done
 
-if ($env:ENGRAM_HOOK_DRYRUN -eq '1') {
-    Write-Host "[dry-run] reviewer-cli = $CLAUDE"
-    Write-Host "[dry-run] engram       = $engramFwd"
-    Write-Host "[dry-run] transcript   = $transcript"
-    Write-Host "[dry-run] general      = $general"
-    Write-Host "[dry-run] project      = $project ($pname)"
-    Write-Host "[dry-run] prompt $($prompt.Length) chars"
-    exit 0
-}
-
-# launch headless reviewer in background; prompt via stdin (long multiline arg gets word-split)
-$promptFile = Join-Path $env:TEMP ("engram-review-" + $PID + ".txt")
-Set-Content -LiteralPath $promptFile -Value $prompt -Encoding UTF8
-$env:ENGRAM_REVIEWER = '1'
-Start-Process -FilePath $CLAUDE -ArgumentList '-p' -RedirectStandardInput $promptFile -RedirectStandardOutput (Join-Path $env:TEMP 'engram-review-out.txt') -RedirectStandardError (Join-Path $env:TEMP 'engram-review-err.txt') -NoNewWindow
+# launch the reviewer on the incremental slice
+& (Join-Path $root 'scripts\launch-reviewer.ps1') `
+    -Root $root -Engram $ENGRAM `
+    -Slice $plan.slice -GeneralDb $plan.general_db -ProjectDb $plan.project_db -ProjectName $plan.project_name `
+    -Pending $plan.pending -Watermark $wm -Cli $CLI
 exit 0
