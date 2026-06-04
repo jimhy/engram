@@ -54,6 +54,8 @@ pub enum StoreError {
     Commit(Box<redb::CommitError>),
     /// JSON 序列化 / 反序列化失败。
     Serde(Box<serde_json::Error>),
+    /// 准备数据库父目录时的文件系统错误（`create_dir_all` 失败，如无权限）。
+    Io(Box<std::io::Error>),
 }
 
 impl fmt::Display for StoreError {
@@ -65,6 +67,7 @@ impl fmt::Display for StoreError {
             StoreError::Storage(e) => write!(f, "表读写失败：{e}"),
             StoreError::Commit(e) => write!(f, "提交事务失败：{e}"),
             StoreError::Serde(e) => write!(f, "JSON 序列化/反序列化失败：{e}"),
+            StoreError::Io(e) => write!(f, "准备数据库目录失败：{e}"),
         }
     }
 }
@@ -79,6 +82,7 @@ impl std::error::Error for StoreError {
             StoreError::Storage(e) => Some(e.as_ref()),
             StoreError::Commit(e) => Some(e.as_ref()),
             StoreError::Serde(e) => Some(e.as_ref()),
+            StoreError::Io(e) => Some(e.as_ref()),
         }
     }
 }
@@ -119,6 +123,12 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        StoreError::Io(Box::new(e))
+    }
+}
+
 impl StoreError {
     /// 判断本错误是否为 redb 的「数据库已被占用，无法获取文件锁」这一类锁竞争错误。
     ///
@@ -144,10 +154,22 @@ impl StoreError {
 /// - `path`：数据库文件路径。
 ///
 /// # Errors
-/// - [`StoreError::Database`] —— 路径无法创建/打开（无权限、父目录不存在、
-///   文件已被其它进程占用、或文件格式损坏等）。其中「已被占用」会被
+/// - [`StoreError::Io`] —— 父目录不存在且 `create_dir_all` 失败（如无权限）。
+/// - [`StoreError::Database`] —— 路径无法创建/打开（文件已被其它进程占用、
+///   或文件格式损坏等）。其中「已被占用」会被
 ///   [`StoreError::is_lock_contention`] 识别，供 [`open`] 据此重试。
 fn open_once(path: &Path) -> Result<Database, StoreError> {
+    // redb 只建文件、不建目录：父目录缺失时 `Database::create` 会以「系统找不到
+    // 指定的路径」失败。全新安装时 `~/.engram/`（及项目库的 `<项目>/.claude/`）
+    // 尚未建立，若不先补建，任何只读命令（list/status/recall/render）都会在打开
+    // 公共库这一步直接报错退出——新用户会误以为插件坏了。这里先确保父目录存在，
+    // 让空库就地建出、显示「0 条」而非红色报错。`create_dir_all` 对已存在目录是
+    // no-op，对热路径无额外代价；任何 io 失败（无权限等）统一归 [`StoreError::Io`]。
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let db = Database::create(path)?;
     Ok(db)
 }
@@ -580,6 +602,33 @@ mod tests {
 
         drop(db);
         cleanup(&path);
+    }
+
+    // 8b. open 自动补建缺失的父目录：指向多级尚不存在目录也应成功建库并显示空。
+    //     这是「全新安装 ~/.engram/ 尚未创建时，只读命令不该报错退出」的回归测试。
+    #[test]
+    fn open_creates_missing_parent_dirs() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mut base = std::env::temp_dir();
+        base.push(format!("engram_store_mkparent_{pid}_{nanos}"));
+        // 故意多套两层尚不存在的子目录，模拟 ~/.engram/ 这类缺失的父目录链。
+        let nested = base.join("never").join("existed");
+        let path = nested.join("general.redb");
+        assert!(!nested.exists(), "前置：嵌套父目录应尚不存在");
+
+        let db = open(&path).expect("父目录不存在时 open 也应补建并成功");
+        assert!(path.exists(), "库文件应被就地创建");
+        assert!(
+            all(&db).expect("all 应成功").is_empty(),
+            "全新建出的库应为空（0 条），而非报错"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- retry_acquire 重试退避逻辑（用闭包注入，不依赖真实文件锁/计时）----
