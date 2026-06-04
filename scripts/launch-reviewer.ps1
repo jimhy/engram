@@ -47,22 +47,32 @@ if ($env:ENGRAM_HOOK_DRYRUN -eq '1') {
     return
 }
 
-# launch headless reviewer in background; prompt via stdin (long multiline arg gets word-split)
+# Launch the reviewer FULLY DETACHED so it never blocks the session. Two hard requirements,
+# both learned the hard way:
+#  1. npm ships `claude` as claude / claude.cmd / claude.ps1 side by side; Start-Process
+#     -FilePath 'claude' grabs the extension-less bash shim and dies ("%1 is not a valid
+#     Win32 application"). => go through cmd, whose own resolution finds claude.cmd.
+#  2. Start-Process -NoNewWindow (UseShellExecute=false) makes the child INHERIT this hook's
+#     stdout pipe handle, so Claude Code -- which captures the hook's stdout -- blocks until
+#     the reviewer EXITS (observed: a multi-minute hang on session start). Fix verified by
+#     experiment (10s -> 0.2s): write a one-shot .cmd that does its OWN stdio redirection,
+#     then Start-Process it with -WindowStyle Hidden (UseShellExecute=true), which does NOT
+#     inherit handles -> the hook returns instantly while the reviewer runs on, detached.
 $promptFile = Join-Path $env:TEMP ("engram-review-" + $PID + "-" + (Get-Random) + ".txt")
 Set-Content -LiteralPath $promptFile -Value $prompt -Encoding UTF8
+$outFile = Join-Path $env:TEMP ("engram-review-out-" + $PID + "-" + (Get-Random) + ".txt")
+$errFile = Join-Path $env:TEMP ("engram-review-err-" + $PID + "-" + (Get-Random) + ".txt")
+$cmdFile = Join-Path $env:TEMP ("engram-review-" + $PID + "-" + (Get-Random) + ".cmd")
+# one-shot batch: "<cli>" -p < "<prompt>" > "<out>" 2> "<err>"  (every path quoted for spaces)
+$line = '"' + $Cli + '" -p < "' + $promptFile + '" > "' + $outFile + '" 2> "' + $errFile + '"'
+# ANSI (system codepage) so a non-ASCII TEMP path (e.g. a Chinese Windows username) survives
+# when cmd reads the batch file.
+Set-Content -LiteralPath $cmdFile -Value $line -Encoding Default
+# ENGRAM_REVIEWER=1 is inherited by the launched process (ShellExecute passes the parent env),
+# so the reviewer's own SessionStart/SessionEnd hooks bail out -> no recursion.
 $env:ENGRAM_REVIEWER = '1'
-$outFile = Join-Path $env:TEMP ("engram-review-out-" + $PID + ".txt")
-$errFile = Join-Path $env:TEMP ("engram-review-err-" + $PID + ".txt")
-# Launch via cmd.exe so npm shims resolve: Start-Process -FilePath 'claude' would grab
-# the extension-less bash shim (npm installs claude / claude.cmd / claude.ps1 side by side)
-# and fail with "%1 is not a valid Win32 application". cmd's own command resolution finds
-# claude.cmd, and the prompt is piped in via redirected stdin. Wrapped so a launch failure
-# never bubbles up and breaks the session (esp. SessionStart catch-up).
-$comspec = if ($env:ComSpec) { $env:ComSpec } else { 'cmd.exe' }
 try {
-    Start-Process -FilePath $comspec -ArgumentList '/c', $Cli, '-p' `
-        -RedirectStandardInput $promptFile -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
-        -NoNewWindow -ErrorAction Stop
+    Start-Process -FilePath $cmdFile -WindowStyle Hidden -ErrorAction Stop
 } catch {
     Write-Host ("engram: failed to launch reviewer: " + $_.Exception.Message)
 }
