@@ -21,9 +21,10 @@ The result: a tiny, always-relevant **hot index** in your context, plus a much l
 ```
 /plugin marketplace add jimhy/engram
 /plugin install engram
+/reload-plugins
 ```
 
-Restart a session; approve the hooks in `/hooks` if prompted. The engine is a single self-contained Rust binary shipped with the plugin — nothing else to install.
+`/reload-plugins` (or restart a session) applies it; approve the hooks in `/hooks` if prompted. The engine is a single self-contained Rust binary shipped with the plugin — nothing else to install.
 
 ## Update
 
@@ -64,6 +65,22 @@ Memory is **tiered**, like human memory:
 - **Climbing requires earned activation; falling is cushioned** by the floor and a grace period — new and important memories aren't killed early.
 - **Consolidation** runs at session end via an *independent* `claude -p` reviewer reading the transcript, so the judgment of "what was actually used / worth keeping" isn't self-serving.
 
+### What goes in each tier
+
+A memory is only worth keeping if it **can't be cheaply recovered** from the code/docs/git — engram stores the *complement* of your artifacts (intent, the "why", dead-ends, decisions, open loops), distilled into a one-line cue + a pointer to the ground truth.
+
+**General — cross-project, in the shared store (`~/.engram/general.redb`):**
+- **L1** — core identity & always-on global rules: who you are, how to address you, language, hard global conventions. Tiny, almost never forgotten.
+- **L2** — important reusable knowledge that holds across projects (a tool gotcha, a durable preference).
+- **L3** — ordinary, easily-forgotten general notes.
+
+**Per-project — L4, in that project's store (`<project>/.engram/engram.redb`):**
+- **L4.1** — project hard rules: the inviolable conventions / taboos for *this* repo, learned from your "always / never" directives or hard-won corrections. *Not* a copy of CLAUDE.md / lint configs (those are auto-loaded artifacts); L4.1 holds what they **don't** say.
+- **L4.2** — durable project knowledge: what the project is, its **architecture / module mental-map** (what each part does and why it's split that way — distilled, not an `ls` dump), and settled / debated decisions (what was chosen, what was rejected and why — so a later session won't re-propose a dead option).
+- **L4.3** — transient: open loops / hand-off-able work (current progress, what's blocked, next step). Decays fast; superseded once done.
+
+> Golden rule: **store the distilled mental model, never what a single `grep` / `ls` already gives you.** File locations live in the pointer, not the cue.
+
 ## Where memory lives
 
 - **Shared** (cross-project L1-3): `~/.engram/general.redb` (auto-created)
@@ -82,7 +99,7 @@ Storage is **[redb](https://github.com/cberner/redb)** (embedded, single-file, A
 
 ## Status line
 
-Claude Code allows only **one** status line. If you already use another (e.g. [claude-hud](https://github.com/jarrodwatts/claude-hud)), use `statusline/engram-statusline.sh` to **compose** them — it renders the other line, then appends `● Engram | …`. Point your `settings.json` `statusLine.command` at that script.
+To show the live `● Engram | …` indicator, point your `settings.json` `statusLine.command` at `statusline/engram-statusline.sh` — it reads `~/.engram/status.txt` (refreshed every turn, no DB hit).
 
 ## Configuration
 

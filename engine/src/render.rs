@@ -191,6 +191,16 @@ fn render_level_section(
 /// - `memories`：要渲染的全部记忆集合（通用 + 已挂载各项目库的合并集）。
 /// - `now`：当前时间（unix 秒）。
 pub fn render(memories: &[Memory], now: f64) -> String {
+    render_scoped(memories, now, &[])
+}
+
+/// 同 [`render`]，但额外保证 `active_projects` 里的每个项目**一定输出其
+/// L4.1/L4.2/L4.3 三小节**——即使该项目当前没有任何 active 记忆，也会渲染成
+/// `[<名>] L4.x [0/容量]（空）`。
+///
+/// 用途：热索引注入时，把「当前作用域解析出的项目」即使 L4 为空也显式列出，
+/// 给用户「该项目已被识别/挂载」的可视确认（避免空项目在热索引里完全隐身）。
+pub fn render_scoped(memories: &[Memory], now: f64, active_projects: &[&str]) -> String {
     let mut buf = String::new();
     buf.push_str(&format!("== Engram 热索引 (now={now}) ==\n"));
 
@@ -205,12 +215,14 @@ pub fn render(memories: &[Memory], now: f64) -> String {
         render_level_section(&mut buf, level, title, None, &items, now);
     }
 
-    // 收集所有出现过的项目名（来自 active 的 L4 记忆），按名升序逐个输出。
-    let projects: BTreeSet<&str> = memories
+    // 收集所有出现过的项目名（来自 active 的 L4 记忆），并入「活跃项目名」后按名升序输出。
+    // 并入 active_projects 是为了让没有任何 L4 记忆的活跃项目也显示其 L4.x 空段。
+    let mut projects: BTreeSet<&str> = memories
         .iter()
         .filter(|m| m.status == Status::Active)
         .filter_map(|m| m.project.as_deref())
         .collect();
+    projects.extend(active_projects.iter().copied());
 
     for project in projects {
         for (level, title) in project_level_order() {
@@ -390,5 +402,23 @@ mod tests {
         let out = render(&[m], base);
         assert!(out.contains("极久未用"));
         assert!(out.contains("[淘汰]"), "跌破淘汰阈值的记忆应被标 [淘汰]");
+    }
+
+    #[test]
+    fn render_scoped_shows_empty_active_project() {
+        let now = 1_000_000_000.0;
+        // 没有任何 engram 项目的 L4 记忆，但 engram 是当前活跃项目 → 应显式输出空的 L4.x 段。
+        let mems = vec![mem("g", Level::L1, None, Status::Active, 0.5)];
+        let out = render_scoped(&mems, now, &["engram"]);
+        assert!(
+            out.contains("[engram] L4.1 项目潜意识层 [0/"),
+            "活跃项目即使 L4 为空也应显示 L4.1 段，实得：\n{out}"
+        );
+        assert!(out.contains("[engram] L4.2 项目重要层 [0/"));
+        assert!(out.contains("[engram] L4.3 项目普通层 [0/"));
+        assert!(out.contains("（空）"), "空段应标（空）");
+        // 普通 render（无活跃项目）则不显示该空项目。
+        let out2 = render(&mems, now);
+        assert!(!out2.contains("[engram]"), "无活跃项目时空项目不应出现");
     }
 }

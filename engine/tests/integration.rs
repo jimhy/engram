@@ -2110,10 +2110,10 @@ fn resolve_env_format_outputs_four_lines() {
         "应含 ENGRAM_SCOPE_KIND=project 行，实得：\n{stdout}"
     );
 
-    // resolve 应已 create_dir_all 作用域库父目录 <project_dir>/.engram。
+    // resolve 只读、**不创建**作用域库的 .engram 目录（防子目录杂散锚点）；只报告路径。
     assert!(
-        canon.join(".engram").is_dir(),
-        "resolve 应创建出 <project_dir>/.engram 目录"
+        !canon.join(".engram").exists(),
+        "resolve 不应创建 <project_dir>/.engram 目录（锚点只由 write/root 建）"
     );
 
     cleanup_file(&general_path);
@@ -2179,9 +2179,9 @@ fn resolve_json_format_is_parseable() {
 }
 
 // 25. session-start 空临时目录：exit 0、stdout 含前言与“== Engram 热索引”，
-//     且会创建出 <project_dir>/.engram/ 目录（作用域库父目录）。
+//     但**不创建** <project_dir>/.engram/（只读 hook 不留杂散锚点，锚点只由 write/root 建）。
 #[test]
-fn session_start_on_empty_dir_prints_index_and_creates_engram_dir() {
+fn session_start_on_empty_dir_prints_index_without_creating_engram_dir() {
     let _guard = test_guard();
     let project_dir = unique_project_dir("ss_empty");
     let general_path = unique_db_path("ss_empty_g");
@@ -2216,15 +2216,15 @@ fn session_start_on_empty_dir_prints_index_and_creates_engram_dir() {
         "stdout 应含热索引表头，实得：\n{stdout}"
     );
 
-    // 会创建出 <project_dir>/.engram/（作用域库父目录）。
+    // session-start 只读、**不创建** <project_dir>/.engram（空目录下仍正常渲染公共库部分，
+    // 但不留下杂散锚点；项目锚点只由 write/root 建）。
     let canon = std::fs::canonicalize(&project_dir).unwrap_or_else(|_| project_dir.clone());
     assert!(
-        canon.join(".engram").is_dir(),
-        "session-start 应创建出 <project_dir>/.engram 目录"
+        !canon.join(".engram").exists(),
+        "session-start 不应创建 <project_dir>/.engram 目录"
     );
 
     cleanup_file(&general_path);
-    // session-start 会在 .engram 下创建 engram.redb 空库，连目录一并清理。
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
@@ -2627,11 +2627,12 @@ fn hot_index_workspace_child_is_project() {
         "应锚定为 project，实得：{log}"
     );
     assert!(log.contains("name=proj"), "项目根应为 proj，实得：{log}");
-    // hot-index 会确保作用域库父目录存在：proj/.engram 应被建出。
+    // hot-index 只读、**不创建** proj/.engram（解析仍正确识别 proj 为项目根，
+    // 但不在子目录里留下杂散锚点；锚点只由 write/root 建）。
     let canon = std::fs::canonicalize(&proj).unwrap_or(proj.clone());
     assert!(
-        canon.join(".engram").is_dir(),
-        "应建出 proj/.engram 作用域库父目录"
+        !canon.join(".engram").exists(),
+        "hot-index 不应建出 proj/.engram（防子目录杂散锚点）"
     );
 
     cleanup_file(&general_path);

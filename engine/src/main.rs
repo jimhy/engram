@@ -47,7 +47,7 @@ use engram::commands::{
 };
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::model::{Level, Memory, Pointer, Status};
-use engram::render::{load_store_entries, render};
+use engram::render::{load_store_entries, render, render_scoped};
 use engram::session::{self, Pending};
 use engram::store::{self, StoreError};
 use redb::Database;
@@ -869,17 +869,22 @@ fn ensure_parent_dir(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 按 cwd 锚定作用域并 `create_dir_all` 公共库与作用域库两个 db 的父目录。
+/// 按 cwd 锚定作用域并 `create_dir_all` **公共库**的父目录（项目库父目录**不**在此建）。
 ///
-/// 把 `session-start` / `resolve` 共用的"解析项目目录 → resolve_scope → 建父目录"
+/// 把 `session-start` / `resolve` 共用的"解析项目目录 → resolve_scope → 建公共库父目录"
 /// 流程收成一处，保证两命令的作用域语义完全一致。
+///
+/// **为何不建项目库父目录**：只读命令（resolve / session-start）若在此 `create_dir_all`
+/// 项目库的 `.engram/` 目录、再配合 `store::open` 建出空库，就会在任意子目录里凭空造出
+/// 杂散锚点，把一个项目碎片化成多个（曾踩：在 plugin/ 子目录开会话，plugin 被识别成独立
+/// 项目而非 engram 的一部分）。项目锚点只应由 `write` / `root` 显式建立。
 ///
 /// # 参数
 /// - `project_dir`：项目目录（即 cwd 语义）；`None` 时取当前工作目录。
 /// - `general_override`：`--general-db` 覆盖；`None` 时走默认约定。
 ///
 /// # Errors
-/// 取当前目录失败、HOME 无法确定、或建父目录失败时，返回中文说明的错误字符串。
+/// 取当前目录失败、HOME 无法确定、或建公共库父目录失败时，返回中文说明的错误字符串。
 fn resolve_scope_and_prepare(
     project_dir: Option<&Path>,
     general_override: Option<&Path>,
@@ -887,7 +892,6 @@ fn resolve_scope_and_prepare(
     let project_dir = resolve_project_dir(project_dir)?;
     let (general_db, scope) = resolve_scope(&project_dir, general_override)?;
     ensure_parent_dir(&general_db)?;
-    ensure_parent_dir(&scope.db)?;
     Ok((general_db, scope))
 }
 
@@ -1084,14 +1088,19 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
 fn read_merged_scope(general_db: &Path, scope: &ProjectScope) -> Result<Vec<Memory>, String> {
     let (_gdb, mut merged) = open_and_read(general_db)
         .map_err(|e| format!("读取公共库 {} 失败：{e}", general_db.display()))?;
-    let (_sdb, mut smems) = open_and_read(&scope.db).map_err(|e| {
-        format!(
-            "读取作用域库 {}（{}）失败：{e}",
-            scope.name,
-            scope.db.display()
-        )
-    })?;
-    merged.append(&mut smems);
+    // 作用域(项目)库：**仅当文件已存在才读，不存在则当空、绝不创建**。只读 hook
+    // (hot-index / session-start) 不该在子目录里凭空建出杂散锚点把一个项目碎片化成
+    // 多个——项目锚点只由 write / root 显式建立（与 run_status 的处理保持一致）。
+    if scope.db.is_file() {
+        let (_sdb, mut smems) = open_and_read(&scope.db).map_err(|e| {
+            format!(
+                "读取作用域库 {}（{}）失败：{e}",
+                scope.name,
+                scope.db.display()
+            )
+        })?;
+        merged.append(&mut smems);
+    }
     Ok(merged)
 }
 
@@ -1579,8 +1588,9 @@ fn build_hot_index_json(hook_event: &str, context: &str) -> Result<String, Strin
 /// 流程：
 /// 1. 解析 emit / now / stdin 兜底（仅 `--from-hook-stdin`）。
 /// 2. cwd 取值：`--workspace-root` 优先，否则 stdin.cwd，否则 current_dir。
-/// 3. [`resolve_scope`] 锚定作用域（含 cwd 规范化、收紧的锚点判据）→ `(general_db, scope)`；
-///    `ensure_parent_dir(&scope.db)`（公共库父目录由 [`store::open`] 时补建）。
+/// 3. [`resolve_scope`] 锚定作用域（含 cwd 规范化、收紧的锚点判据）→ `(general_db, scope)`。
+///    **不为 `scope.db` 建父目录**：只读 hook 不该凭空建出杂散锚点把项目碎片化（项目库
+///    缺失即按空处理，锚点只由 write/root 显式建）；公共库父目录由 [`store::open`] 补建。
 /// 4. 合并读取改为 **公共库 + `scope.db` 两库**（[`read_merged_scope`]）。
 /// 5. 状态栏小文件：照常写 [`oneline_status`]（best-effort，门控判空也写）。
 /// 6. `--state` 门控：state 文件存**上次 `scope.root` 的绝对路径字符串**；本次相同则
@@ -1631,7 +1641,9 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         },
     };
 
-    // 3. 从 cwd 向上锚定作用域，得 (general_db, scope)；确保作用域库父目录存在。
+    // 3. 从 cwd 向上锚定作用域，得 (general_db, scope)。不为作用域(项目)库建父目录：
+    //    只读 hook 不该凭空建出杂散锚点把项目碎片化（项目库缺失即按空处理，锚点只由
+    //    write/root 显式建）；公共库父目录由 read_merged_scope→store::open 补建。
     let (general_db, scope) = match resolve_scope(&cwd, args.general_db) {
         Ok(r) => r,
         Err(e) => {
@@ -1639,10 +1651,6 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = ensure_parent_dir(&scope.db) {
-        eprintln!("hot-index 失败：{e}");
-        return ExitCode::FAILURE;
-    }
 
     // 4. 合并 公共库 + 作用域库（在状态门控之前先读出，因为状态栏小文件无论是否
     //    门控判空都要写最新的一行状态串，需要先有挂载集）。
@@ -1683,7 +1691,13 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
     // 7. 渲染。前言后若作用域是项目管理目录，追加一行提示（勿在此直接写项目记忆）。
     const PREAMBLE: &str = "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」";
     const WORKSPACE_NOTE: &str = "（注意：当前目录是 engram 项目管理目录，不要直接在此写项目记忆；请在其下的具体项目目录里工作，项目记忆写到该项目的库。）";
-    let rendered = render(&merged, now);
+    // 当前作用域是具体项目时，即使其 L4 为空也显式渲染 [<项目名>] L4.x 段，
+    // 作为「该项目已识别/挂载」的可视确认（空项目否则会在热索引里完全隐身）。
+    let active_projects: Vec<&str> = match scope.kind {
+        ScopeKind::Project => vec![scope.name.as_str()],
+        ScopeKind::Workspace => Vec::new(),
+    };
+    let rendered = render_scoped(&merged, now, &active_projects);
     let is_workspace = scope.kind == ScopeKind::Workspace;
 
     // 8. 输出。
