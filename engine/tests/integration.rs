@@ -2050,11 +2050,12 @@ fn unique_project_dir(tag: &str) -> PathBuf {
     dir
 }
 
-// 23. resolve --format env：输出三行 ENGRAM_* 且路径正确（project_db 为
-//     <project_dir>/.claude/engram.redb、general_db 为 --general-db 给定值、
-//     project_name 为项目目录最后一段名）。
+// 23. resolve --format env：输出四行 ENGRAM_*（含 ENGRAM_SCOPE_KIND）且路径正确。
+//     无 .engram 锚点的空目录：scope=cwd 自己（project），作用域库为
+//     <project_dir>/.engram/engram.redb、general_db 为 --general-db 给定值、
+//     作用域名为项目目录最后一段名。
 #[test]
-fn resolve_env_format_outputs_three_lines() {
+fn resolve_env_format_outputs_four_lines() {
     let _guard = test_guard();
     let project_dir = unique_project_dir("resolve_env");
     let general_path = unique_db_path("resolve_env_g");
@@ -2072,7 +2073,7 @@ fn resolve_env_format_outputs_three_lines() {
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 3, "env 格式应恰好三行，实得：\n{stdout}");
+    assert_eq!(lines.len(), 4, "env 格式应恰好四行，实得：\n{stdout}");
 
     // general_db = 给定 override。
     let expected_general = format!("ENGRAM_GENERAL_DB={}", general_path.display());
@@ -2080,12 +2081,18 @@ fn resolve_env_format_outputs_three_lines() {
         lines.contains(&expected_general.as_str()),
         "应含 general_db 行，实得：\n{stdout}"
     );
-    // project_db = <project_dir>/.claude/engram.redb。
-    let expected_pdb = project_dir.join(".claude").join("engram.redb");
-    let expected_pdb_line = format!("ENGRAM_PROJECT_DB={}", expected_pdb.display());
+    // project_db（作用域库）= <project_dir(规范化后)>/.engram/engram.redb。
+    let canon = std::fs::canonicalize(&project_dir).unwrap_or_else(|_| project_dir.clone());
+    let expected_pdb = canon.join(".engram").join("engram.redb");
+    let pdb_line = lines
+        .iter()
+        .find(|l| l.starts_with("ENGRAM_PROJECT_DB="))
+        .expect("应含 project_db 行");
     assert!(
-        lines.contains(&expected_pdb_line.as_str()),
-        "应含 project_db 行 {expected_pdb_line}，实得：\n{stdout}"
+        pdb_line.ends_with(&format!("{}engram.redb", std::path::MAIN_SEPARATOR))
+            && pdb_line.contains(".engram"),
+        "project_db 行应指向 .engram/engram.redb，实得：{pdb_line}（期望近似 {}）",
+        expected_pdb.display()
     );
     // project_name = 项目目录最后一段名。
     let name = project_dir
@@ -2097,18 +2104,23 @@ fn resolve_env_format_outputs_three_lines() {
         lines.contains(&expected_name_line.as_str()),
         "应含 project_name 行 {expected_name_line}，实得：\n{stdout}"
     );
-
-    // resolve 应已 create_dir_all 项目库父目录 <project_dir>/.claude。
+    // 无 workspace 标记的空目录 → kind=project。
     assert!(
-        project_dir.join(".claude").is_dir(),
-        "resolve 应创建出 <project_dir>/.claude 目录"
+        lines.contains(&"ENGRAM_SCOPE_KIND=project"),
+        "应含 ENGRAM_SCOPE_KIND=project 行，实得：\n{stdout}"
+    );
+
+    // resolve 应已 create_dir_all 作用域库父目录 <project_dir>/.engram。
+    assert!(
+        canon.join(".engram").is_dir(),
+        "resolve 应创建出 <project_dir>/.engram 目录"
     );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
-// 24. resolve --format json：输出可被 serde_json 解析，三字段齐全且值正确。
+// 24. resolve --format json：输出可被 serde_json 解析，四字段齐全（含 kind）且值正确。
 #[test]
 fn resolve_json_format_is_parseable() {
     let _guard = test_guard();
@@ -2136,12 +2148,14 @@ fn resolve_json_format_is_parseable() {
         Some(general_path.to_string_lossy().as_ref()),
         "json general_db 应等于 --general-db"
     );
-    // project_db 字段 = <project_dir>/.claude/engram.redb。
-    let expected_pdb = project_dir.join(".claude").join("engram.redb");
-    assert_eq!(
-        parsed.get("project_db").and_then(|v| v.as_str()),
-        Some(expected_pdb.to_string_lossy().as_ref()),
-        "json project_db 应为 <project_dir>/.claude/engram.redb"
+    // project_db 字段（作用域库）应指向 .engram/engram.redb。
+    let pdb = parsed
+        .get("project_db")
+        .and_then(|v| v.as_str())
+        .expect("应有 project_db 字段");
+    assert!(
+        pdb.contains(".engram") && pdb.ends_with("engram.redb"),
+        "json project_db 应指向 .engram/engram.redb，实得：{pdb}"
     );
     // project_name 字段 = 目录最后一段名。
     let name = project_dir
@@ -2153,15 +2167,21 @@ fn resolve_json_format_is_parseable() {
         Some(name),
         "json project_name 应为目录最后一段名"
     );
+    // kind 字段 = project（无 workspace 标记）。
+    assert_eq!(
+        parsed.get("kind").and_then(|v| v.as_str()),
+        Some("project"),
+        "json kind 应为 project"
+    );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
 // 25. session-start 空临时目录：exit 0、stdout 含前言与“== Engram 热索引”，
-//     且会创建出 <project_dir>/.claude/ 目录（即便项目库本不存在）。
+//     且会创建出 <project_dir>/.engram/ 目录（作用域库父目录）。
 #[test]
-fn session_start_on_empty_dir_prints_index_and_creates_claude_dir() {
+fn session_start_on_empty_dir_prints_index_and_creates_engram_dir() {
     let _guard = test_guard();
     let project_dir = unique_project_dir("ss_empty");
     let general_path = unique_db_path("ss_empty_g");
@@ -2196,14 +2216,15 @@ fn session_start_on_empty_dir_prints_index_and_creates_claude_dir() {
         "stdout 应含热索引表头，实得：\n{stdout}"
     );
 
-    // 会创建出 <project_dir>/.claude/（项目库父目录）。
+    // 会创建出 <project_dir>/.engram/（作用域库父目录）。
+    let canon = std::fs::canonicalize(&project_dir).unwrap_or_else(|_| project_dir.clone());
     assert!(
-        project_dir.join(".claude").is_dir(),
-        "session-start 应创建出 <project_dir>/.claude 目录"
+        canon.join(".engram").is_dir(),
+        "session-start 应创建出 <project_dir>/.engram 目录"
     );
 
     cleanup_file(&general_path);
-    // session-start 会在 .claude 下创建 engram.redb 空库，连目录一并清理。
+    // session-start 会在 .engram 下创建 engram.redb 空库，连目录一并清理。
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
@@ -2445,15 +2466,30 @@ fn unique_workspace_root(tag: &str) -> PathBuf {
     dir
 }
 
-/// 在 `<base>/.claude/engram.redb` 处建一个 db 并灌入 `mems`，关闭后返回该 db 路径。
-fn seed_claude_db(base: &Path, mems: &[Memory]) -> PathBuf {
-    let claude = base.join(".claude");
-    std::fs::create_dir_all(&claude).expect("应能创建 .claude 目录");
-    let db_path = claude.join("engram.redb");
+/// 在 `<base>/.engram/engram.redb` 处建一个项目库并灌入 `mems`，关闭后返回该 db 路径。
+///
+/// 这样 `base` 即成为带 redb 锚点的「具体项目」根目录（从其下任意子目录开会话，
+/// hot-index / resolve 会向上锚定到 `base`）。
+fn seed_engram_db(base: &Path, mems: &[Memory]) -> PathBuf {
+    let engram = base.join(".engram");
+    std::fs::create_dir_all(&engram).expect("应能创建 .engram 目录");
+    let db_path = engram.join("engram.redb");
     let db = store::open(&db_path).expect("应能创建数据库");
     store::put_many(&db, mems).expect("put_many 应成功");
     drop(db);
     db_path
+}
+
+/// 把 `base` 设为 engram「项目管理目录」（workspace）：建 `.engram/`、写 `workspace`
+/// 标记与一个空项目库，返回 `.engram` 目录路径。
+fn seed_workspace(base: &Path) -> PathBuf {
+    let engram = base.join(".engram");
+    std::fs::create_dir_all(&engram).expect("应能创建 .engram 目录");
+    std::fs::write(engram.join("workspace"), "engram-workspace v1 created_at=0")
+        .expect("应能写 workspace 标记");
+    let db = store::open(&engram.join("engram.redb")).expect("应能创建管理库");
+    drop(db);
+    engram
 }
 
 /// 调用 `engram hot-index ...`，返回完整 Output（调用方自行断言）。
@@ -2469,60 +2505,49 @@ fn last_segment(p: &Path) -> String {
         .to_string()
 }
 
-// 29. transcript 判定取最后触碰的子项目（正斜杠分隔符）；挂载集含根 L4 + 活跃子项目 L4。
+/// 规范化路径并剥离 Windows verbatim 前缀 `\\?\`（与二进制 `resolve_scope` 的处理一致）。
+///
+/// 测试里断言 `--state` 文件内容（作用域根绝对路径）时，需与二进制输出对齐：二进制
+/// 用 `canonicalize` 后会去掉 `\\?\`，故测试期望值也要同样处理。canonicalize 失败
+/// 时退回原路径。
+fn canonicalize_no_verbatim(p: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = canon.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if !rest.starts_with(r"UNC\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    canon
+}
+
+// 29. 普通项目锚定：cwd 在 项目/src 深处，项目自带 .engram/engram.redb →
+//     锚定到项目根，挂载「公共库 + 项目库」。
 #[test]
-fn hot_index_transcript_picks_last_and_mounts_active_l4() {
+fn hot_index_anchors_project_from_subdir() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_transcript");
-    let ws_str = ws.to_string_lossy().replace('\\', "/");
-
-    // 两个真实子项目目录 engram、ai-2d-engine。
-    let engram_dir = ws.join("engram");
-    let ai_dir = ws.join("ai-2d-engine");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram 子目录");
-    std::fs::create_dir_all(&ai_dir).expect("建 ai-2d-engine 子目录");
-
-    // 根项目库一条 L4.1（root 名作 project）。根名 = ws 最后一段。
-    let root_name = last_segment(&ws);
-    let root_l4 = make(
-        "root_l4",
-        Level::L4_1,
-        Some(&root_name),
-        Status::Active,
-        0.5,
-        now,
-        vec![now],
+    let proj = unique_workspace_root("hi_anchor");
+    let proj_name = last_segment(&proj);
+    // 项目库一条 L4.1（项目名作 project）。
+    let _proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "proj_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
     );
-    let _root_db = seed_claude_db(&ws, &[root_l4]);
+    // 在项目下的子目录开会话。
+    let subdir = proj.join("src").join("deep");
+    std::fs::create_dir_all(&subdir).expect("建子目录");
 
-    // engram 子项目库一条 L4.1。
-    let eng_l4 = make(
-        "eng_l4",
-        Level::L4_1,
-        Some("engram"),
-        Status::Active,
-        0.5,
-        now,
-        vec![now],
-    );
-    let _eng_db = seed_claude_db(&engram_dir, &[eng_l4]);
-
-    // ai-2d-engine 子项目库一条 L4.1。
-    let ai_l4 = make(
-        "ai_l4",
-        Level::L4_1,
-        Some("ai-2d-engine"),
-        Status::Active,
-        0.5,
-        now,
-        vec![now],
-    );
-    let _ai_db = seed_claude_db(&ai_dir, &[ai_l4]);
-
-    // 公共库一条 L1。
     let general_path = seed_db(
-        "hi_transcript_g",
+        "hi_anchor_g",
         &[make(
             "gen1",
             Level::L1,
@@ -2535,19 +2560,11 @@ fn hot_index_transcript_picks_last_and_mounts_active_l4() {
     );
     let g = general_path.to_string_lossy().to_string();
 
-    // transcript：先触碰 engram，再触碰 ai-2d-engine → active 应为 ai-2d-engine。
-    let transcript = ws.join("session.jsonl");
-    let content = format!("{ws_str}/engram/src/x.rs 然后 {ws_str}/ai-2d-engine/y.rs\n");
-    std::fs::write(&transcript, content).expect("写 transcript");
-    let tp = transcript.to_string_lossy().to_string();
-
     let out = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--transcript",
-        &tp,
+        subdir.to_string_lossy().as_ref(),
         "--now",
         "1000000000",
     ]);
@@ -2557,61 +2574,84 @@ fn hot_index_transcript_picks_last_and_mounts_active_l4() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
-    // 应含公共 L1、根 L4、活跃子项目 ai-2d-engine 的 L4；不含 engram 的 L4。
     assert!(stdout.contains("cue-gen1"), "应含公共 L1");
-    assert!(stdout.contains("cue-root_l4"), "应含根 L4");
     assert!(
-        stdout.contains("cue-ai_l4"),
-        "应含活跃子项目 ai-2d-engine 的 L4，实得：\n{stdout}"
+        stdout.contains("cue-proj_l4"),
+        "在子目录开会话应锚定到项目根并挂其 L4，实得：\n{stdout}"
     );
+    // 不应是 workspace（普通项目不打管理目录提示）。
     assert!(
-        !stdout.contains("cue-eng_l4"),
-        "不应含未激活的 engram 子项目 L4，实得：\n{stdout}"
+        !stdout.contains("engram 项目管理目录"),
+        "普通项目不应打管理目录提示，实得：\n{stdout}"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 30. 管理目录的子目录即项目：cwd 在 workspace 的子目录深处，该子目录尚无自己的
+//     .engram → 锚定到「workspace 的直接下一级子目录」作为项目根。
+#[test]
+fn hot_index_workspace_child_is_project() {
+    let _guard = test_guard();
+    let ws = unique_workspace_root("hi_wschild");
+    seed_workspace(&ws);
+    // workspace 的直接子目录 proj（项目根），其下再有 src。
+    let proj = ws.join("proj");
+    let subdir = proj.join("src");
+    std::fs::create_dir_all(&subdir).expect("建子目录");
+    // proj 还没自己的 .engram → 项目根 = proj，项目库 = proj/.engram/engram.redb（尚不存在）。
+
+    let general_path = seed_db("hi_wschild_g", &[]);
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_hot_index_raw(&[
+        "--general-db",
+        &g,
+        "--workspace-root",
+        subdir.to_string_lossy().as_ref(),
+        "--log",
+        ws.join("hi.log").to_string_lossy().as_ref(),
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        out.status.success(),
+        "hot-index 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 日志应记 kind=project、name=proj、root 指向 proj。
+    let log = std::fs::read_to_string(ws.join("hi.log")).expect("应能读日志");
+    assert!(
+        log.contains("kind=project"),
+        "应锚定为 project，实得：{log}"
+    );
+    assert!(log.contains("name=proj"), "项目根应为 proj，实得：{log}");
+    // hot-index 会确保作用域库父目录存在：proj/.engram 应被建出。
+    let canon = std::fs::canonicalize(&proj).unwrap_or(proj.clone());
+    assert!(
+        canon.join(".engram").is_dir(),
+        "应建出 proj/.engram 作用域库父目录"
     );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&ws);
 }
 
-// 30. transcript 判定支持 JSON 转义的双反斜杠分隔符变体。
+// 31. cwd 正好是管理目录本身 → Workspace：注入里追加「项目管理目录」提示行。
 #[test]
-fn hot_index_transcript_handles_double_backslash() {
+fn hot_index_at_workspace_emits_note() {
     let _guard = test_guard();
-    let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_dbs");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram 子目录");
-
-    let eng_l4 = make(
-        "eng_dbs",
-        Level::L4_1,
-        Some("engram"),
-        Status::Active,
-        0.5,
-        now,
-        vec![now],
-    );
-    let _eng_db = seed_claude_db(&engram_dir, &[eng_l4]);
-    // 根库可为空（hot-index 会 open 创建）。
-    let _root_db = seed_claude_db(&ws, &[]);
-
-    let general_path = seed_db("hi_dbs_g", &[]);
+    let ws = unique_workspace_root("hi_atws");
+    seed_workspace(&ws);
+    let general_path = seed_db("hi_atws_g", &[]);
     let g = general_path.to_string_lossy().to_string();
-
-    // transcript 用双反斜杠（JSON 转义形态）写工作区路径。
-    let ws_bs = ws.to_string_lossy().replace('\\', "\\\\");
-    let transcript = ws.join("session.jsonl");
-    let content = format!("{{\"cwd\":\"{ws_bs}\\\\engram\"}}");
-    std::fs::write(&transcript, content).expect("写 transcript");
-    let tp = transcript.to_string_lossy().to_string();
 
     let out = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
         ws.to_string_lossy().as_ref(),
-        "--transcript",
-        &tp,
         "--now",
         "1000000000",
     ]);
@@ -2622,195 +2662,124 @@ fn hot_index_transcript_handles_double_backslash() {
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
     assert!(
-        stdout.contains("cue-eng_dbs"),
-        "双反斜杠分隔符也应判定出 engram，实得：\n{stdout}"
+        stdout.contains("以下是你的 engram 长期记忆热索引"),
+        "应含前言，实得：\n{stdout}"
+    );
+    assert!(
+        stdout.contains("当前目录是 engram 项目管理目录"),
+        "cwd 是管理目录时应追加管理目录提示行，实得：\n{stdout}"
     );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&ws);
 }
 
-// 31. prompt 信号优先于 transcript：prompt 提 engram、transcript 指 ai-2d-engine → 取 engram。
+// 32. 就近优先：项目自带普通锚（.engram/engram.redb）压过上层 workspace 管理目录。
 #[test]
-fn hot_index_prompt_takes_precedence_over_transcript() {
+fn hot_index_nearest_project_wins_over_workspace() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_prompt");
-    let ws_str = ws.to_string_lossy().replace('\\', "/");
-    let engram_dir = ws.join("engram");
-    let ai_dir = ws.join("ai-2d-engine");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    std::fs::create_dir_all(&ai_dir).expect("建 ai-2d-engine");
-
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let ws = unique_workspace_root("hi_nearest");
+    seed_workspace(&ws);
+    // proj 自带普通项目锚。
+    let proj = ws.join("proj");
+    std::fs::create_dir_all(&proj).expect("建 proj");
+    let proj_name = "proj".to_string();
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "eng_p",
+            "near_l4",
             Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _ai_db = seed_claude_db(
-        &ai_dir,
-        &[make(
-            "ai_p",
-            Level::L4_1,
-            Some("ai-2d-engine"),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        )],
-    );
-    let _root_db = seed_claude_db(&ws, &[]);
-    let general_path = seed_db("hi_prompt_g", &[]);
-    let g = general_path.to_string_lossy().to_string();
+    let subdir = proj.join("src");
+    std::fs::create_dir_all(&subdir).expect("建子目录");
 
-    // transcript 指向 ai-2d-engine。
-    let transcript = ws.join("session.jsonl");
-    std::fs::write(&transcript, format!("{ws_str}/ai-2d-engine/y.rs")).expect("写 transcript");
-    let tp = transcript.to_string_lossy().to_string();
-
-    let out = run_hot_index_raw(&[
-        "--general-db",
-        &g,
-        "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--transcript",
-        &tp,
-        "--prompt",
-        "我现在要做 engram 这个项目",
-        "--now",
-        "1000000000",
-    ]);
-    assert!(out.status.success(), "hot-index 应成功");
-    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
-    assert!(
-        stdout.contains("cue-eng_p"),
-        "prompt 信号应优先选 engram，实得：\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("cue-ai_p"),
-        "不应选 transcript 指向的 ai-2d-engine，实得：\n{stdout}"
-    );
-
-    cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
-}
-
-// 32. active 必须是真实子目录：prompt/transcript 提到的伪造名不算 → 只挂根 L4 + 公共。
-#[test]
-fn hot_index_active_must_be_real_subdir() {
-    let _guard = test_guard();
-    let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_fake");
-    // 只建一个真实子目录 engram；prompt 故意提一个不存在的 nonexistent。
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
-        &[make(
-            "eng_real",
-            Level::L4_1,
-            Some("engram"),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        )],
-    );
-    let root_name = last_segment(&ws);
-    let _root_db = seed_claude_db(
-        &ws,
-        &[make(
-            "root_only",
-            Level::L4_1,
-            Some(&root_name),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        )],
-    );
-    let general_path = seed_db("hi_fake_g", &[]);
+    let general_path = seed_db("hi_nearest_g", &[]);
     let g = general_path.to_string_lossy().to_string();
 
     let out = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--prompt",
-        "去 nonexistent 那个伪造项目",
+        subdir.to_string_lossy().as_ref(),
         "--now",
         "1000000000",
     ]);
     assert!(out.status.success(), "hot-index 应成功");
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
-    // 伪造名不算 active → 不挂任何子项目 L4，只剩根 L4。
-    assert!(stdout.contains("cue-root_only"), "应含根 L4");
+    // 锚定到 proj 自己的项目库（而非上溯到 workspace）。
     assert!(
-        !stdout.contains("cue-eng_real"),
-        "未被激活的 engram 不应出现，实得：\n{stdout}"
+        stdout.contains("cue-near_l4"),
+        "应锚定到 proj 自带的项目库，实得：\n{stdout}"
+    );
+    // 锚定到普通项目 → 不应打管理目录提示。
+    assert!(
+        !stdout.contains("engram 项目管理目录"),
+        "锚定普通项目不应打管理目录提示，实得：\n{stdout}"
     );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&ws);
 }
 
-// 33. 状态门控：同一 active 连续两次（带 --state）第二次输出空；active 变化则有输出。
+// 33. 状态门控按「作用域根路径」：同一作用域连续两次（带 --state）第二次输出空；
+//     作用域根变化（切到另一项目）则重新有输出，并更新状态。
 #[test]
-fn hot_index_state_gates_unchanged_active() {
+fn hot_index_state_gates_unchanged_scope() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
     let ws = unique_workspace_root("hi_state");
-    let engram_dir = ws.join("engram");
-    let ai_dir = ws.join("ai-2d-engine");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    std::fs::create_dir_all(&ai_dir).expect("建 ai-2d-engine");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    seed_workspace(&ws);
+    // 两个项目 a、b，各自带项目库。
+    let proj_a = ws.join("a");
+    let proj_b = ws.join("b");
+    std::fs::create_dir_all(&proj_a).expect("建 a");
+    std::fs::create_dir_all(&proj_b).expect("建 b");
+    let _a_db = seed_engram_db(
+        &proj_a,
         &[make(
-            "s_eng",
+            "s_a",
             Level::L4_1,
-            Some("engram"),
+            Some("a"),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _ai_db = seed_claude_db(
-        &ai_dir,
+    let _b_db = seed_engram_db(
+        &proj_b,
         &[make(
-            "s_ai",
+            "s_b",
             Level::L4_1,
-            Some("ai-2d-engine"),
+            Some("b"),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _root_db = seed_claude_db(&ws, &[]);
     let general_path = seed_db("hi_state_g", &[]);
     let g = general_path.to_string_lossy().to_string();
     let state_path = ws.join("hot-index-state.txt");
     let sp = state_path.to_string_lossy().to_string();
-    let ws_arg = ws.to_string_lossy().to_string();
+    let a_arg = proj_a.to_string_lossy().to_string();
+    let b_arg = proj_b.to_string_lossy().to_string();
+    // 与二进制 resolve_scope 一致：规范化后剥离 Windows verbatim 前缀 `\\?\`。
+    let canon_a = canonicalize_no_verbatim(&proj_a);
 
-    // 第一次：active=engram，状态文件无 → 应有输出，并写回状态。
+    // 第一次：作用域=a，状态文件无 → 应有输出，并写回状态（a 的规范化根路径）。
     let out1 = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        &ws_arg,
-        "--prompt",
-        "做 engram",
+        &a_arg,
         "--state",
         &sp,
         "--now",
@@ -2818,20 +2787,20 @@ fn hot_index_state_gates_unchanged_active() {
     ]);
     assert!(out1.status.success(), "首次 hot-index 应成功");
     let s1 = String::from_utf8(out1.stdout).expect("stdout 非 UTF-8");
-    assert!(s1.contains("cue-s_eng"), "首次应渲染 engram 的 L4");
-    assert!(s1.contains("== Engram 热索引"), "首次应有热索引");
-    // 状态文件应记 engram。
+    assert!(s1.contains("cue-s_a"), "首次应渲染项目 a 的 L4");
     let recorded = std::fs::read_to_string(&state_path).expect("应能读状态");
-    assert_eq!(recorded.trim(), "engram", "状态应记 engram");
+    assert_eq!(
+        recorded.trim(),
+        canon_a.to_string_lossy(),
+        "状态应记项目 a 的作用域根绝对路径"
+    );
 
-    // 第二次：同样 active=engram，状态门控应输出空。
+    // 第二次：仍在项目 a → 状态门控应输出空。
     let out2 = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        &ws_arg,
-        "--prompt",
-        "继续 engram",
+        &a_arg,
         "--state",
         &sp,
         "--now",
@@ -2841,17 +2810,15 @@ fn hot_index_state_gates_unchanged_active() {
     let s2 = String::from_utf8(out2.stdout).expect("stdout 非 UTF-8");
     assert!(
         s2.is_empty(),
-        "active 未变时应输出空（不重注入），实得：\n{s2}"
+        "作用域未变时应输出空（不重注入），实得：\n{s2}"
     );
 
-    // 第三次：active 变为 ai-2d-engine → 应重新有输出，并更新状态。
+    // 第三次：切到项目 b → 作用域根变化，应重新有输出并更新状态。
     let out3 = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        &ws_arg,
-        "--prompt",
-        "切到 ai-2d-engine",
+        &b_arg,
         "--state",
         &sp,
         "--now",
@@ -2860,47 +2827,35 @@ fn hot_index_state_gates_unchanged_active() {
     assert!(out3.status.success(), "第三次 hot-index 应成功");
     let s3 = String::from_utf8(out3.stdout).expect("stdout 非 UTF-8");
     assert!(
-        s3.contains("cue-s_ai"),
-        "active 变化后应渲染 ai-2d-engine 的 L4，实得：\n{s3}"
+        s3.contains("cue-s_b"),
+        "作用域变化后应渲染项目 b 的 L4，实得：\n{s3}"
     );
+    let canon_b = canonicalize_no_verbatim(&proj_b);
     let recorded2 = std::fs::read_to_string(&state_path).expect("应能读状态");
     assert_eq!(
         recorded2.trim(),
-        "ai-2d-engine",
-        "状态应更新为 ai-2d-engine"
+        canon_b.to_string_lossy(),
+        "状态应更新为项目 b 的作用域根绝对路径"
     );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&ws);
 }
 
-// 34. 无 active 时挂载集 = 公共 + 根 L4（不含任何子项目 L4）。
+// 34. 无任何 .engram 锚点的空目录：scope=cwd 自己，挂载「公共库 + cwd 的项目库」。
 #[test]
-fn hot_index_no_active_mounts_only_root_and_general() {
+fn hot_index_no_anchor_uses_cwd() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_noactive");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_noanchor");
+    let proj_name = last_segment(&proj);
+    // 给 cwd 自己建一个项目库（scope.db = cwd/.engram/engram.redb）。
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "na_eng",
+            "na_self",
             Level::L4_1,
-            Some("engram"),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        )],
-    );
-    let root_name = last_segment(&ws);
-    let _root_db = seed_claude_db(
-        &ws,
-        &[make(
-            "na_root",
-            Level::L4_1,
-            Some(&root_name),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
@@ -2908,7 +2863,7 @@ fn hot_index_no_active_mounts_only_root_and_general() {
         )],
     );
     let general_path = seed_db(
-        "hi_noactive_g",
+        "hi_noanchor_g",
         &[make(
             "na_gen",
             Level::L1,
@@ -2921,26 +2876,24 @@ fn hot_index_no_active_mounts_only_root_and_general() {
     );
     let g = general_path.to_string_lossy().to_string();
 
-    // 不给 prompt / transcript → 无信号 → 无 active。
     let out = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
+        proj.to_string_lossy().as_ref(),
         "--now",
         "1000000000",
     ]);
     assert!(out.status.success(), "hot-index 应成功");
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
     assert!(stdout.contains("cue-na_gen"), "应含公共 L1");
-    assert!(stdout.contains("cue-na_root"), "应含根 L4");
     assert!(
-        !stdout.contains("cue-na_eng"),
-        "无 active 时不应含任何子项目 L4，实得：\n{stdout}"
+        stdout.contains("cue-na_self"),
+        "应含 cwd 自身作用域库的 L4，实得：\n{stdout}"
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
 // 35. --emit json：可被 serde_json 解析、hookEventName 取自 --hook-event、additionalContext 非空。
@@ -2948,22 +2901,20 @@ fn hot_index_no_active_mounts_only_root_and_general() {
 fn hot_index_emit_json_wraps_context_with_hook_event() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_json");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_json");
+    let proj_name = last_segment(&proj);
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "j_eng",
+            "j_l4",
             Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _root_db = seed_claude_db(&ws, &[]);
     let general_path = seed_db("hi_json_g", &[]);
     let g = general_path.to_string_lossy().to_string();
 
@@ -2971,9 +2922,7 @@ fn hot_index_emit_json_wraps_context_with_hook_event() {
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--prompt",
-        "做 engram",
+        proj.to_string_lossy().as_ref(),
         "--emit",
         "json",
         "--hook-event",
@@ -3008,15 +2957,15 @@ fn hot_index_emit_json_wraps_context_with_hook_event() {
         "additionalContext 应含整段渲染文本，实得：\n{ctx}"
     );
     assert!(
-        ctx.contains("cue-j_eng"),
-        "additionalContext 应含活跃子项目 L4，实得：\n{ctx}"
+        ctx.contains("cue-j_l4"),
+        "additionalContext 应含作用域库 L4，实得：\n{ctx}"
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
-// 36. --from-hook-stdin：从 stdin 读 cwd / prompt 作兜底；空/非法 stdin 不崩。
+// 36. --from-hook-stdin：从 stdin 读 cwd 作兜底；空/非法 stdin 不崩。
 #[test]
 fn hot_index_from_hook_stdin_fallbacks() {
     let _guard = test_guard();
@@ -3024,28 +2973,26 @@ fn hot_index_from_hook_stdin_fallbacks() {
     use std::process::Stdio;
 
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_stdin");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_stdin");
+    let proj_name = last_segment(&proj);
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "stdin_eng",
+            "stdin_l4",
             Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _root_db = seed_claude_db(&ws, &[]);
     let general_path = seed_db("hi_stdin_g", &[]);
     let g = general_path.to_string_lossy().to_string();
 
-    // stdin 给 cwd（工作区根）+ prompt（提 engram），命令行不给 --workspace-root/--prompt。
-    let ws_json = ws.to_string_lossy().replace('\\', "\\\\");
-    let stdin_payload = format!("{{\"cwd\":\"{ws_json}\",\"prompt\":\"做 engram\"}}");
+    // stdin 给 cwd（项目根），命令行不给 --workspace-root。
+    let proj_json = proj.to_string_lossy().replace('\\', "\\\\");
+    let stdin_payload = format!("{{\"cwd\":\"{proj_json}\"}}");
 
     let exe = env!("CARGO_BIN_EXE_engram");
     let mut child = Command::new(exe)
@@ -3074,17 +3021,17 @@ fn hot_index_from_hook_stdin_fallbacks() {
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
     assert!(
-        stdout.contains("cue-stdin_eng"),
-        "应从 stdin 的 cwd/prompt 兜底判出 engram，实得：\n{stdout}"
+        stdout.contains("cue-stdin_l4"),
+        "应从 stdin 的 cwd 兜底锚定作用域，实得：\n{stdout}"
     );
 
-    // 空 stdin 也不应 panic（无信号 → 无 active，仍正常输出根+公共）。
+    // 空 stdin 也不应 panic（cwd 退回进程当前目录，仍正常输出）。
     let mut child2 = Command::new(exe)
         .arg("hot-index")
         .arg("--general-db")
         .arg(&g)
         .arg("--workspace-root")
-        .arg(ws.to_string_lossy().as_ref())
+        .arg(proj.to_string_lossy().as_ref())
         .arg("--from-hook-stdin")
         .arg("--now")
         .arg("1000000000")
@@ -3103,43 +3050,39 @@ fn hot_index_from_hook_stdin_fallbacks() {
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
-// 37. --log：追加一行 hot-index 记录，含 event / active / root / ws。
+// 37. --log：追加一行 hot-index 记录，含 event / kind / name / root。
 #[test]
 fn hot_index_log_appends_record() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_log");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_log");
+    let proj_name = last_segment(&proj);
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "log_eng",
+            "log_l4",
             Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _root_db = seed_claude_db(&ws, &[]);
     let general_path = seed_db("hi_log_g", &[]);
     let g = general_path.to_string_lossy().to_string();
 
-    let log_path = ws.join("logs").join("hi.log");
+    let log_path = proj.join("logs").join("hi.log");
     let lp = log_path.to_string_lossy().to_string();
 
     let out = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--prompt",
-        "做 engram",
+        proj.to_string_lossy().as_ref(),
         "--hook-event",
         "UserPromptSubmit",
         "--log",
@@ -3160,14 +3103,19 @@ fn hot_index_log_appends_record() {
         lines[0]
     );
     assert!(
-        lines[0].contains("active=engram"),
-        "应记 active=engram，实得：{}",
+        lines[0].contains("kind=project"),
+        "应记 kind=project，实得：{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains(&format!("name={proj_name}")),
+        "应记 name=<项目名>，实得：{}",
         lines[0]
     );
     assert!(lines[0].starts_with("1700000000 "), "应以 now 开头");
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
 // ============================================================================
@@ -3369,20 +3317,20 @@ fn status_full_shows_breakdown_fields() {
     cleanup_file(&p_path);
 }
 
-// 40. status 把工作区根 L4 库一并计入挂载集（复用 hot-index 那套加载）。
+// 40. status 把作用域库一并计入挂载集（从 --workspace-root 向上锚定的作用域库）。
 #[test]
-fn status_includes_workspace_root_l4() {
+fn status_includes_scope_l4() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("status_ws");
-    let root_name = last_segment(&ws);
-    // 根 L4 库一条 active L4.1（project = 根名）。
-    let _root_db = seed_claude_db(
-        &ws,
+    let proj = unique_workspace_root("status_ws");
+    let proj_name = last_segment(&proj);
+    // 作用域库（项目库）一条 active L4.1（project = 项目名）。
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "ws_root_l4",
+            "ws_scope_l4",
             Level::L4_1,
-            Some(&root_name),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
@@ -3407,7 +3355,7 @@ fn status_includes_workspace_root_l4() {
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
+        proj.to_string_lossy().as_ref(),
         "--format",
         "oneline",
         "--now",
@@ -3419,14 +3367,14 @@ fn status_includes_workspace_root_l4() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
-    // 通用 L1:1；根 L4 计为 <root_name>:1。
+    // 通用 L1:1；作用域库 L4 计为 <proj_name>:1。
     assert!(
-        stdout.trim_end() == format!("● Engram | L1:1 L2:0 L3:0 | {root_name}:1"),
-        "应把工作区根 L4 计入挂载集（{root_name}:1），实得：\n{stdout}"
+        stdout.trim_end() == format!("● Engram | L1:1 L2:0 L3:0 | {proj_name}:1"),
+        "应把作用域库 L4 计入挂载集（{proj_name}:1），实得：\n{stdout}"
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
 // 41. hot-index --status-file：运行后该文件存在，内容等于 oneline_status（覆盖写）；
@@ -3435,30 +3383,15 @@ fn status_includes_workspace_root_l4() {
 fn hot_index_status_file_written_equals_oneline() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_sf");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    // engram 子项目库一条 L4.1（被 prompt 激活后挂载）。
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_sf");
+    let proj_name = last_segment(&proj);
+    // 作用域（项目）库一条 L4.1。
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "sf_eng",
+            "sf_l4",
             Level::L4_1,
-            Some("engram"),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        )],
-    );
-    // 根 L4 库一条 L4.1（root 名作 project）。
-    let root_name = last_segment(&ws);
-    let _root_db = seed_claude_db(
-        &ws,
-        &[make(
-            "sf_root",
-            Level::L4_1,
-            Some(&root_name),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
@@ -3492,7 +3425,7 @@ fn hot_index_status_file_written_equals_oneline() {
     let g = general_path.to_string_lossy().to_string();
 
     // status 文件放在尚不存在的子目录下，验证父目录会被自动创建。
-    let status_file = ws.join("statusbar").join("engram.status");
+    let status_file = proj.join("statusbar").join("engram.status");
     let sf = status_file.to_string_lossy().to_string();
     assert!(
         !status_file.parent().expect("应有父目录").exists(),
@@ -3503,9 +3436,7 @@ fn hot_index_status_file_written_equals_oneline() {
         "--general-db",
         &g,
         "--workspace-root",
-        ws.to_string_lossy().as_ref(),
-        "--prompt",
-        "做 engram",
+        proj.to_string_lossy().as_ref(),
         "--status-file",
         &sf,
         "--now",
@@ -3524,8 +3455,7 @@ fn hot_index_status_file_written_equals_oneline() {
         status_file.display()
     );
     let content = std::fs::read_to_string(&status_file).expect("应能读状态文件");
-    // 内容应等于挂载集（公共 L1:1 L3:1 + 根 L4 + 激活的 engram L4）的 oneline_status。
-    // 用库函数算出期望值，保证与实现一致（项目按名升序：engram 在 <root_name> 关系视名字而定）。
+    // 内容应等于挂载集（公共 L1:1 L3:1 + 作用域库 L4）的 oneline_status。
     use engram::commands::oneline_status;
     let expected_mems = vec![
         make(
@@ -3547,18 +3477,9 @@ fn hot_index_status_file_written_equals_oneline() {
             vec![now],
         ),
         make(
-            "sf_root",
+            "sf_l4",
             Level::L4_1,
-            Some(&root_name),
-            Status::Active,
-            0.5,
-            now,
-            vec![now],
-        ),
-        make(
-            "sf_eng",
-            Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
@@ -3572,30 +3493,28 @@ fn hot_index_status_file_written_equals_oneline() {
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
-// 42. hot-index --status-file 在状态门控判空（active 未变）时仍写状态文件。
+// 42. hot-index --status-file 在状态门控判空（作用域未变）时仍写状态文件。
 #[test]
 fn hot_index_status_file_written_even_when_gated_empty() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let ws = unique_workspace_root("hi_sf_gate");
-    let engram_dir = ws.join("engram");
-    std::fs::create_dir_all(&engram_dir).expect("建 engram");
-    let _eng_db = seed_claude_db(
-        &engram_dir,
+    let proj = unique_workspace_root("hi_sf_gate");
+    let proj_name = last_segment(&proj);
+    let _proj_db = seed_engram_db(
+        &proj,
         &[make(
-            "g_eng",
+            "g_l4",
             Level::L4_1,
-            Some("engram"),
+            Some(&proj_name),
             Status::Active,
             0.5,
             now,
             vec![now],
         )],
     );
-    let _root_db = seed_claude_db(&ws, &[]);
     let general_path = seed_db(
         "hi_sf_gate_g",
         &[make(
@@ -3609,20 +3528,18 @@ fn hot_index_status_file_written_even_when_gated_empty() {
         )],
     );
     let g = general_path.to_string_lossy().to_string();
-    let state_path = ws.join("state.txt");
+    let state_path = proj.join("state.txt");
     let sp = state_path.to_string_lossy().to_string();
-    let status_file = ws.join("engram.status");
+    let status_file = proj.join("engram.status");
     let sf = status_file.to_string_lossy().to_string();
-    let ws_arg = ws.to_string_lossy().to_string();
+    let proj_arg = proj.to_string_lossy().to_string();
 
-    // 第一次：active=engram，状态文件无 → 有输出，写回状态与状态栏文件。
+    // 第一次：作用域=proj，状态文件无 → 有输出，写回状态与状态栏文件。
     let out1 = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        &ws_arg,
-        "--prompt",
-        "做 engram",
+        &proj_arg,
         "--state",
         &sp,
         "--status-file",
@@ -3640,14 +3557,12 @@ fn hot_index_status_file_written_even_when_gated_empty() {
     // 篡改状态栏文件内容，验证第二次（门控判空）仍会覆盖刷新它。
     std::fs::write(&status_file, "STALE").expect("应能改写状态文件");
 
-    // 第二次：同样 active=engram → 状态门控判空、输出空，但状态栏文件仍应被覆盖刷新。
+    // 第二次：仍在 proj → 状态门控判空、输出空，但状态栏文件仍应被覆盖刷新。
     let out2 = run_hot_index_raw(&[
         "--general-db",
         &g,
         "--workspace-root",
-        &ws_arg,
-        "--prompt",
-        "继续 engram",
+        &proj_arg,
         "--state",
         &sp,
         "--status-file",
@@ -3671,5 +3586,151 @@ fn hot_index_status_file_written_even_when_gated_empty() {
     );
 
     cleanup_file(&general_path);
-    let _ = std::fs::remove_dir_all(&ws);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// ============================================================================
+// root 子命令的集成测试
+// ============================================================================
+
+/// 调用 `engram root ...`，返回完整 Output（调用方自行断言）。
+fn run_root_raw(args: &[&str]) -> std::process::Output {
+    run_subcommand_raw("root", args)
+}
+
+// 43. root 把空目录设为项目管理目录：建 .engram/workspace 与空库、往公共库写一条 L2，
+//     stdout 打印该目录绝对路径；幂等（再跑一次仍成功且不重复）。
+#[test]
+fn root_creates_workspace_marker_and_memory_idempotent() {
+    let _guard = test_guard();
+    let dir = unique_workspace_root("root_mk");
+    let general_path = unique_db_path("root_mk_g");
+    let d = dir.to_string_lossy().to_string();
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_root_raw(&["--project-dir", &d, "--general-db", &g]);
+    assert!(
+        out.status.success(),
+        "root 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    // stdout 打印管理目录绝对路径（规范化后），非空且指向该目录末段名。
+    let printed = stdout.trim();
+    assert!(!printed.is_empty(), "应打印管理目录路径");
+    assert!(
+        printed.ends_with(&last_segment(&dir)),
+        "打印路径应以目录末段名结尾，实得：{printed}"
+    );
+
+    // 应建出 .engram/workspace 标记 + .engram/engram.redb 空库。
+    let canon = canonicalize_no_verbatim(&dir);
+    assert!(
+        canon.join(".engram").join("workspace").is_file(),
+        "应建出 .engram/workspace 标记"
+    );
+    assert!(
+        canon.join(".engram").join("engram.redb").is_file(),
+        "应建出 .engram/engram.redb 空库"
+    );
+
+    // 公共库应有一条带 workspace 标签的 L2 记忆。
+    let gdb = store::open(&general_path).expect("应能打开公共库");
+    let mems = store::all(&gdb).expect("应能读公共库");
+    drop(gdb);
+    assert_eq!(mems.len(), 1, "公共库应恰有一条管理目录记忆");
+    let m = &mems[0];
+    assert_eq!(m.level, Level::L2, "管理目录记忆应为 L2");
+    assert_eq!(m.project, None, "管理目录记忆为通用（project=None）");
+    assert!(
+        m.tags.iter().any(|t| t == "workspace"),
+        "应带 workspace 标签"
+    );
+    assert!((m.importance - 0.6).abs() < 1e-9, "importance 应为 0.6");
+
+    // 幂等：再跑一次应成功，且不再新增公共库记忆。
+    let out2 = run_root_raw(&["--project-dir", &d, "--general-db", &g]);
+    assert!(out2.status.success(), "第二次 root 应成功（幂等）");
+    let stdout2 = String::from_utf8(out2.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout2.contains("已是 engram 项目管理目录"),
+        "幂等路径应提示已是管理目录，实得：{stdout2}"
+    );
+    let gdb2 = store::open(&general_path).expect("应能打开公共库");
+    let mems2 = store::all(&gdb2).expect("应能读公共库");
+    drop(gdb2);
+    assert_eq!(mems2.len(), 1, "幂等再跑不应新增公共库记忆");
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 44. root 防嵌套：父目录已是管理目录时，子目录再 root 应失败（非 0）。
+#[test]
+fn root_rejects_nesting_under_existing_workspace() {
+    let _guard = test_guard();
+    let parent = unique_workspace_root("root_nest");
+    seed_workspace(&parent); // 父目录已是管理目录。
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("建 child");
+    let general_path = unique_db_path("root_nest_g");
+    let c = child.to_string_lossy().to_string();
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_root_raw(&["--project-dir", &c, "--general-db", &g]);
+    assert!(!out.status.success(), "在管理目录下再 root 应失败（非 0）");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("不能嵌套"),
+        "stderr 应提示不能嵌套，实得：{stderr}"
+    );
+    // 不应在 child 下建出 .engram。
+    assert!(
+        !child.join(".engram").exists(),
+        "嵌套失败时不应建出 child/.engram"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+// 45. root 冲突：目录已是普通项目（有项目库、无 workspace 标记）时 root 应失败。
+#[test]
+fn root_rejects_existing_plain_project() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let dir = unique_workspace_root("root_conflict");
+    // 先把它建成普通项目（有 .engram/engram.redb、无 workspace 标记）。
+    let _db = seed_engram_db(
+        &dir,
+        &[make(
+            "existing",
+            Level::L4_1,
+            Some(&last_segment(&dir)),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let general_path = unique_db_path("root_conflict_g");
+    let d = dir.to_string_lossy().to_string();
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_root_raw(&["--project-dir", &d, "--general-db", &g]);
+    assert!(!out.status.success(), "已是普通项目时 root 应失败（非 0）");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("已是 engram 项目"),
+        "stderr 应提示已是普通项目，实得：{stderr}"
+    );
+    // 不应写出 workspace 标记。
+    let canon = canonicalize_no_verbatim(&dir);
+    assert!(
+        !canon.join(".engram").join("workspace").exists(),
+        "冲突失败时不应写出 workspace 标记"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&dir);
 }

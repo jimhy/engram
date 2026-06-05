@@ -14,9 +14,10 @@
 //! - [`merge_level`] / [`merge_access_log`] / [`merge_tags`] / [`build_merged_memory`]：
 //!   merge 命令的字段合并纯逻辑；
 //! - [`last_touch`] / [`gc_should_delete`]：gc 命令的 TTL 判定纯逻辑。
-//! - [`resolve_paths`] / [`home_dir`]：hook 辅助命令（session-start / resolve）的
-//!   **路径解析约定**（纯计算，不碰文件系统），把"general 库 / project 库 /
-//!   project 名"三者的推导收进引擎，让 hook 侧近乎零逻辑。
+//! - [`home_dir`] / [`resolve_project_scope`]：hook 辅助命令（session-start /
+//!   resolve / hot-index / root）的**作用域锚定约定**（纯计算，从 cwd 向上找
+//!   `.engram/` 锚点，把"general 库 / 作用域库 / 作用域名"三者的推导收进引擎，
+//!   让 hook 侧近乎零逻辑）。
 //!
 //! 设计文档参考：§13 交付形态（多库分置）、§4 显式召回 recall、§7.4 TTL 硬删除。
 
@@ -69,27 +70,11 @@ pub fn parse_project_dbs(raw: &[String]) -> Result<BTreeMap<String, PathBuf>, St
     Ok(map)
 }
 
-/// hook 辅助命令解析出的三个路径/名称约定结果。
-///
-/// 由 [`resolve_paths`] 纯计算得出，供 `session-start` / `resolve` 子命令使用：
-/// - `general_db`：公共库（L1/L2/L3 通用记忆）的 redb 文件路径；
-/// - `project_db`：当前项目库（L4 记忆）的 redb 文件路径；
-/// - `project_name`：当前项目名（用于 `--project-db name=path` 映射）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedPaths {
-    /// 公共库 redb 文件路径。
-    pub general_db: PathBuf,
-    /// 当前项目库 redb 文件路径。
-    pub project_db: PathBuf,
-    /// 当前项目名（`project_dir` 的最后一段目录名，取不到则为 `"root"`）。
-    pub project_name: String,
-}
-
 /// 用注入式的环境变量查找闭包推导用户主目录（HOME）。
 ///
 /// 优先取 `USERPROFILE`（Windows 主目录变量），缺省再取 `HOME`（类 Unix）。
-/// 把"环境变量读取"做成可注入的闭包，是为了让 [`resolve_paths`] 可被纯单测覆盖：
-/// 测试时传入假 env 查找，不依赖真实进程环境变量。
+/// 把"环境变量读取"做成可注入的闭包，是为了让调用方（如 main.rs 的 `resolve_scope`）
+/// 可被纯单测覆盖：测试时传入假 env 查找，不依赖真实进程环境变量。
 ///
 /// # 参数
 /// - `env_lookup`：给定变量名返回其值（`Some`）或不存在（`None`）的查找闭包。
@@ -111,55 +96,115 @@ where
     Err("无法确定用户主目录：环境变量 USERPROFILE 与 HOME 均未设置".to_string())
 }
 
-/// 解析 hook 辅助命令所需的三条路径/名称约定（**纯计算，不碰文件系统**）。
-///
-/// 约定：
-/// - `general_db` = `general_override` 若给定；否则 `<HOME>/.engram/general.redb`，
-///   其中 HOME 由 [`home_dir`] 用注入的 `env_lookup` 推导（`USERPROFILE` 优先，
-///   缺省再取 `HOME`）。两者都取不到时返回错误（不 panic、不 unwrap）。
-/// - `project_db` = `<project_dir>/.claude/engram.redb`。
-/// - `project_name` = `project_dir` 的最后一段目录名（[`Path::file_name`]）；取不到
-///   （如根盘符 `C:\` / `/`）时回退为 `"root"`。
-///
-/// 本函数只拼路径、读 env，不创建目录、不打开库（便于纯单测）。确保父目录存在
-/// 是调用方（CLI 编排层）的职责。
-///
-/// # 参数
-/// - `project_dir`：当前项目根目录。
-/// - `general_override`：`--general-db` 显式指定的公共库路径（`None` 时走默认约定）。
-/// - `env_lookup`：环境变量查找闭包（生产传 `|k| std::env::var(k).ok()`）。
-///
-/// # Errors
-/// 当 `general_override` 为 `None` 且 [`home_dir`] 无法确定主目录时，返回其错误说明。
-pub fn resolve_paths<F>(
-    project_dir: &Path,
-    general_override: Option<&Path>,
-    env_lookup: F,
-) -> Result<ResolvedPaths, String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let general_db = match general_override {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let home = home_dir(env_lookup)?;
-            home.join(".engram").join("general.redb")
-        }
-    };
+/// engram 在每个项目根 / 项目管理目录下的数据目录名（取代旧的 `.claude`）。
+pub const ENGRAM_DIR: &str = ".engram";
+/// 项目库 / 管理库的文件名（位于 `.engram/` 内）。
+pub const ENGRAM_DB_FILE: &str = "engram.redb";
+/// 项目管理目录的标记文件名（位于 `.engram/` 内，仅项目管理目录才有）。
+pub const WORKSPACE_MARKER: &str = "workspace";
 
-    let project_db = project_dir.join(".claude").join("engram.redb");
+/// 一个作用域是「具体项目」还是「项目管理目录」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeKind {
+    /// 具体项目：记忆写它的 L4 库。
+    Project,
+    /// 项目管理目录：只存少量「管理层」记忆；具体项目应建在它的子目录里
+    /// （`cwd` 正好是管理目录本身时，agent 应主动在其下建项目目录再工作）。
+    Workspace,
+}
 
-    let project_name = project_dir
-        .file_name()
+/// 从 `cwd` 向上锚定出的作用域：项目根（或管理目录）及其库路径、名字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectScope {
+    /// 是具体项目还是项目管理目录。
+    pub kind: ScopeKind,
+    /// 作用域根目录（项目根，或管理目录本身）。
+    pub root: PathBuf,
+    /// 该作用域的库：`<root>/.engram/engram.redb`。
+    pub db: PathBuf,
+    /// 作用域名（`root` 的末段目录名；取不到回退 `"root"`）。
+    pub name: String,
+}
+
+/// 返回 `<dir>/.engram/engram.redb`。
+fn engram_db_in(dir: &Path) -> PathBuf {
+    dir.join(ENGRAM_DIR).join(ENGRAM_DB_FILE)
+}
+
+/// `dir` 的末段目录名；取不到（根盘符 `C:\` / `/` 等）回退 `"root"`。
+fn dir_name_or_root(dir: &Path) -> String {
+    dir.file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "root".to_string());
+        .unwrap_or_else(|| "root".to_string())
+}
 
-    Ok(ResolvedPaths {
-        general_db,
-        project_db,
-        project_name,
-    })
+/// 从 `cwd` 向上锚定项目作用域：找最近的 `.engram/`，据其是否带 `workspace` 标记
+/// 区分「具体项目」与「项目管理目录」，按三种情况返回作用域。
+///
+/// **纯逻辑**：文件系统探测由注入的两个闭包完成（便于单测，不直接碰磁盘）。
+///
+/// 规则（自 `cwd` 起逐级向上，遇到的**第一个**含 `.engram/` 的目录 `D` 即停）：
+/// 1. `D/.engram/workspace` 存在（项目管理目录 `M = D`）：
+///    - `D == cwd`：当前就在管理目录本身 → `Workspace`（库 = `M/.engram/engram.redb`，
+///      存少量管理记忆；agent 应主动在其下建项目目录）；
+///    - 否则（`D` 是 `cwd` 的祖先）：项目根 = `D` 朝 `cwd` 方向的**直接下一级**子目录
+///      → `Project`（即「管理目录的直接子目录就是项目」）。
+/// 2. `D` 不带 `workspace` 标记（普通项目的 `.engram/`）：项目根 = `D` → `Project`
+///    （你的 `项目/src` 例子：在子目录开会话向上找到 `项目/.engram/`，认定项目根=项目）。
+/// 3. 向上到尽头都没有 `.engram/`：`cwd` 即项目根 → `Project`（随手放的项目，
+///    将在 `cwd` 建 `.engram/`）。
+///
+/// # 参数
+/// - `cwd`：当前工作目录。
+/// - `has_engram`：判断 `<dir>/.engram/` 是否存在。
+/// - `is_workspace`：判断 `<dir>/.engram/workspace` 标记是否存在。
+pub fn resolve_project_scope<E, W>(cwd: &Path, has_engram: E, is_workspace: W) -> ProjectScope
+where
+    E: Fn(&Path) -> bool,
+    W: Fn(&Path) -> bool,
+{
+    // ancestors(): [cwd, parent, ..., root]；下标 0 即 cwd 自己。
+    let chain: Vec<&Path> = cwd.ancestors().collect();
+    for (i, dir) in chain.iter().enumerate() {
+        if !has_engram(dir) {
+            continue;
+        }
+        if is_workspace(dir) {
+            // 管理目录 M = dir。
+            if i == 0 {
+                // cwd 就是管理目录本身。
+                return ProjectScope {
+                    kind: ScopeKind::Workspace,
+                    root: dir.to_path_buf(),
+                    db: engram_db_in(dir),
+                    name: dir_name_or_root(dir),
+                };
+            }
+            // 项目根 = M 朝 cwd 方向的直接下一级 = chain[i-1]（i>=1 时必存在）。
+            let proj = chain[i - 1];
+            return ProjectScope {
+                kind: ScopeKind::Project,
+                root: proj.to_path_buf(),
+                db: engram_db_in(proj),
+                name: dir_name_or_root(proj),
+            };
+        }
+        // 普通项目的 .engram/（无 workspace 标记）。
+        return ProjectScope {
+            kind: ScopeKind::Project,
+            root: dir.to_path_buf(),
+            db: engram_db_in(dir),
+            name: dir_name_or_root(dir),
+        };
+    }
+    // 向上到尽头都没有 .engram/：cwd 即项目根。
+    ProjectScope {
+        kind: ScopeKind::Project,
+        root: cwd.to_path_buf(),
+        db: engram_db_in(cwd),
+        name: dir_name_or_root(cwd),
+    }
 }
 
 /// 把 CLI 传入的层级字符串解析为 [`Level`]。
@@ -675,275 +720,8 @@ pub fn gc_should_delete(m: &Memory, now: f64, ttl_days: f64, tombstone_ttl_days:
 }
 
 // ============================================================================
-// hot-index：动态按需挂载子项目 L4 的活跃子项目判定（纯逻辑，便于单测）
+// hot-index：状态栏一行串（纯逻辑，便于单测）
 // ============================================================================
-
-/// 判断一个 workspace-root 直接子目录名是否「可作为活跃子项目挂载」。
-///
-/// workspace-root 下的真实子目录里，有不少是工具/构建/版本控制的基础设施目录
-/// （如 `.claude`、`.git`、`node_modules`、`target`），它们虽是真实子目录，但
-/// 绝不是用户的「子项目」。真实工作区的 transcript 必然频繁触碰这些路径
-/// （例如 `<root>/.claude/...`），若不排除，活跃子项目判定会被它们污染——把
-/// `.claude` 当成活跃子项目而乱挂、状态乱跳。
-///
-/// 排除规则：满足以下任一即**不可挂载**（返回 `false`）：
-/// - 名字以 `.` 开头（dotdir，如 `.claude`、`.git`、`.vscode`）；
-/// - 名字在 denylist 内：`node_modules`、`target`、`dist`、`build`、`out`、`.`、`..`。
-///
-/// 其余名字（如 `engram`、`ai-2d-engine`）返回 `true`。
-///
-/// 本判定供三处复用：① prompt 信号候选（[`active_from_prompt`]）；② transcript
-/// 信号候选（[`active_from_transcript`]）；③ `main.rs` 枚举可挂载子目录时的过滤。
-///
-/// # 参数
-/// - `name`：待判定的子目录名（workspace-root 的某个直接子目录名）。
-pub fn is_mountable_subproject_name(name: &str) -> bool {
-    /// 即便不以 `.` 开头、也绝不作为子项目挂载的工具/构建目录名。
-    const DENYLIST: &[&str] = &["node_modules", "target", "dist", "build", "out", ".", ".."];
-    if name.starts_with('.') {
-        return false;
-    }
-    !DENYLIST.contains(&name)
-}
-
-/// 判断某字符是否为「词/路径段」边界字符。
-///
-/// 用于信号 A（prompt 显式提及）的整词匹配：一个子目录名要被认作「被提及」，
-/// 其在 prompt 文本里的出现两侧必须都是边界字符（或文本端点），避免把
-/// `engram` 误命中在 `engrams` / `myengram` 之类的子串里。
-///
-/// 边界字符包括：ASCII 字母数字与下划线**之外**的一切字符（含路径分隔符
-/// `/` `\`、空白、标点、CJK 等）。即：只有当两侧不是「标识符字符」时才算边界。
-///
-/// # 参数
-/// - `c`：待判定字符。
-fn is_word_boundary(c: char) -> bool {
-    !(c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// 在 `haystack` 中查找 `needle` 作为「完整词/路径段」**最后一次**出现的字节位置。
-///
-/// 「完整词」指该出现的左右两侧要么是文本端点，要么是 [`is_word_boundary`] 字符。
-/// 返回最后一次合法出现的起始字节下标；从不合法出现（如仅作为更长标识符的子串）
-/// 则返回 `None`。`needle` 为空时返回 `None`。
-///
-/// 用于信号 A：判断某子目录名是否作为完整词出现在 prompt 中、并取其位置以选「最后」。
-///
-/// # 参数
-/// - `haystack`：被搜索文本（如 prompt）。
-/// - `needle`：待查找的词（如子目录名）。
-fn last_word_occurrence(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    let nbytes = needle.len();
-    let mut last: Option<usize> = None;
-    let mut search_from = 0usize;
-    while let Some(rel) = haystack[search_from..].find(needle) {
-        let start = search_from + rel;
-        let end = start + nbytes;
-        // 左边界：start 处的前一个字符（若有）须为边界字符。
-        let left_ok = start == 0
-            || haystack[..start]
-                .chars()
-                .next_back()
-                .is_some_and(is_word_boundary);
-        // 右边界：end 处的后一个字符（若有）须为边界字符。
-        let right_ok =
-            end >= haystack.len() || haystack[end..].chars().next().is_some_and(is_word_boundary);
-        if left_ok && right_ok {
-            last = Some(start);
-        }
-        // 继续向后找下一处（步进 1 字节避免死循环；needle 至少 1 字节）。
-        search_from = start + 1;
-        if search_from >= haystack.len() {
-            break;
-        }
-    }
-    last
-}
-
-/// 信号 A：从 prompt 文本里挑出**最后被显式提及**的子目录名。
-///
-/// 对每个候选子目录名做「完整词」匹配，在 prompt 里找其作为完整词
-/// 的最后出现位置；在所有「确有出现」的候选中，取**出现位置最靠后**者。位置相同
-/// （理论上不会，因 needle 非空且互不为同一字符串起点）时取候选列表中靠后者。
-///
-/// # 参数
-/// - `prompt`：用户本次 prompt 文本。
-/// - `subdirs`：workspace_root 的直接子目录名列表。
-///
-/// # 返回
-/// 最后被提及的子目录名（`Some`），或都未被提及（`None`）。
-pub fn active_from_prompt(prompt: &str, subdirs: &[String]) -> Option<String> {
-    let mut best: Option<(usize, &String)> = None;
-    for name in subdirs {
-        // 排除 dotdir / 基础设施目录（`.claude`、`.git`、`node_modules` 等）：
-        // 它们虽是真实子目录，但绝不作为活跃子项目。
-        if !is_mountable_subproject_name(name) {
-            continue;
-        }
-        if let Some(pos) = last_word_occurrence(prompt, name) {
-            match best {
-                Some((bpos, _)) if bpos >= pos => {}
-                _ => best = Some((pos, name)),
-            }
-        }
-    }
-    best.map(|(_, name)| name.clone())
-}
-
-/// 信号 B：从 transcript 文本里挑出**最近被触碰**的子目录名。
-///
-/// 在 transcript 整体文本里寻找形如「`<workspace_root><分隔符><段名>」的出现，
-/// 分隔符同时匹配 `/`、`\`、`\\`（后者是 JSON 字符串里反斜杠的转义形态）。取
-/// **最后一次**出现所对应的段名。段名以下一个「非段字符」（路径分隔符、引号、
-/// 空白等）为界截取。
-///
-/// 实现细节：
-/// - workspace_root 自身的路径分隔符差异（`/` vs `\` vs `\\`）也会被归一比较，
-///   即先把 transcript 与 root 都按「分隔符归一」后再做前缀匹配，使
-///   `F:/ClaudeWorkspaces` 能匹配到 transcript 里写成 `F:\\ClaudeWorkspaces`
-///   的同一路径。
-/// - 只认 root 之后**紧跟一个分隔符**再接段名的形态；段名为空（root 后直接是
-///   另一个分隔符或结束）则跳过该处。
-///
-/// # 参数
-/// - `transcript`：transcript 文件的整体文本。
-/// - `workspace_root`：工作区根目录路径字符串。
-/// - `subdirs`：workspace_root 的直接子目录名列表（用于校验段名确为真实子目录）。
-///
-/// # 返回
-/// 最后被触碰、且确为真实子目录的段名（`Some`），或无任何命中（`None`）。
-pub fn active_from_transcript(
-    transcript: &str,
-    workspace_root: &str,
-    subdirs: &[String],
-) -> Option<String> {
-    // 把任意路径分隔符序列（`/` `\` `\\`）归一为单个 '/'，便于跨写法匹配。
-    let norm = normalize_separators(transcript);
-    let root_norm = normalize_separators(workspace_root);
-    // root 归一后去掉尾部分隔符，统一在其后强制要求一个 '/'。
-    let root_trimmed = root_norm.trim_end_matches('/');
-    if root_trimmed.is_empty() {
-        return None;
-    }
-
-    let needle = format!("{root_trimmed}/");
-    let mut last: Option<String> = None;
-    let mut from = 0usize;
-    while let Some(rel) = norm[from..].find(&needle) {
-        let seg_start = from + rel + needle.len();
-        // root 后紧跟的段：取到下一个「段终止符」（路径分隔符 '/'、引号、空白、
-        // 或其它非段字符）为界。段名可含 '.' '-' '_' 等普通文件名字符，但不含
-        // 分隔符与引号/空白——transcript 里路径常被引号或空白包裹。
-        let rest = &norm[seg_start..];
-        let seg_end = rest.find(is_segment_terminator).unwrap_or(rest.len());
-        let seg = &rest[..seg_end];
-        // 校验该段确为真实子目录名（精确相等，避免把更长名误判），且为「可挂载子项目」。
-        // 关键：`.claude` / `.git` / `node_modules` 等段即便确是真实子目录也**跳过**，
-        // **不更新** `last`——这样 `<root>/engram/y.rs` 之后又出现 `<root>/.claude/x`
-        // 时，active 仍取剩余里最后触碰的 `engram`，而不会被 `.claude` 顶掉变 None。
-        if is_mountable_subproject_name(seg) && subdirs.iter().any(|s| s == seg) {
-            last = Some(seg.to_string());
-        }
-        from = seg_start.max(from + rel + 1);
-        if from >= norm.len() {
-            break;
-        }
-    }
-    last
-}
-
-/// 判断某字符是否为「路径段终止符」：归一后的分隔符 `/`、引号、空白等。
-///
-/// 用于 [`active_from_transcript`] 从 root 之后截取段名：transcript 里路径常被
-/// 双引号包裹或以空白/换行结尾，故这些字符都视作段的边界。
-fn is_segment_terminator(c: char) -> bool {
-    c == '/' || c == '"' || c == '\'' || c.is_whitespace() || c.is_control()
-}
-
-/// 把字符串里的路径分隔符序列（任意数量连续的 `/` 或 `\`）归一为单个 `/`。
-///
-/// 这样 `F:\\ClaudeWorkspaces\\engram`、`F:/ClaudeWorkspaces/engram`、
-/// `F:\ClaudeWorkspaces\engram` 归一后都成 `F:/ClaudeWorkspaces/engram`，
-/// 供 [`active_from_transcript`] 跨写法做前缀匹配。
-///
-/// # 参数
-/// - `s`：原始文本。
-fn normalize_separators(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_sep = false;
-    for c in s.chars() {
-        if c == '/' || c == '\\' {
-            if !prev_sep {
-                out.push('/');
-                prev_sep = true;
-            }
-        } else {
-            out.push(c);
-            prev_sep = false;
-        }
-    }
-    out
-}
-
-/// 综合信号 A / B，判定本次的活跃子项目名。
-///
-/// 优先级：信号 A（prompt 显式提及，[`active_from_prompt`]）优先；其次信号 B
-/// （transcript 最近触碰，[`active_from_transcript`]）；都没有则 `None`。本函数
-/// 只做「字符串/正则层面的判定」，不校验目录是否真实存在（真实性由调用方在
-/// 拿到候选后用文件系统二次校验）；但信号 B 内部已要求段名属 `subdirs`。
-///
-/// 注意：信号 A 的候选 `subdirs` 也应是真实子目录列表（由调用方枚举得到），
-/// 因此返回值已是「真实子目录名」级别的候选。
-///
-/// # 参数
-/// - `prompt`：本次 prompt 文本（`None` 表示无 prompt）。
-/// - `transcript`：transcript 整体文本（`None` 表示无 transcript）。
-/// - `workspace_root`：工作区根目录路径字符串。
-/// - `subdirs`：workspace_root 的直接子目录名列表。
-///
-/// # 返回
-/// 活跃子项目名（`Some`）或无法判定（`None`）。
-pub fn decide_active(
-    prompt: Option<&str>,
-    transcript: Option<&str>,
-    workspace_root: &str,
-    subdirs: &[String],
-) -> Option<String> {
-    if let Some(p) = prompt {
-        if let Some(name) = active_from_prompt(p, subdirs) {
-            return Some(name);
-        }
-    }
-    if let Some(t) = transcript {
-        if let Some(name) = active_from_transcript(t, workspace_root, subdirs) {
-            return Some(name);
-        }
-    }
-    None
-}
-
-/// 状态门控比较：本次 active 名与上次是否**相同**（相同则无需重注入）。
-///
-/// 把 `None`（无活跃子项目）归一为给定的 `root_name`，与状态文件里记录的上次名
-/// （同样用 `root_name` 表示「无活跃子项目」）做相等比较。
-///
-/// # 参数
-/// - `current`：本次判定出的活跃子项目名（`None` 表示无、即根）。
-/// - `last`：状态文件里上次记录的名（`None` 表示状态文件不存在/为空）。
-/// - `root_name`：根项目名（用于把「无活跃子项目」归一表示）。
-///
-/// # 返回
-/// `true` 表示与上次相同（应输出空、不重注入）；`false` 表示有变化（应渲染）。
-pub fn active_unchanged(current: Option<&str>, last: Option<&str>, root_name: &str) -> bool {
-    let cur = current.unwrap_or(root_name);
-    match last {
-        Some(prev) => prev == cur,
-        None => false,
-    }
-}
 
 /// 把**当前挂载集**的 active 记忆分布压成一行紧凑状态串，供状态栏显示。
 ///
@@ -1009,6 +787,152 @@ mod tests {
     use super::*;
     use crate::model::{Pointer, Status};
 
+    // ---- resolve_project_scope：向上找 .engram/ 锚点的项目根判定 ----
+
+    /// 用两个目录集合构造文件系统探测闭包，跑 resolve_project_scope。
+    fn scope_with(cwd: &str, engram_dirs: &[&str], workspace_dirs: &[&str]) -> ProjectScope {
+        let eng: Vec<PathBuf> = engram_dirs.iter().map(PathBuf::from).collect();
+        let ws: Vec<PathBuf> = workspace_dirs.iter().map(PathBuf::from).collect();
+        resolve_project_scope(
+            Path::new(cwd),
+            |d| eng.iter().any(|e| e == d),
+            |d| ws.iter().any(|w| w == d),
+        )
+    }
+
+    // 1. 普通项目：在 项目/src 开会话，向上找到 项目/.engram → 项目根=项目。
+    #[test]
+    fn scope_project_anchor_from_subdir() {
+        let s = scope_with("/ws/proj/src", &["/ws/proj"], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/proj"));
+        assert_eq!(s.name, "proj");
+        assert_eq!(s.db, PathBuf::from("/ws/proj/.engram/engram.redb"));
+    }
+
+    // 2. 管理目录 + cwd 在其子项目深处：项目根 = 管理目录的直接子目录。
+    #[test]
+    fn scope_workspace_child_is_project() {
+        // M=/ws/M 是管理目录；engram 还没自己的 .engram → 向上锚定到 M，项目根=engram。
+        let s = scope_with("/ws/M/engram/plugin/scripts", &["/ws/M"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/engram"));
+        assert_eq!(s.name, "engram");
+    }
+
+    // 3. cwd 正好是管理目录本身 → Workspace（库为管理库）。
+    #[test]
+    fn scope_at_workspace_itself() {
+        let s = scope_with("/ws/M", &["/ws/M"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Workspace);
+        assert_eq!(s.root, PathBuf::from("/ws/M"));
+        assert_eq!(s.db, PathBuf::from("/ws/M/.engram/engram.redb"));
+    }
+
+    // 4. 向上无任何 .engram/ → cwd 即项目根。
+    #[test]
+    fn scope_no_anchor_uses_cwd() {
+        let s = scope_with("/some/where/deep", &[], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/some/where/deep"));
+    }
+
+    // 5. 就近优先：项目自己的 .engram/ 比上层管理目录更近 → 锚定项目，不上溯到管理目录。
+    #[test]
+    fn scope_nearest_project_wins_over_workspace() {
+        // engram 已有自己的项目 .engram/（无 workspace 标记），M 是更上层管理目录。
+        let s = scope_with(
+            "/ws/M/engram/plugin",
+            &["/ws/M/engram", "/ws/M"],
+            &["/ws/M"],
+        );
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/engram"));
+        assert_eq!(s.name, "engram");
+    }
+
+    // ---- 补充测试矩阵（多 agent 穷举，仅跨平台稳定的正斜杠用例）----
+
+    // 6. cwd 自己就是普通项目锚（i==0，无 workspace 标记）——区别于 #3 的 cwd==管理目录。
+    #[test]
+    fn scope_cwd_is_plain_anchor() {
+        let s = scope_with("/ws/proj", &["/ws/proj"], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/proj"));
+        assert_eq!(s.name, "proj");
+    }
+
+    // 7. 管理目录是直接父级（i==1）→ 项目根 = chain[0] = cwd 自己（i-1 下溢边界）。
+    #[test]
+    fn scope_workspace_immediate_parent_root_is_cwd() {
+        let s = scope_with("/ws/M/proj", &["/ws/M"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/proj"));
+        assert_eq!(s.name, "proj");
+    }
+
+    // 8. 普通锚在中间层、上面多级无 .engram → 一路上溯到第一个有锚的目录。
+    #[test]
+    fn scope_plain_anchor_middle_layer() {
+        let s = scope_with("/ws/proj/a/b/c", &["/ws/proj"], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/proj"));
+    }
+
+    // 9. 管理目录在 i==2、项目根 = chain[1]，而该项目根自身还没有 .engram/（首次、待建）。
+    #[test]
+    fn scope_workspace_child_root_need_not_have_engram() {
+        let s = scope_with("/ws/M/proj/sub", &["/ws/M"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/proj"));
+    }
+
+    // 10. 就近优先（最近是管理目录）：更上层还有普通锚也要忽略。
+    #[test]
+    fn scope_stop_at_nearest_workspace_ignore_higher_plain() {
+        let s = scope_with("/ws/M/proj/sub", &["/ws/M", "/ws"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/proj"));
+    }
+
+    // 11. 两个管理目录都在链上（生产禁止嵌套，但 resolve 必须确定性地停在最近的）。
+    #[test]
+    fn scope_stop_at_nearest_workspace_ignore_higher_workspace() {
+        let s = scope_with(
+            "/outer/inner/proj/sub",
+            &["/outer/inner", "/outer"],
+            &["/outer/inner", "/outer"],
+        );
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/outer/inner/proj"));
+    }
+
+    // 12. 项目自带普通锚（i==0）压过父级管理目录（i==1）。
+    #[test]
+    fn scope_cwd_plain_anchor_beats_parent_workspace() {
+        let s = scope_with("/ws/M/proj", &["/ws/M/proj", "/ws/M"], &["/ws/M"]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/ws/M/proj"));
+    }
+
+    // 13. 文件系统根作为 cwd、无锚 → cwd 即根，name 回退 "root"（file_name()==None）。
+    #[test]
+    fn scope_fs_root_no_anchor_falls_back() {
+        let s = scope_with("/", &[], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/"));
+        assert_eq!(s.name, "root");
+    }
+
+    // 14. 非 ASCII（CJK）段名：普通锚在父级，name 保留 CJK。
+    #[test]
+    fn scope_non_ascii_cjk_anchor() {
+        let s = scope_with("/项目/子目录", &["/项目"], &[]);
+        assert_eq!(s.kind, ScopeKind::Project);
+        assert_eq!(s.root, PathBuf::from("/项目"));
+        assert_eq!(s.name, "项目");
+    }
+
     /// 构造一条用于测试的记忆。
     fn mem(id: &str, level: Level, project: Option<&str>, status: Status, cue: &str) -> Memory {
         Memory {
@@ -1068,7 +992,7 @@ mod tests {
         assert!(parse_project_dbs(&raw).is_err(), "重复项目名应报错");
     }
 
-    // ====================== hook 辅助命令：resolve_paths / home_dir 纯单测 ======================
+    // ====================== hook 辅助命令：home_dir 纯单测 ======================
 
     #[test]
     fn home_dir_prefers_userprofile_then_home() {
@@ -1104,81 +1028,6 @@ mod tests {
         assert!(
             home_dir(|_| Some(String::new())).is_err(),
             "空串应等同未设置而报错"
-        );
-    }
-
-    #[test]
-    fn resolve_paths_default_general_uses_injected_home() {
-        // 注入假 USERPROFILE，不依赖真实环境变量。
-        let env = |k: &str| {
-            if k == "USERPROFILE" {
-                Some("C:\\Users\\sea".to_string())
-            } else {
-                None
-            }
-        };
-        let project_dir = Path::new("D:\\work\\engram");
-        let r = resolve_paths(project_dir, None, env).expect("应能解析");
-
-        // general_db = <HOME>/.engram/general.redb。
-        assert_eq!(
-            r.general_db,
-            PathBuf::from("C:\\Users\\sea")
-                .join(".engram")
-                .join("general.redb"),
-            "general_db 应为 <HOME>/.engram/general.redb"
-        );
-        // project_db = <project_dir>/.claude/engram.redb。
-        assert_eq!(
-            r.project_db,
-            project_dir.join(".claude").join("engram.redb"),
-            "project_db 应为 <project_dir>/.claude/engram.redb"
-        );
-        // project_name = 最后一段目录名。
-        assert_eq!(r.project_name, "engram", "project_name 应为最后一段目录名");
-    }
-
-    #[test]
-    fn resolve_paths_general_override_takes_precedence() {
-        // 给了 general_override：忽略 HOME（env 闭包即便返回值也不应被用到）。
-        let override_path = Path::new("E:\\custom\\g.redb");
-        let project_dir = Path::new("D:\\work\\proj");
-        let r = resolve_paths(project_dir, Some(override_path), |_| {
-            Some("C:\\Users\\should_not_be_used".to_string())
-        })
-        .expect("应能解析");
-        assert_eq!(
-            r.general_db,
-            PathBuf::from("E:\\custom\\g.redb"),
-            "general_override 应优先于默认 HOME 约定"
-        );
-        assert_eq!(r.project_name, "proj");
-    }
-
-    #[test]
-    fn resolve_paths_root_dir_name_falls_back_to_root() {
-        // 根盘符无 file_name → project_name 回退 "root"。给 override 以免触发 HOME。
-        let override_path = Path::new("E:\\g.redb");
-        let root = Path::new("C:\\");
-        let r = resolve_paths(root, Some(override_path), |_| None).expect("应能解析");
-        assert_eq!(
-            r.project_name, "root",
-            "根盘符无最后一段目录名时应回退 root"
-        );
-        assert_eq!(
-            r.project_db,
-            root.join(".claude").join("engram.redb"),
-            "project_db 仍按约定拼在根下"
-        );
-    }
-
-    #[test]
-    fn resolve_paths_missing_home_without_override_errors() {
-        // 无 general_override 且 HOME/USERPROFILE 都缺 → 报错（不 panic）。
-        let project_dir = Path::new("D:\\work\\engram");
-        assert!(
-            resolve_paths(project_dir, None, |_| None).is_err(),
-            "默认约定下 HOME 缺失应返回错误"
         );
     }
 
@@ -1829,222 +1678,6 @@ mod tests {
         assert!(
             !gc_should_delete(&sup_old, now, ttl, tomb_ttl),
             "superseded 永不删"
-        );
-    }
-
-    // ====================== hot-index：活跃子项目判定纯逻辑单测 ======================
-
-    /// 便捷：把 `&[&str]` 转成 `Vec<String>`（构造 subdirs 列表用）。
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn last_word_occurrence_requires_full_word() {
-        // 完整词命中。
-        assert!(last_word_occurrence("做 engram 这个项目", "engram").is_some());
-        // 作为更长标识符的子串不命中。
-        assert!(last_word_occurrence("engrams 复数形式", "engram").is_none());
-        assert!(last_word_occurrence("myengram 前缀", "engram").is_none());
-        // 路径分隔符算边界。
-        assert!(last_word_occurrence("path/engram/x", "engram").is_some());
-        assert!(last_word_occurrence("path\\engram\\x", "engram").is_some());
-        // 空 needle。
-        assert!(last_word_occurrence("anything", "").is_none());
-    }
-
-    #[test]
-    fn last_word_occurrence_picks_last() {
-        // 两次出现取靠后那次的位置。
-        let pos = last_word_occurrence("engram 然后又 engram", "engram").expect("应命中");
-        // 第二次出现在更后的位置。
-        assert!(pos > 0, "应取最后一次出现的位置，得 {pos}");
-        let first = "engram 然后又 engram".find("engram").expect("有首次");
-        assert!(pos > first, "最后一次位置应晚于首次");
-    }
-
-    #[test]
-    fn active_from_prompt_picks_last_mentioned() {
-        let subdirs = names(&["engram", "ai-2d-engine", "other"]);
-        // 先提 engram 再提 ai-2d-engine → 取最后的 ai-2d-engine。
-        let p = "先看 engram 再去 ai-2d-engine 那边";
-        assert_eq!(
-            active_from_prompt(p, &subdirs),
-            Some("ai-2d-engine".to_string())
-        );
-        // 都没提 → None。
-        assert_eq!(active_from_prompt("无关内容", &subdirs), None);
-        // 伪造名（不在 subdirs）不会被 prompt 信号选中（因为根本不在候选里）。
-        let fake = names(&["engram"]);
-        assert_eq!(active_from_prompt("去 nonexistent 项目", &fake), None);
-    }
-
-    #[test]
-    fn active_from_transcript_matches_separators_and_picks_last() {
-        let root = "F:/ClaudeWorkspaces";
-        let subdirs = names(&["engram", "ai-2d-engine"]);
-        // 先触碰 engram 再触碰 ai-2d-engine（正斜杠）→ 取最后 ai-2d-engine。
-        let t = "F:/ClaudeWorkspaces/engram/src/x.rs 然后 F:/ClaudeWorkspaces/ai-2d-engine/y.rs";
-        assert_eq!(
-            active_from_transcript(t, root, &subdirs),
-            Some("ai-2d-engine".to_string())
-        );
-
-        // JSON 转义的双反斜杠分隔符变体，root 用反斜杠写法。
-        let root_bs = "F:\\ClaudeWorkspaces";
-        let t2 =
-            r"F:\\ClaudeWorkspaces\\engram\\a.rs 接着 F:\\ClaudeWorkspaces\\ai-2d-engine\\b.rs";
-        assert_eq!(
-            active_from_transcript(t2, root_bs, &subdirs),
-            Some("ai-2d-engine".to_string())
-        );
-
-        // 单反斜杠分隔符变体。
-        let t3 = r"F:\ClaudeWorkspaces\engram\a.rs";
-        assert_eq!(
-            active_from_transcript(t3, root_bs, &subdirs),
-            Some("engram".to_string())
-        );
-
-        // root 用正斜杠、transcript 用双反斜杠，跨写法也应匹配。
-        let t4 = r"F:\\ClaudeWorkspaces\\engram\\a.rs";
-        assert_eq!(
-            active_from_transcript(t4, root, &subdirs),
-            Some("engram".to_string())
-        );
-    }
-
-    #[test]
-    fn active_from_transcript_rejects_non_subdir_segment() {
-        let root = "F:/ClaudeWorkspaces";
-        let subdirs = names(&["engram"]);
-        // 段名 fake 不在 subdirs → 不命中。
-        let t = "F:/ClaudeWorkspaces/fake/x.rs";
-        assert_eq!(active_from_transcript(t, root, &subdirs), None);
-        // 真实子目录命中。
-        let t2 = "F:/ClaudeWorkspaces/engram/x.rs";
-        assert_eq!(
-            active_from_transcript(t2, root, &subdirs),
-            Some("engram".to_string())
-        );
-    }
-
-    #[test]
-    fn decide_active_prompt_takes_precedence_over_transcript() {
-        let root = "F:/ClaudeWorkspaces";
-        let subdirs = names(&["engram", "ai-2d-engine"]);
-        // transcript 指向 ai-2d-engine，但 prompt 显式提 engram → 取 prompt 的 engram。
-        let prompt = "我现在要做 engram";
-        let transcript = "F:/ClaudeWorkspaces/ai-2d-engine/y.rs";
-        assert_eq!(
-            decide_active(Some(prompt), Some(transcript), root, &subdirs),
-            Some("engram".to_string()),
-            "prompt 信号应优先于 transcript"
-        );
-
-        // prompt 无命中时回退 transcript。
-        let prompt_none = "无任何子项目名";
-        assert_eq!(
-            decide_active(Some(prompt_none), Some(transcript), root, &subdirs),
-            Some("ai-2d-engine".to_string()),
-            "prompt 无命中应回退 transcript"
-        );
-
-        // 都无 → None。
-        assert_eq!(decide_active(None, None, root, &subdirs), None);
-        assert_eq!(
-            decide_active(Some("无关"), Some("也无关"), root, &subdirs),
-            None
-        );
-    }
-
-    #[test]
-    fn active_unchanged_gates_correctly() {
-        // 上次无记录（None）→ 视为有变化（要渲染）。
-        assert!(!active_unchanged(Some("engram"), None, "root"));
-        // 同名 → 不变。
-        assert!(active_unchanged(Some("engram"), Some("engram"), "root"));
-        // 变化。
-        assert!(!active_unchanged(
-            Some("engram"),
-            Some("ai-2d-engine"),
-            "root"
-        ));
-        // 本次无活跃子项目（None）归一为 root_name；上次也记的是 root → 不变。
-        assert!(active_unchanged(None, Some("root"), "root"));
-        // 本次 None（→root）但上次是某子项目 → 有变化。
-        assert!(!active_unchanged(None, Some("engram"), "root"));
-    }
-
-    #[test]
-    fn normalize_separators_collapses_runs() {
-        assert_eq!(normalize_separators(r"a\\b/c\d"), "a/b/c/d");
-        assert_eq!(normalize_separators("no-sep"), "no-sep");
-        assert_eq!(normalize_separators(r"x\\\\y"), "x/y");
-    }
-
-    // ====================== 排除 dotdir / 基础设施目录（bug 修复） ======================
-
-    #[test]
-    fn is_mountable_subproject_name_excludes_dotdirs_and_denylist() {
-        // dotdir：以 '.' 开头一律排除。
-        assert!(!is_mountable_subproject_name(".claude"));
-        assert!(!is_mountable_subproject_name(".git"));
-        assert!(!is_mountable_subproject_name(".vscode"));
-        // denylist：即便不以 '.' 开头也排除。
-        assert!(!is_mountable_subproject_name("node_modules"));
-        assert!(!is_mountable_subproject_name("target"));
-        assert!(!is_mountable_subproject_name("dist"));
-        assert!(!is_mountable_subproject_name("build"));
-        assert!(!is_mountable_subproject_name("out"));
-        // 当前/上级目录名。
-        assert!(!is_mountable_subproject_name("."));
-        assert!(!is_mountable_subproject_name(".."));
-        // 真实子项目名：放行。
-        assert!(is_mountable_subproject_name("engram"));
-        assert!(is_mountable_subproject_name("ai-2d-engine"));
-    }
-
-    #[test]
-    fn active_from_transcript_skips_dotdir_and_keeps_last_real() {
-        // transcript 先触碰 engram，再触碰 .claude：active 应取剩余里最后触碰的 engram，
-        // 不能被 .claude 顶掉变 None（即便 .claude 真实存在于 subdirs）。
-        let root = "F:/ClaudeWorkspaces";
-        let subdirs = names(&["engram", ".claude"]);
-        let t = "F:/ClaudeWorkspaces/engram/y.rs 然后 F:/ClaudeWorkspaces/.claude/x";
-        assert_eq!(
-            active_from_transcript(t, root, &subdirs),
-            Some("engram".to_string()),
-            ".claude 段应被跳过，active 取剩余最后触碰的 engram"
-        );
-    }
-
-    #[test]
-    fn active_from_transcript_only_infra_dirs_is_none() {
-        // transcript 只触碰 .git 与 node_modules → 无可挂载子项目，active = None。
-        let root = "F:/ClaudeWorkspaces";
-        let subdirs = names(&[".git", "node_modules"]);
-        let t = "F:/ClaudeWorkspaces/.git/HEAD 还有 F:/ClaudeWorkspaces/node_modules/pkg/index.js";
-        assert_eq!(
-            active_from_transcript(t, root, &subdirs),
-            None,
-            "只触碰基础设施目录时不应选出任何活跃子项目"
-        );
-    }
-
-    #[test]
-    fn active_from_prompt_does_not_select_dotdir() {
-        // prompt 里提到 .claude（且 .claude 在 subdirs 里）也不被选为 active。
-        let subdirs = names(&[".claude", "engram"]);
-        assert_eq!(
-            active_from_prompt("我去看看 .claude 目录", &subdirs),
-            None,
-            ".claude 不应作为活跃子项目被 prompt 信号选中"
-        );
-        // 同时提 .claude 与 engram → 只会选可挂载的 engram。
-        assert_eq!(
-            active_from_prompt("先 .claude 再 engram", &subdirs),
-            Some("engram".to_string())
         );
     }
 

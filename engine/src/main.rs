@@ -22,12 +22,13 @@
 //! - `recall`：在合并集上词法检索返候选（默认搜 active+cold），**不写任何东西**；
 //! - `list`：在合并集上按 status/level/project 过滤检视。
 //!
-//! 另有两个服务 Claude Code hook 的辅助子命令（把"路径解析约定"收进引擎，
-//! 让 hook 侧近乎零逻辑，见 [`engram::commands::resolve_paths`]）：
-//! - `session-start`：SessionStart hook 调用，按约定推导 general/project 库路径、
-//!   确保父目录存在、打开两库合并后把热索引（含前言）打到 **stdout** 供注入；
-//! - `resolve`：SessionEnd 脚本调用，按同一约定推导并 `create_dir_all` 两父目录，
-//!   以 `env` 或 `json` 格式打印统一的 db 路径与项目名，供脚本再去调别的命令。
+//! 另有若干服务 Claude Code hook 的辅助子命令（把"作用域锚定约定"收进引擎，
+//! 让 hook 侧近乎零逻辑，见 [`resolve_scope`] / [`engram::commands::resolve_project_scope`]）：
+//! - `session-start` / `hot-index`：从 cwd 向上找 `.engram/` 锚点定出作用域，确保
+//!   父目录存在、打开「公共库 + 作用域库」合并后把热索引（含前言）打到 **stdout** 供注入；
+//! - `resolve`：脚本调用，按同一约定锚定作用域并 `create_dir_all` 两父目录，以 `env`
+//!   或 `json` 格式打印 general/作用域库路径、作用域名与 kind，供脚本再去调别的命令；
+//! - `root`：把某目录设为 engram「项目管理目录」（在其 `.engram/` 下写 workspace 标记）。
 //!
 //! 设计文档参考：§6 升降级、§7 降级去向、§13 交付形态（存储选定 redb、多库分置）。
 
@@ -39,10 +40,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 
 use engram::commands::{
-    self, active_unchanged, build_merged_memory, decide_active, gc_should_delete, generate_id,
-    home_dir, last_touch, list_visible, oneline_status, parse_level, parse_project_dbs,
-    parse_status_filter, parse_tags, recall_candidates, resolve_paths, revived_level,
-    tokenize_query, validate_merge_scope, MergeScope, ResolvedPaths,
+    self, build_merged_memory, gc_should_delete, generate_id, home_dir, last_touch, list_visible,
+    oneline_status, parse_level, parse_project_dbs, parse_status_filter, parse_tags,
+    recall_candidates, resolve_project_scope, revived_level, tokenize_query, validate_merge_scope,
+    MergeScope, ProjectScope, ScopeKind, ENGRAM_DB_FILE, ENGRAM_DIR, WORKSPACE_MARKER,
 };
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::model::{Level, Memory, Pointer, Status};
@@ -276,9 +277,10 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// hook 用：按约定推导库路径、确保父目录存在、打开两库合并后把热索引（含前言）打到 stdout。
+    /// hook 用：从 cwd 锚定作用域、确保父目录存在、打开「公共库 + 作用域库」合并后把
+    /// 热索引（含前言）打到 stdout。
     SessionStart {
-        /// 项目根目录；缺省取当前工作目录。
+        /// 项目目录（即 cwd）；缺省取当前工作目录，从其向上锚定作用域。
         #[arg(long)]
         project_dir: Option<PathBuf>,
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
@@ -297,9 +299,10 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
     },
-    /// hook 用：按约定推导并 create_dir_all 两父目录，以 env|json 打印统一的 db 路径与项目名。
+    /// hook 用：从 cwd 锚定作用域、create_dir_all 两父目录，以 env|json 打印 general/
+    /// 作用域库路径、作用域名与 kind（project|workspace）。
     Resolve {
-        /// 项目根目录；缺省取当前工作目录。
+        /// 项目目录（即 cwd）；缺省取当前工作目录，从其向上锚定作用域。
         #[arg(long)]
         project_dir: Option<PathBuf>,
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
@@ -309,22 +312,22 @@ enum Command {
         #[arg(long, default_value = "env")]
         format: String,
     },
-    /// hook 用：动态按需挂载「当前活跃子项目」的 L4——渲染 公共L1-3 + 根L4 +
-    /// 活跃子项目L4，仅当活跃子项目相对上次**变化**时才输出（重注入）。
+    /// hook 用：从 cwd 向上找 `.engram/` 锚点定出作用域，挂载「公共库 + 作用域库」并渲染；
+    /// 仅当作用域根相对上次**变化**时才输出（重注入）。
     HotIndex {
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
         #[arg(long)]
         general_db: Option<PathBuf>,
-        /// 工作区根目录；缺省取 stdin 的 cwd，再缺省取当前工作目录。
+        /// 工作区根目录（作 cwd override）；缺省取 stdin 的 cwd，再缺省取当前工作目录。
         #[arg(long)]
         workspace_root: Option<PathBuf>,
-        /// transcript 文件路径（用于「最近触碰」信号）；缺省取 stdin 的 transcript_path。
+        /// transcript 文件路径（历史信号字段，新作用域模型已不使用；仅为兼容保留接收）。
         #[arg(long)]
         transcript: Option<PathBuf>,
-        /// 本次用户 prompt 文本（用于「显式提及」信号）；缺省取 stdin 的 prompt。
+        /// 本次用户 prompt 文本（历史信号字段，新作用域模型已不使用；仅为兼容保留接收）。
         #[arg(long)]
         prompt: Option<String>,
-        /// 状态文件路径；给定时启用状态门控（活跃子项目未变则输出空、不重注入）。
+        /// 状态文件路径；给定时启用状态门控（作用域根未变则输出空、不重注入）。
         #[arg(long)]
         state: Option<PathBuf>,
         /// 状态栏小文件路径；给定时每次都把挂载集的一行状态串写入该文件（覆盖），
@@ -348,14 +351,14 @@ enum Command {
         #[arg(long)]
         now: Option<f64>,
     },
-    /// 概况：复用 hot-index 那套加载（公共库 + 工作区根 L4 + 各 --project-db），
-    /// 把**传入的全部库**当作挂载集统计/展示（不做活跃子项目动态判定、不接 transcript）。
+    /// 概况：从 cwd 锚定作用域，挂载「公共库 + 作用域库 + 各 --project-db」，把这批库
+    /// 当作挂载集统计/展示（不做活跃子项目动态判定、不接 transcript）。
     Status {
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
         #[arg(long)]
         general_db: Option<PathBuf>,
-        /// 工作区根目录；缺省取 stdin 的 cwd（仅 --from-hook-stdin 时），再缺省取当前工作目录。
-        /// 其 `<root>/.claude/engram.redb` 作为根 L4 库一并计入挂载集。
+        /// 工作区根目录（作 cwd override）；缺省取 stdin 的 cwd（仅 --from-hook-stdin 时），
+        /// 再缺省取当前工作目录。从该目录向上锚定作用域，其作用域库一并计入挂载集。
         #[arg(long)]
         workspace_root: Option<PathBuf>,
         /// 额外项目库映射 `name=path`，可重复给 0..N 个（一并计入挂载集）。
@@ -411,6 +414,16 @@ enum Command {
         /// 水位线文件路径。
         #[arg(long)]
         watermark: PathBuf,
+    },
+    /// 把某目录设为 engram「项目管理目录」（workspace）：在其 `.engram/` 下写 workspace
+    /// 标记 + 建空项目库，并往公共库追加一条 L2「管理目录」记忆。幂等、防嵌套。
+    Root {
+        /// 待设为项目管理目录的目录；缺省取当前工作目录。
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+        /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
+        #[arg(long)]
+        general_db: Option<PathBuf>,
     },
 }
 
@@ -742,6 +755,10 @@ fn main() -> ExitCode {
         Command::ConsolidateDone { pending, watermark } => {
             run_consolidate_done(&pending, &watermark)
         }
+        Command::Root {
+            project_dir,
+            general_db,
+        } => run_root(project_dir.as_deref(), general_db.as_deref()),
     }
 }
 
@@ -761,6 +778,82 @@ fn resolve_project_dir(project_dir: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
+/// 去除 Windows 规范化路径可能带的 verbatim 前缀 `\\?\`（如 `\\?\C:\foo` → `C:\foo`）。
+///
+/// [`std::fs::canonicalize`] 在 Windows 上返回带 `\\?\` 前缀的 verbatim 路径，该写法
+/// 虽合法但对用户不友好、且与项目里别处拼出的普通路径不一致（影响 `--state` 的字符串
+/// 比较、日志可读性）。这里仅做字符串层面的前缀剥离，**不引入新依赖**；非 Windows
+/// 或本就无该前缀的路径原样返回。UNC verbatim（`\\?\UNC\...`）较罕见，保守地只剥离
+/// 普通盘符形态的 `\\?\`，其余情况保持原值。
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    // 用 lossy 转字符串判断前缀；仅当确为 `\\?\` 开头且其后不是 `UNC\` 时才剥离。
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if !rest.starts_with(r"UNC\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
+/// 把 `cwd` 规范化为绝对路径并剥离 Windows verbatim 前缀（best-effort）。
+///
+/// 先尝试 [`std::fs::canonicalize`]（解析符号链接、`.`/`..`、相对路径）；成功则剥离
+/// 可能的 `\\?\` 前缀，失败（路径不存在、无权限等）则原样退回传入的 `cwd`——作用域
+/// 锚定不应因为路径暂不可规范化而整体失败。
+fn canonicalize_cwd(cwd: &Path) -> PathBuf {
+    match std::fs::canonicalize(cwd) {
+        Ok(canon) => strip_verbatim_prefix(canon),
+        Err(_) => cwd.to_path_buf(),
+    }
+}
+
+/// 从 `cwd` 向上锚定作用域，并算出公共库路径（生产 helper，供各 hook 命令复用）。
+///
+/// 流程：
+/// 1. 用 [`canonicalize_cwd`] 把 `cwd` 规范化为绝对路径（best-effort）。
+/// 2. 用「锚点必须带 redb 或 workspace 标记」的收紧判据从规范化 cwd 向上锚定作用域
+///    （见 [`resolve_project_scope`]）：空的 / 残留的 `.engram/` 目录**不算**锚点。
+/// 3. 公共库 `general_db` = `general_override` 若给定，否则 `<HOME>/.engram/general.redb`
+///    （HOME 由 [`home_dir`] 用真实环境变量推导）。
+///
+/// 返回 `(general_db, scope)`。本函数会探测文件系统（canonicalize、`is_file`），但不
+/// 创建任何目录、不打开任何库——建父目录、开库是调用方的职责。
+///
+/// # 参数
+/// - `cwd`：当前工作目录（可为相对路径，会被规范化）。
+/// - `general_override`：`--general-db` 显式指定的公共库路径（`None` 时走默认约定）。
+///
+/// # Errors
+/// 当 `general_override` 为 `None` 且 [`home_dir`] 无法确定主目录时，返回其错误说明。
+fn resolve_scope(
+    cwd: &Path,
+    general_override: Option<&Path>,
+) -> Result<(PathBuf, ProjectScope), String> {
+    let canonical_cwd = canonicalize_cwd(cwd);
+
+    // 锚点判据（收紧）：`.engram/` 下必须有 redb 库或 workspace 标记才算真锚点，
+    // 空的 / 残留的 `.engram/` 目录不算——否则误删后残留的空目录会污染锚定。
+    let has_engram = |d: &Path| {
+        d.join(ENGRAM_DIR).join(ENGRAM_DB_FILE).is_file()
+            || d.join(ENGRAM_DIR).join(WORKSPACE_MARKER).is_file()
+    };
+    // workspace 判据：`.engram/workspace` 标记文件存在即为项目管理目录。
+    let is_workspace = |d: &Path| d.join(ENGRAM_DIR).join(WORKSPACE_MARKER).is_file();
+
+    let scope = resolve_project_scope(&canonical_cwd, has_engram, is_workspace);
+
+    let general_db = match general_override {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let home = home_dir(real_env_lookup)?;
+            home.join(ENGRAM_DIR).join("general.redb")
+        }
+    };
+
+    Ok((general_db, scope))
+}
+
 /// 确保某 db 文件路径的父目录存在（redb 只建文件不建目录）。
 ///
 /// 路径无父目录段（极端情况）时视作无需创建，直接返回 `Ok`。
@@ -776,22 +869,26 @@ fn ensure_parent_dir(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 按约定解析 hook 辅助命令所需路径，并 `create_dir_all` 两个 db 的父目录。
+/// 按 cwd 锚定作用域并 `create_dir_all` 公共库与作用域库两个 db 的父目录。
 ///
-/// 把 `session-start` 与 `resolve` 共用的"解析项目目录 → resolve_paths →
-/// 建父目录"流程收成一处，保证两命令路径语义完全一致。
+/// 把 `session-start` / `resolve` 共用的"解析项目目录 → resolve_scope → 建父目录"
+/// 流程收成一处，保证两命令的作用域语义完全一致。
+///
+/// # 参数
+/// - `project_dir`：项目目录（即 cwd 语义）；`None` 时取当前工作目录。
+/// - `general_override`：`--general-db` 覆盖；`None` 时走默认约定。
 ///
 /// # Errors
 /// 取当前目录失败、HOME 无法确定、或建父目录失败时，返回中文说明的错误字符串。
-fn resolve_and_prepare(
+fn resolve_scope_and_prepare(
     project_dir: Option<&Path>,
     general_override: Option<&Path>,
-) -> Result<ResolvedPaths, String> {
+) -> Result<(PathBuf, ProjectScope), String> {
     let project_dir = resolve_project_dir(project_dir)?;
-    let resolved = resolve_paths(&project_dir, general_override, real_env_lookup)?;
-    ensure_parent_dir(&resolved.general_db)?;
-    ensure_parent_dir(&resolved.project_db)?;
-    Ok(resolved)
+    let (general_db, scope) = resolve_scope(&project_dir, general_override)?;
+    ensure_parent_dir(&general_db)?;
+    ensure_parent_dir(&scope.db)?;
+    Ok((general_db, scope))
 }
 
 /// `session-start` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
@@ -848,7 +945,7 @@ fn build_hook_json(context: &str) -> Result<String, String> {
 
 /// 向调试日志文件**追加一行**本次 `session-start` 调用的记录（best-effort）。
 ///
-/// 行格式：`<unix秒> session-start emit=<text|json> project=<name> general=<路径> project_db=<路径>\n`。
+/// 行格式：`<unix秒> session-start emit=<text|json> kind=<project|workspace> project=<name> general=<路径> scope_db=<路径>\n`。
 /// 父目录不存在时先 `create_dir_all`。
 ///
 /// 调试日志是次要旁路——**任何错误都被静默吞掉、不上抛**：注入热索引才是主任务，
@@ -858,8 +955,15 @@ fn build_hook_json(context: &str) -> Result<String, String> {
 /// - `log_path`：日志文件路径（append 模式打开/创建）。
 /// - `now`：当前时间（unix 秒），取整数秒写入。
 /// - `emit`：本次的输出格式。
-/// - `resolved`：已解析的库路径与项目名。
-fn append_session_log(log_path: &Path, now: f64, emit: EmitFormat, resolved: &ResolvedPaths) {
+/// - `general_db`：本次解析出的公共库路径。
+/// - `scope`：本次锚定出的作用域（取其 kind / name / db）。
+fn append_session_log(
+    log_path: &Path,
+    now: f64,
+    emit: EmitFormat,
+    general_db: &Path,
+    scope: &ProjectScope,
+) {
     use std::io::Write as _;
 
     // 父目录不存在先创建；失败则直接放弃写日志（不报错、不影响主输出）。
@@ -876,10 +980,11 @@ fn append_session_log(log_path: &Path, now: f64, emit: EmitFormat, resolved: &Re
     // now 取非负整数秒（防御异常负值），与文档约定的「unix 秒」一致。
     let ts = now.max(0.0) as u64;
     let line = format!(
-        "{ts} session-start emit={emit_str} project={} general={} project_db={}\n",
-        resolved.project_name,
-        resolved.general_db.display(),
-        resolved.project_db.display(),
+        "{ts} session-start emit={emit_str} kind={} project={} general={} scope_db={}\n",
+        scope_kind_str(scope.kind),
+        scope.name,
+        general_db.display(),
+        scope.db.display(),
     );
 
     // append 模式打开/创建并写入；任一步失败都静默忽略。
@@ -889,6 +994,14 @@ fn append_session_log(log_path: &Path, now: f64, emit: EmitFormat, resolved: &Re
         .open(log_path)
     {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 把 [`ScopeKind`] 渲染为日志/输出用的小写短串。
+fn scope_kind_str(kind: ScopeKind) -> &'static str {
+    match kind {
+        ScopeKind::Project => "project",
+        ScopeKind::Workspace => "workspace",
     }
 }
 
@@ -909,7 +1022,7 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
     let Some(now) = resolve_now(args.now) else {
         return ExitCode::FAILURE;
     };
-    let resolved = match resolve_and_prepare(args.project_dir, args.general_db) {
+    let (general_db, scope) = match resolve_scope_and_prepare(args.project_dir, args.general_db) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("session-start 失败：{e}");
@@ -917,8 +1030,8 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
         }
     };
 
-    // 打开公共库与当前项目库，各自读出后合并（项目库即作用域，挂载即包含）。
-    let merged = match read_merged_two(&resolved) {
+    // 打开公共库与本作用域库，各自读出后合并（作用域库即挂载集）。
+    let merged = match read_merged_scope(&general_db, &scope) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("session-start 失败：{e}");
@@ -956,60 +1069,68 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
 
     // 调试日志（best-effort）：在主输出之后追加一行，失败不影响退出码。
     if let Some(log_path) = args.log {
-        append_session_log(log_path, now, emit, &resolved);
+        append_session_log(log_path, now, emit, &general_db, &scope);
     }
 
     status
 }
 
-/// 打开 [`ResolvedPaths`] 的公共库 + 当前项目库，读出全部记忆合并为一个 `Vec`。
+/// 打开公共库 + 本作用域库（`scope.db`），读出全部记忆合并为一个 `Vec`。
 ///
-/// 项目记忆以 `project_name` 标注其归属（与 `--project-db name=path` 语义一致）。
+/// 作用域库即本次挂载集（具体项目库或项目管理库），其记忆已自带 `project` 标注。
 ///
 /// # Errors
 /// 任一库打开或读取失败时，返回带库类别说明的错误字符串。
-fn read_merged_two(resolved: &ResolvedPaths) -> Result<Vec<Memory>, String> {
-    let (_gdb, mut merged) = open_and_read(&resolved.general_db)
-        .map_err(|e| format!("读取公共库 {} 失败：{e}", resolved.general_db.display()))?;
-    let (_pdb, mut pmems) = open_and_read(&resolved.project_db).map_err(|e| {
+fn read_merged_scope(general_db: &Path, scope: &ProjectScope) -> Result<Vec<Memory>, String> {
+    let (_gdb, mut merged) = open_and_read(general_db)
+        .map_err(|e| format!("读取公共库 {} 失败：{e}", general_db.display()))?;
+    let (_sdb, mut smems) = open_and_read(&scope.db).map_err(|e| {
         format!(
-            "读取项目库 {}（{}）失败：{e}",
-            resolved.project_name,
-            resolved.project_db.display()
+            "读取作用域库 {}（{}）失败：{e}",
+            scope.name,
+            scope.db.display()
         )
     })?;
-    merged.append(&mut pmems);
+    merged.append(&mut smems);
     Ok(merged)
 }
 
-/// 执行 `resolve` 子命令：按约定推导路径 → 建父目录 → 以 env|json 打印三项。
+/// 执行 `resolve` 子命令：从 cwd 锚定作用域 → 建父目录 → 以 env|json 打印各项。
 ///
-/// `--format env`（缺省）逐行打印 `ENGRAM_GENERAL_DB` / `ENGRAM_PROJECT_DB` /
-/// `ENGRAM_PROJECT_NAME`；`--format json` 用 serde_json 打印单行对象。
+/// 输出语义（作用域库 `scope.db` 充当 project_db、作用域名 `scope.name` 充当
+/// project_name，便于调用脚本沿用旧字段名透传）：
+/// - `--format env`（缺省）逐行打印 `ENGRAM_GENERAL_DB` / `ENGRAM_PROJECT_DB` /
+///   `ENGRAM_PROJECT_NAME` / `ENGRAM_SCOPE_KIND`（`project|workspace`）；
+/// - `--format json` 用 serde_json 打印单行对象，含 `general_db` / `project_db` /
+///   `project_name` / `kind` 四个字段。
+///
 /// 未知 format 值走 stderr + 非 0 退出。
 fn run_resolve(project_dir: Option<&Path>, general_db: Option<&Path>, format: &str) -> ExitCode {
-    let resolved = match resolve_and_prepare(project_dir, general_db) {
+    let (general_db, scope) = match resolve_scope_and_prepare(project_dir, general_db) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("resolve 失败：{e}");
             return ExitCode::FAILURE;
         }
     };
+    let kind = scope_kind_str(scope.kind);
 
     match format.trim().to_ascii_lowercase().as_str() {
         "env" => {
-            println!("ENGRAM_GENERAL_DB={}", resolved.general_db.display());
-            println!("ENGRAM_PROJECT_DB={}", resolved.project_db.display());
-            println!("ENGRAM_PROJECT_NAME={}", resolved.project_name);
+            println!("ENGRAM_GENERAL_DB={}", general_db.display());
+            println!("ENGRAM_PROJECT_DB={}", scope.db.display());
+            println!("ENGRAM_PROJECT_NAME={}", scope.name);
+            println!("ENGRAM_SCOPE_KIND={kind}");
             ExitCode::SUCCESS
         }
         "json" => {
             // 用 serde_json 转义路径/名称，保证含特殊字符（反斜杠等）也合法。
             let obj = format!(
-                r#"{{"general_db":{},"project_db":{},"project_name":{}}}"#,
-                json_str(&resolved.general_db.to_string_lossy()),
-                json_str(&resolved.project_db.to_string_lossy()),
-                json_str(&resolved.project_name),
+                r#"{{"general_db":{},"project_db":{},"project_name":{},"kind":{}}}"#,
+                json_str(&general_db.to_string_lossy()),
+                json_str(&scope.db.to_string_lossy()),
+                json_str(&scope.name),
+                json_str(kind),
             );
             println!("{obj}");
             ExitCode::SUCCESS
@@ -1112,9 +1233,12 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
     let slice_path = PathBuf::from(&pending.slice);
     if !slice_path.exists() {
         let transcript = PathBuf::from(&pending.transcript);
-        if let Err(e) =
-            session::slice_lines(&transcript, pending.start_line, pending.end_line, &slice_path)
-        {
+        if let Err(e) = session::slice_lines(
+            &transcript,
+            pending.start_line,
+            pending.end_line,
+            &slice_path,
+        ) {
             eprintln!("catchup-scan 失败：重切增量失败：{e}");
             return ExitCode::FAILURE;
         }
@@ -1163,6 +1287,144 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
     }
 }
 
+/// 执行 `root` 子命令：把 `--project-dir`（缺省当前目录）设为 engram 项目管理目录。
+///
+/// 步骤（任一失败走 stderr + 非 0 退出，不 panic）：
+/// 1. 规范化 `project_dir`（[`canonicalize_cwd`]，含剥离 Windows verbatim 前缀）。
+/// 2. 防嵌套：沿其**父链（不含自己）**向上，若任一祖先已是项目管理目录
+///    （`<祖先>/.engram/workspace` 是文件）→ 失败返回（不允许嵌套管理目录）。
+/// 3. 幂等：若本目录 `.engram/workspace` 已存在 → 打印「已是」并成功返回。
+/// 4. 冲突：若本目录已是普通项目（有 `.engram/engram.redb` 但无 workspace 标记）→
+///    失败返回（不能把已有项目库的目录再设为管理目录）。
+/// 5. 否则：建 `.engram/` → 写 `workspace` 标记（`engram-workspace v1 created_at=<秒>`）
+///    → 用 [`store::open`] 建空项目库 → 往公共库追加一条 L2「管理目录」记忆 →
+///    打印该管理目录的**绝对路径**（供调用脚本使用）。
+fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
+    // 1. 解析并规范化目标目录。
+    let raw_dir = match resolve_project_dir(project_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("engram root 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = canonicalize_cwd(&raw_dir);
+
+    // 2. 防嵌套：检查父链（不含自己）上是否已有项目管理目录。
+    for ancestor in dir.ancestors().skip(1) {
+        let marker = ancestor.join(ENGRAM_DIR).join(WORKSPACE_MARKER);
+        if marker.is_file() {
+            eprintln!(
+                "engram root 失败：不能嵌套——父目录 {} 已是 engram 项目管理目录",
+                ancestor.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let engram_dir = dir.join(ENGRAM_DIR);
+    let workspace_marker = engram_dir.join(WORKSPACE_MARKER);
+    let scope_db = engram_dir.join(ENGRAM_DB_FILE);
+
+    // 3. 幂等：已是管理目录则直接成功。
+    if workspace_marker.is_file() {
+        println!("{} 已是 engram 项目管理目录", dir.display());
+        return ExitCode::SUCCESS;
+    }
+
+    // 4. 冲突：已是普通项目（有库无 workspace 标记）则拒绝。
+    if scope_db.is_file() {
+        eprintln!(
+            "engram root 失败：{} 已是 engram 项目（已有项目库），不能再设为项目管理目录",
+            dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 取当前时间（用于 workspace 标记内容、记忆 created_at / id）。
+    let Some(now) = resolve_now(None) else {
+        return ExitCode::FAILURE;
+    };
+
+    // 5a. 建 .engram/ 目录。
+    if let Err(e) = std::fs::create_dir_all(&engram_dir) {
+        eprintln!(
+            "engram root 失败：创建目录 {} 失败：{e}",
+            engram_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 5b. 写 workspace 标记文件。
+    let marker_content = format!("engram-workspace v1 created_at={}", now.max(0.0) as u64);
+    if let Err(e) = std::fs::write(&workspace_marker, marker_content) {
+        eprintln!(
+            "engram root 失败：写 workspace 标记 {} 失败：{e}",
+            workspace_marker.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 5c. 用 store::open 建出空项目库（不存在即建）。
+    if let Err(e) = store::open(&scope_db) {
+        eprintln!(
+            "engram root 失败：创建项目库 {} 失败：{e}",
+            scope_db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 5d. 往公共库追加一条 L2「管理目录」记忆。
+    let general_db: PathBuf = match general_db {
+        Some(p) => p.to_path_buf(),
+        None => match home_dir(real_env_lookup) {
+            Ok(home) => home.join(ENGRAM_DIR).join("general.redb"),
+            Err(e) => {
+                eprintln!("engram root 失败：{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let abs = dir.display().to_string();
+    let cue = format!("{abs} 是 engram 项目管理目录，不可直接当项目用，请在其下建具体项目目录");
+    let memory = Memory {
+        id: generate_id(&cue, now),
+        cue,
+        pointer: Pointer {
+            kind: "none".to_string(),
+            reference: None,
+            detail: None,
+        },
+        level: Level::L2,
+        project: None,
+        importance: 0.6,
+        pinned: false,
+        access_log: Vec::new(),
+        status: Status::Active,
+        superseded_by: None,
+        created_at: now,
+        tags: vec!["workspace".to_string()],
+    };
+    let gdb = match store::open(&general_db) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "engram root 失败：打开公共库 {} 失败：{e}",
+                general_db.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = store::put(&gdb, &memory) {
+        eprintln!("engram root 失败：写入管理目录记忆失败：{e}");
+        return ExitCode::FAILURE;
+    }
+
+    // 5e. 打印管理目录绝对路径（供调用脚本使用）。
+    println!("{abs}");
+    ExitCode::SUCCESS
+}
+
 /// 打印 `action=review` 的复盘 JSON（`review-prepare` 与 `catchup-scan` 共用）。
 ///
 /// 含复盘者所需的一切：增量切片路径、待收尾的 pending 路径、库路径与项目名、行区间。
@@ -1193,13 +1455,13 @@ fn print_review_json(pending: &Pending, pending_path: &Path) -> ExitCode {
 struct HotIndexArgs<'a> {
     /// `--general-db` 覆盖；`None` 时走 `<HOME>/.engram/general.redb` 约定。
     general_db: Option<&'a Path>,
-    /// `--workspace-root` 覆盖；`None` 时取 stdin 的 cwd，再缺省取当前目录。
+    /// `--workspace-root`（作 cwd override）；`None` 时取 stdin 的 cwd，再缺省取当前目录。
     workspace_root: Option<&'a Path>,
-    /// `--transcript`；`None` 时取 stdin 的 transcript_path。
+    /// `--transcript`（历史信号字段，新作用域模型已不使用；仅为兼容保留接收）。
     transcript: Option<&'a Path>,
-    /// `--prompt`；`None` 时取 stdin 的 prompt。
+    /// `--prompt`（历史信号字段，新作用域模型已不使用；仅为兼容保留接收）。
     prompt: Option<&'a str>,
-    /// `--state`；给定时启用状态门控。
+    /// `--state`；给定时启用状态门控（按作用域根路径比较）。
     state: Option<&'a Path>,
     /// `--status-file`；给定时每次都把挂载集的一行状态串写入该文件（覆盖）。
     status_file: Option<&'a Path>,
@@ -1215,20 +1477,19 @@ struct HotIndexArgs<'a> {
     now: Option<f64>,
 }
 
-/// 从 stdin 解析出的 hook 兜底字段（任一缺失即为 `None`）。
+/// 从 stdin 解析出的 hook 兜底字段（缺失即为 `None`）。
+///
+/// 新作用域模型只需 hook 给的 `cwd`（用于从其向上锚定作用域）；历史的
+/// `transcript_path` / `prompt` 已不再参与判定，故不再解析。
 #[derive(Debug, Default)]
 struct HookStdin {
-    /// hook 给的 transcript 文件路径。
-    transcript_path: Option<PathBuf>,
     /// hook 给的当前工作目录。
     cwd: Option<PathBuf>,
-    /// hook 给的本次 prompt 文本。
-    prompt: Option<String>,
 }
 
-/// 读取整段 stdin、按 hook JSON 解析出 `transcript_path` / `cwd` / `prompt`。
+/// 读取整段 stdin、按 hook JSON 解析出 `cwd`。
 ///
-/// stdin 为空、非法 JSON、或不是对象时一律返回 [`HookStdin::default`]（全 `None`）——
+/// stdin 为空、非法 JSON、或不是对象时一律返回 [`HookStdin::default`]（`cwd` 为 `None`）——
 /// **静默当作无**，不报错、不 panic（UserPromptSubmit hook 偶尔无 stdin 是正常的）。
 ///
 /// 取字段时只接受字符串值；非字符串或缺字段对应项为 `None`。
@@ -1250,47 +1511,11 @@ fn read_hook_stdin() -> HookStdin {
         Some(o) => o,
         None => return HookStdin::default(),
     };
-    let str_field = |key: &str| obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
-    HookStdin {
-        transcript_path: str_field("transcript_path").map(PathBuf::from),
-        cwd: str_field("cwd").map(PathBuf::from),
-        prompt: str_field("prompt"),
-    }
+    let cwd = obj.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+    HookStdin { cwd }
 }
 
-/// 枚举 `root` 的**可挂载直接子目录名**（仅目录、仅名字）。读目录失败时返回空 `Vec`。
-///
-/// 用于活跃子项目判定的候选集与真实性校验：只有真实存在、且为「可挂载子项目」的
-/// 子目录名才会成为候选。dotdir（`.claude`、`.git` 等）与基础设施目录
-/// （`node_modules`、`target` 等）由 [`commands::is_mountable_subproject_name`]
-/// 在此处一并过滤掉——它们虽是真实子目录，但绝不作为活跃子项目挂载。
-fn list_subdirs(root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if commands::is_mountable_subproject_name(name) {
-                    out.push(name.to_string());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 取工作区根目录的「名字」（最后一段目录名）；取不到回退 `"root"`。
-fn root_name_of(root: &Path) -> String {
-    root.file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "root".to_string())
-}
-
-/// 读状态文件里上次记录的 active 名（去首尾空白）。文件不存在/读失败/为空 → `None`。
+/// 读状态文件里上次记录的作用域根路径（去首尾空白）。文件不存在/读失败/为空 → `None`。
 fn read_state(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim();
@@ -1301,32 +1526,24 @@ fn read_state(path: &Path) -> Option<String> {
     }
 }
 
-/// 把本次 active 名写回状态文件（父目录不存在先创建）。失败时返回错误说明。
+/// 把本次作用域根的绝对路径字符串写回状态文件（父目录不存在先创建）。失败时返回错误说明。
 ///
 /// # Errors
 /// 创建父目录或写文件失败时返回带路径说明的错误字符串。
-fn write_state(path: &Path, active_name: &str) -> Result<(), String> {
+fn write_state(path: &Path, scope_root: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("创建状态目录 {} 失败：{e}", parent.display()))?;
         }
     }
-    std::fs::write(path, active_name)
-        .map_err(|e| format!("写状态文件 {} 失败：{e}", path.display()))
+    std::fs::write(path, scope_root).map_err(|e| format!("写状态文件 {} 失败：{e}", path.display()))
 }
 
 /// 向 `hot-index` 的调试日志**追加一行**（best-effort，失败静默忽略）。
 ///
-/// 行格式：`<now> hot-index event=<hook_event> active=<active|none> root=<name> ws=<workspace_root>\n`。
-fn append_hot_index_log(
-    log_path: &Path,
-    now: f64,
-    hook_event: &str,
-    active: Option<&str>,
-    root_name: &str,
-    workspace_root: &Path,
-) {
+/// 行格式：`<now> hot-index event=<hook_event> kind=<project|workspace> name=<scope.name> root=<scope.root>\n`。
+fn append_hot_index_log(log_path: &Path, now: f64, hook_event: &str, scope: &ProjectScope) {
     use std::io::Write as _;
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
@@ -1334,10 +1551,11 @@ fn append_hot_index_log(
         }
     }
     let ts = now.max(0.0) as u64;
-    let active_str = active.unwrap_or("none");
     let line = format!(
-        "{ts} hot-index event={hook_event} active={active_str} root={root_name} ws={}\n",
-        workspace_root.display()
+        "{ts} hot-index event={hook_event} kind={} name={} root={}\n",
+        scope_kind_str(scope.kind),
+        scope.name,
+        scope.root.display(),
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1362,42 +1580,30 @@ fn build_hot_index_json(hook_event: &str, context: &str) -> Result<String, Strin
     serde_json::to_string(&value).map_err(|e| format!("序列化 hook JSON 失败：{e}"))
 }
 
-/// 读取「公共库 + 根 L4 库 + 活跃子项目 L4 库（若存在）」并合并为一个 `Vec`。
+/// 执行 `hot-index` 子命令：从 cwd 向上锚定作用域（找最近的 `.engram/` 锚点），
+/// 挂载「公共库 + 该作用域库」并渲染热索引。
 ///
-/// - 公共库：`general_db`（其全部记忆，含 L1-3 通用记忆）。
-/// - 根 L4 库：`root_db`（工作区根项目自己的项目库，全部记忆）。
-/// - 活跃子项目 L4 库：`<root>/<active>/.claude/engram.redb`，**仅当该文件存在**时加载。
-///
-/// # Errors
-/// 任一应加载的库打开或读取失败时，返回带库类别说明的错误字符串。
-fn read_hot_index_merged(
-    general_db: &Path,
-    root_db: &Path,
-    active_db: Option<&Path>,
-) -> Result<Vec<Memory>, String> {
-    let (_gdb, mut merged) = open_and_read(general_db)
-        .map_err(|e| format!("读取公共库 {} 失败：{e}", general_db.display()))?;
-    let (_rdb, mut rmems) = open_and_read(root_db)
-        .map_err(|e| format!("读取根项目库 {} 失败：{e}", root_db.display()))?;
-    merged.append(&mut rmems);
-    if let Some(path) = active_db {
-        let (_adb, mut amems) = open_and_read(path)
-            .map_err(|e| format!("读取活跃子项目库 {} 失败：{e}", path.display()))?;
-        merged.append(&mut amems);
-    }
-    Ok(merged)
-}
-
-/// 执行 `hot-index` 子命令：动态按需挂载「当前活跃子项目」的 L4。
-///
-/// 流程（详见命令文档）：解析 general/workspace_root（含 stdin 兜底）→ 打开根项目库
-/// → 判定活跃子项目（prompt 信号优先、否则 transcript 信号；须为真实子目录且非根）
-/// → 合并 公共L1-3 + 根L4 + 活跃子项目L4（活跃库文件存在才加载）→ 状态门控（仅
-/// `--state` 给出时：与上次 active 相同则输出空、exit 0；否则写回状态继续）→ 按
-/// `--emit` 渲染输出（前言 + 热索引；门控判空时不打印任何东西）→ 可选追加日志。
+/// 流程：
+/// 1. 解析 emit / now / stdin 兜底（仅 `--from-hook-stdin`）。
+/// 2. cwd 取值：`--workspace-root` 优先，否则 stdin.cwd，否则 current_dir。
+/// 3. [`resolve_scope`] 锚定作用域（含 cwd 规范化、收紧的锚点判据）→ `(general_db, scope)`；
+///    `ensure_parent_dir(&scope.db)`（公共库父目录由 [`store::open`] 时补建）。
+/// 4. 合并读取改为 **公共库 + `scope.db` 两库**（[`read_merged_scope`]）。
+/// 5. 状态栏小文件：照常写 [`oneline_status`]（best-effort，门控判空也写）。
+/// 6. `--state` 门控：state 文件存**上次 `scope.root` 的绝对路径字符串**；本次相同则
+///    输出空、exit 0；不同则写回后继续渲染。
+/// 7. 若 `scope.kind == Workspace`：在注入前言之后追加一行管理目录提示。
+/// 8. 按 `--emit` 渲染输出（前言 + 热索引；门控判空时不打印任何东西）→ 可选追加日志。
 ///
 /// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。stdin 解析失败静默当作无。
+///
+/// 注意：`--transcript` / `--prompt`（及 stdin 的同名字段）在新作用域模型下不再参与
+/// 判定，仅为兼容历史 hook 调用契约而保留接收，本函数不读取它们。
 fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
+    // 历史 hook 调用仍可能传 --transcript / --prompt；新模型不再用它们做作用域判定，
+    // 显式忽略以表意图、避免「字段从未读取」的告警。
+    let _ = (args.transcript, args.prompt);
+
     // 输出格式复用 session-start 的解析。
     let emit = match parse_emit_format(args.emit) {
         Ok(e) => e,
@@ -1410,27 +1616,15 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // 1. stdin 兜底（仅当 --from-hook-stdin）。
+    // 1. stdin 兜底（仅当 --from-hook-stdin）：只用其 cwd 作 cwd 兜底。
     let hook = if args.from_hook_stdin {
         read_hook_stdin()
     } else {
         HookStdin::default()
     };
 
-    // 2. general_db：--general-db，否则 <HOME>/.engram/general.redb。
-    let general_db: PathBuf = match args.general_db {
-        Some(p) => p.to_path_buf(),
-        None => match home_dir(real_env_lookup) {
-            Ok(home) => home.join(".engram").join("general.redb"),
-            Err(e) => {
-                eprintln!("hot-index 失败：{e}");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-
-    // 3. workspace_root：--workspace-root，否则 stdin.cwd，否则 current_dir()。
-    let workspace_root: PathBuf = match args.workspace_root {
+    // 2. cwd：--workspace-root 优先，否则 stdin.cwd，否则 current_dir()。
+    let cwd: PathBuf = match args.workspace_root {
         Some(p) => p.to_path_buf(),
         None => match hook.cwd.clone() {
             Some(c) => c,
@@ -1444,60 +1638,22 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         },
     };
 
-    // transcript / prompt：显式优先，否则 stdin 兜底。
-    let transcript_path: Option<PathBuf> = args
-        .transcript
-        .map(|p| p.to_path_buf())
-        .or_else(|| hook.transcript_path.clone());
-    let prompt: Option<String> = args
-        .prompt
-        .map(|s| s.to_string())
-        .or_else(|| hook.prompt.clone());
-
-    // 4. 根项目库：<workspace_root>/.claude/engram.redb；建父目录后 open（不存在即建）。
-    let root_db = workspace_root.join(".claude").join("engram.redb");
-    if let Err(e) = ensure_parent_dir(&root_db) {
+    // 3. 从 cwd 向上锚定作用域，得 (general_db, scope)；确保作用域库父目录存在。
+    let (general_db, scope) = match resolve_scope(&cwd, args.general_db) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("hot-index 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ensure_parent_dir(&scope.db) {
         eprintln!("hot-index 失败：{e}");
         return ExitCode::FAILURE;
     }
-    let root_name = root_name_of(&workspace_root);
 
-    // 5. 判定活跃子项目（active）。
-    let subdirs = list_subdirs(&workspace_root);
-    let ws_str = workspace_root.to_string_lossy();
-    let transcript_text: Option<String> = transcript_path
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok());
-    let mut active = decide_active(
-        prompt.as_deref(),
-        transcript_text.as_deref(),
-        ws_str.as_ref(),
-        &subdirs,
-    );
-    // 校验：active 必须是真实存在的子目录；active==根 name 视为 None。
-    if let Some(name) = &active {
-        let sub_path = workspace_root.join(name);
-        if !sub_path.is_dir() || name == &root_name {
-            active = None;
-        }
-    }
-
-    // 6. 活跃子项目 L4 库路径（仅当文件存在才加载）。
-    let active_db: Option<PathBuf> = active.as_ref().and_then(|name| {
-        let p = workspace_root
-            .join(name)
-            .join(".claude")
-            .join("engram.redb");
-        if p.is_file() {
-            Some(p)
-        } else {
-            None
-        }
-    });
-
-    // 7. 合并 公共L1-3 + 根L4 + 活跃子项目L4（在状态门控之前先读出，因为状态栏小文件
-    //    无论是否门控判空都要写最新的一行状态串，需要先有挂载集）。
-    let merged = match read_hot_index_merged(&general_db, &root_db, active_db.as_deref()) {
+    // 4. 合并 公共库 + 作用域库（在状态门控之前先读出，因为状态栏小文件无论是否
+    //    门控判空都要写最新的一行状态串，需要先有挂载集）。
+    let merged = match read_merged_scope(&general_db, &scope) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("hot-index 失败：{e}");
@@ -1505,51 +1661,55 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         }
     };
 
-    // 8. 状态栏小文件（best-effort）：把挂载集的一行状态串写入 --status-file（覆盖）。
+    // 5. 状态栏小文件（best-effort）：把挂载集的一行状态串写入 --status-file（覆盖）。
     //    无论后面状态门控是否判空、是否注入，都先把状态栏文件刷成最新；写失败静默忽略。
     if let Some(status_path) = args.status_file {
         write_status_file_silent(status_path, &oneline_status(&merged, now));
     }
 
-    // 9. 状态门控（仅当 --state 给出）：与上次 active 相同则输出空、exit 0。
+    // 6. 状态门控（仅当 --state 给出）：与上次 scope.root 相同则输出空、exit 0。
+    //    state 文件存上次作用域根的绝对路径字符串。
+    let scope_root_str = scope.root.to_string_lossy().to_string();
     if let Some(state_path) = args.state {
         let last = read_state(state_path);
-        let unchanged = active_unchanged(active.as_deref(), last.as_deref(), &root_name);
+        let unchanged = last.as_deref() == Some(scope_root_str.as_str());
         if unchanged {
             // 不打印任何东西（让 hook 不注入）；状态栏文件已在上一步写过、仍记日志（best-effort）。
             if let Some(log_path) = args.log {
-                append_hot_index_log(
-                    log_path,
-                    now,
-                    args.hook_event,
-                    active.as_deref(),
-                    &root_name,
-                    &workspace_root,
-                );
+                append_hot_index_log(log_path, now, args.hook_event, &scope);
             }
             return ExitCode::SUCCESS;
         }
-        // 有变化：把本次 active 名（None 记为根 name）写回状态文件后继续渲染。
-        let to_write = active.as_deref().unwrap_or(&root_name);
-        if let Err(e) = write_state(state_path, to_write) {
+        // 有变化：把本次 scope.root 绝对路径写回状态文件后继续渲染。
+        if let Err(e) = write_state(state_path, &scope_root_str) {
             eprintln!("hot-index 失败：{e}");
             return ExitCode::FAILURE;
         }
     }
 
-    // 10. 渲染。
+    // 7. 渲染。前言后若作用域是项目管理目录，追加一行提示（勿在此直接写项目记忆）。
     const PREAMBLE: &str = "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」";
+    const WORKSPACE_NOTE: &str = "（注意：当前目录是 engram 项目管理目录，不要直接在此写项目记忆；请在其下的具体项目目录里工作，项目记忆写到该项目的库。）";
     let rendered = render(&merged, now);
+    let is_workspace = scope.kind == ScopeKind::Workspace;
 
-    // 11. 输出。
+    // 8. 输出。
     let status = match emit {
         EmitFormat::Text => {
             println!("{PREAMBLE}");
+            if is_workspace {
+                println!("{WORKSPACE_NOTE}");
+            }
             print!("{rendered}");
             ExitCode::SUCCESS
         }
         EmitFormat::Json => {
-            let context = format!("{PREAMBLE}\n{rendered}");
+            // additionalContext = 前言（+ 管理目录提示行）+ render 输出。
+            let context = if is_workspace {
+                format!("{PREAMBLE}\n{WORKSPACE_NOTE}\n{rendered}")
+            } else {
+                format!("{PREAMBLE}\n{rendered}")
+            };
             match build_hot_index_json(args.hook_event, &context) {
                 Ok(json) => {
                     println!("{json}");
@@ -1563,16 +1723,9 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         }
     };
 
-    // 12. 调试日志（best-effort）。
+    // 9. 调试日志（best-effort）。
     if let Some(log_path) = args.log {
-        append_hot_index_log(
-            log_path,
-            now,
-            args.hook_event,
-            active.as_deref(),
-            &root_name,
-            &workspace_root,
-        );
+        append_hot_index_log(log_path, now, args.hook_event, &scope);
     }
 
     status
@@ -1602,7 +1755,8 @@ fn write_status_file_silent(path: &Path, content: &str) {
 struct StatusArgs<'a> {
     /// `--general-db` 覆盖；`None` 时走 `<HOME>/.engram/general.redb` 约定。
     general_db: Option<&'a Path>,
-    /// `--workspace-root` 覆盖；`None` 时取 stdin 的 cwd（仅 from_hook_stdin），再缺省取当前目录。
+    /// `--workspace-root`（作 cwd override）；`None` 时取 stdin 的 cwd（仅 from_hook_stdin），
+    /// 再缺省取当前目录；从该目录向上锚定作用域。
     workspace_root: Option<&'a Path>,
     /// 额外 `--project-db name=path`（0..N 个）。
     project_db: &'a [String],
@@ -1646,7 +1800,7 @@ fn parse_status_format(s: &str) -> Result<StatusFormat, String> {
 /// 纯函数，不做 IO。
 ///
 /// # 参数
-/// - `memories`：挂载集（公共库 + 工作区根 L4 + 各 --project-db 的合并集）。
+/// - `memories`：挂载集（公共库 + 作用域库 + 各 --project-db 的合并集）。
 /// - `now`：当前时间（unix 秒），仅用于打印抬头（统计本身不依赖时间）。
 fn render_status_full(memories: &[Memory], now: f64) -> String {
     // 通用三层 active 计数。
@@ -1704,16 +1858,18 @@ fn render_status_full(memories: &[Memory], now: f64) -> String {
     buf
 }
 
-/// 执行 `status` 子命令：复用 hot-index 那套加载（公共库 + 工作区根 L4 + 各
-/// `--project-db`），把**传入的全部库**当作挂载集统计/展示。
+/// 执行 `status` 子命令：从 cwd 锚定作用域，挂载「公共库 + 作用域库 + 各
+/// `--project-db`」，把这批库当作挂载集统计/展示。
 ///
 /// 注意：本命令只做统计/展示，**不做 active 子项目动态判定、不接 transcript**——
-/// status 给的是「全貌」，把传入的所有库都算上即可。
+/// status 给的是「全貌」，把传入的所有库都算上即可。`--workspace-root` 在此作为
+/// cwd override，用于从其向上锚定作用域。
 ///
 /// `--format oneline`：打印 [`oneline_status`]（一行、不带多余空行）。
 /// `--format full`（缺省）：打印 [`render_status_full`] 的可读多行概况。
 ///
-/// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。
+/// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。作用域库 / 各项目库缺失时静默跳过
+/// （只读概况，库尚未创建时算作 0 条，不应报错）。
 fn run_status(args: StatusArgs<'_>) -> ExitCode {
     let format = match parse_status_format(args.format) {
         Ok(f) => f,
@@ -1729,27 +1885,15 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // stdin 兜底（仅 --from-hook-stdin）：只用其 cwd 作 workspace-root 兜底。
+    // stdin 兜底（仅 --from-hook-stdin）：只用其 cwd 作 cwd 兜底。
     let hook = if args.from_hook_stdin {
         read_hook_stdin()
     } else {
         HookStdin::default()
     };
 
-    // general_db：--general-db，否则 <HOME>/.engram/general.redb。
-    let general_db: PathBuf = match args.general_db {
-        Some(p) => p.to_path_buf(),
-        None => match home_dir(real_env_lookup) {
-            Ok(home) => home.join(".engram").join("general.redb"),
-            Err(e) => {
-                eprintln!("status 失败：{e}");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-
-    // workspace_root：--workspace-root，否则 stdin.cwd，否则 current_dir()。
-    let workspace_root: PathBuf = match args.workspace_root {
+    // cwd：--workspace-root 优先，否则 stdin.cwd，否则 current_dir()。
+    let cwd: PathBuf = match args.workspace_root {
         Some(p) => p.to_path_buf(),
         None => match hook.cwd.clone() {
             Some(c) => c,
@@ -1763,9 +1907,17 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
         },
     };
 
-    // 挂载集：公共库（全部）+ 工作区根 L4 库（若文件存在）+ 各 --project-db（若文件存在）。
-    // 与 hot-index 一致，但不做活跃子项目判定——传入的库即全貌。缺失的库静默跳过
-    // （状态命令是只读概况，库尚未创建时算作 0 条，不应报错）。
+    // 从 cwd 向上锚定作用域，得 (general_db, scope)。
+    let (general_db, scope) = match resolve_scope(&cwd, args.general_db) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("status 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 挂载集：公共库（全部）+ 作用域库（若文件存在）+ 各 --project-db（若文件存在）。
+    // 缺失的库静默跳过（只读概况，库尚未创建时算作 0 条，不应报错）。
     let mut merged = match open_and_read(&general_db) {
         Ok((_db, mems)) => mems,
         Err(e) => {
@@ -1774,12 +1926,15 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
         }
     };
 
-    let root_db = workspace_root.join(".claude").join("engram.redb");
-    if root_db.is_file() {
-        match open_and_read(&root_db) {
+    if scope.db.is_file() {
+        match open_and_read(&scope.db) {
             Ok((_db, mut mems)) => merged.append(&mut mems),
             Err(e) => {
-                eprintln!("status 失败：读取根项目库 {} 失败：{e}", root_db.display());
+                eprintln!(
+                    "status 失败：读取作用域库 {}（{}）失败：{e}",
+                    scope.name,
+                    scope.db.display()
+                );
                 return ExitCode::FAILURE;
             }
         }

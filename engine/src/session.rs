@@ -313,10 +313,7 @@ mod tests {
     fn watermark_roundtrip_and_missing() {
         let dir = unique_dir("wm");
         let wmf = dir.join("watermark.json");
-        assert!(
-            read_watermark(&wmf).is_empty(),
-            "缺失文件应读为空表"
-        );
+        assert!(read_watermark(&wmf).is_empty(), "缺失文件应读为空表");
         let mut wm = Watermark::new();
         wm.insert("/path/to/t.jsonl".to_string(), 42);
         write_watermark(&wmf, &wm).expect("写水位线应成功");
@@ -342,10 +339,16 @@ mod tests {
     fn list_pending_filters_and_sorts() {
         let dir = unique_dir("list");
         // 两条合法 pending（created_at 100、50）
-        write_pending(&dir.join("a.json"), &sample_pending("a", "/a.jsonl", "/a.slice.jsonl", 100.0))
-            .expect("写 a 应成功");
-        write_pending(&dir.join("b.json"), &sample_pending("b", "/b.jsonl", "/b.slice.jsonl", 50.0))
-            .expect("写 b 应成功");
+        write_pending(
+            &dir.join("a.json"),
+            &sample_pending("a", "/a.jsonl", "/a.slice.jsonl", 100.0),
+        )
+        .expect("写 a 应成功");
+        write_pending(
+            &dir.join("b.json"),
+            &sample_pending("b", "/b.jsonl", "/b.slice.jsonl", 50.0),
+        )
+        .expect("写 b 应成功");
         // 一个切片文件（.jsonl，应被忽略）、一个坏 json（应被跳过）
         write_file(&dir.join("a.slice.jsonl"), "x\n");
         write_file(&dir.join("bad.json"), "not json");
@@ -363,8 +366,11 @@ mod tests {
         let dir = unique_dir("remove");
         let pf = dir.join("sid.json");
         let sf = dir.join("sid.slice.jsonl");
-        write_pending(&pf, &sample_pending("sid", "/t.jsonl", sf.to_string_lossy().as_ref(), 1.0))
-            .expect("写应成功");
+        write_pending(
+            &pf,
+            &sample_pending("sid", "/t.jsonl", sf.to_string_lossy().as_ref(), 1.0),
+        )
+        .expect("写应成功");
         write_file(&sf, "x\n");
         remove_pending(&pf, &sf);
         assert!(!pf.exists(), "pending 应被删");

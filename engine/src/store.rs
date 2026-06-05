@@ -160,7 +160,7 @@ impl StoreError {
 ///   [`StoreError::is_lock_contention`] 识别，供 [`open`] 据此重试。
 fn open_once(path: &Path) -> Result<Database, StoreError> {
     // redb 只建文件、不建目录：父目录缺失时 `Database::create` 会以「系统找不到
-    // 指定的路径」失败。全新安装时 `~/.engram/`（及项目库的 `<项目>/.claude/`）
+    // 指定的路径」失败。全新安装时 `~/.engram/`（及项目库的 `<项目>/.engram/`）
     // 尚未建立，若不先补建，任何只读命令（list/status/recall/render）都会在打开
     // 公共库这一步直接报错退出——新用户会误以为插件坏了。这里先确保父目录存在，
     // 让空库就地建出、显示「0 条」而非红色报错。`create_dir_all` 对已存在目录是

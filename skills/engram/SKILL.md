@@ -12,13 +12,26 @@ engram 是仿人脑的分层记忆系统：**总结当索引、按需回溯细�
 
 ---
 
-## 0. 数据库怎么传（作用域）
+## 0. 作用域与库怎么定（`.engram/` 锚点）
 
-所有命令都要 `--general-db <公共库路径>`，外加 0..N 个 `--project-db <项目名>=<库路径>`：
+记忆分两种库：
+- **公共库**：用户级共享 L1-3，恒定加载，在 `~/.engram/general.redb`。
+- **项目库**：每个项目根下的 `<项目>/.engram/engram.redb`，存该项目的 L4。
 
-- **公共库**：用户级共享 L1-3，恒定加载。
-- **项目库**：每个目录（含工作区根）的 `<目录>/.claude/engram.redb`，存该目录这个"项目"的 L4。
-- 一次会话的"活跃项目集" = 启动目录自己的项目库 + 当前正在做的子项目库（由 hook 动态决定，链向下不向上）。把这些都用 `--project-db name=path` 传给引擎即可。
+**当前是哪个项目，由「`.engram/` 锚点」决定，不靠 cwd**：引擎从当前目录**向上找最近的 `.engram/`**——
+- 找到普通项目锚（`.engram/` 有库、无 `workspace` 标记）→ 那个目录即项目根；
+- 找到**项目管理目录**锚（`.engram/workspace` 标记，由 `/engram:root` 所建）→ 项目根 = 该管理目录的**直接子目录**（你正处的那一支）；
+- 一路无锚点 → 当前目录即项目根。
+
+所以同一项目在 `src/`、`plugin/` 等任意子目录开会话，都锚定到**同一个项目库**，不再碎片化（旧的「cwd 当 root + 猜活跃子项目」已废弃）。
+
+**怎么拿当前作用域**（手动跑 list/recall/write 前先来一次）：
+```
+engram resolve --format json   # 输出 general_db / project_db / project_name / kind
+```
+之后各命令统一带 `--general-db <general_db> --project-db <project_name>=<project_db>`。`kind` 为 `workspace` 表示你正站在项目管理目录本身（特殊，见 §1.5）。
+
+> SessionStart / UserPromptSubmit hook 已按锚点自动注入热索引；只有你**手动**跑 list/recall/write 时才需先 resolve。
 
 ---
 
@@ -39,6 +52,18 @@ engram 是仿人脑的分层记忆系统：**总结当索引、按需回溯细�
 
 ---
 
+## 1.5 在「项目管理目录」里怎么办
+
+`engram resolve` 的 `kind` 若为 `workspace`，说明你**正站在项目管理目录本身**（它只负责分门别类管理项目，不该直接堆项目记忆）。此时：
+
+- **要做具体项目** → **主动在它下面建一个项目子目录**（按项目内容起名，拿不准就先问用户一句），进到那个子目录里干活；该项目的记忆写**它自己的库**（`resolve` 在子目录会自动锚定到它）。
+- 只有**真正关于"管理这些项目"本身**的少量元信息（如这批项目的统一规范、哪个项目负责什么）才写管理目录的库——量应该很少。
+- **别把某个具体项目的细节写进管理库**。
+
+SessionStart hook 注入热索引时，也会在前言提醒你"当前在项目管理目录"。
+
+---
+
 ## 2. 写什么 + 落哪层：salience 判定
 
 分三步走：**①可恢复性闸门**（值不值得写）→ **②作用域闸门**（进公共层还是项目 L4）→ **③显著度**（importance 高低 / 落哪层）。外加一个 override（只管"写不写"）。
@@ -48,7 +73,7 @@ engram 是仿人脑的分层记忆系统：**总结当索引、按需回溯细�
 
 ### ② 作用域闸门（公共层 vs 项目 L4）——**默认 L4**
 先问：这条**只在当前这个项目/仓库里成立**，还是**换个项目也照样成立**？
-- 只在本项目成立（本仓库的架构、约定、踩过的坑、某处为何这么写）→ 写**项目 L4**（带 `--project NAME`，NAME = 当前已挂载的项目库）。**这是默认去向。**
+- 只在本项目成立（本仓库的架构、约定、踩过的坑、某处为何这么写）→ 写**项目 L4**（带 `--project NAME`，NAME = `engram resolve` 给的 `project_name`）。**这是默认去向。**
 - 跨项目通用（用户身份/称呼/长期偏好、与具体仓库无关的工具用法或普适事实）→ 才升到**公共 L1-3**。
 
 > 偏置很重要：**身处项目时默认 L4**，只有明确判断"拿到别的项目也有用"才进公共层。否则公共层会被单个项目的细节噪声污染，换项目后满眼无关记忆。
@@ -144,5 +169,7 @@ engram gc --general-db G [--project-db n=p ...] [--dry-run]
 | `gc` | TTL 硬删除（`--dry-run` 预览） |
 | `list` | 可读检视（redb 是二进制，用它看内容） |
 | `import --from-json-dir` | 从 JSON 目录导入（迁移/灌库用） |
+| `resolve --format json\|env` | 按 `.engram/` 锚点解析当前作用域（general/project 库路径 + name + kind），手动跑读写命令前先来一次 |
+| `root --project-dir D` | 把 D 设为项目管理目录（防嵌套 + 建 `.engram/workspace` 标记与管理库 + 写 L2 登记） |
 
-> 检视任何库内容：`engram list --general-db G [--project-db n=p ...] --status all`
+> 检视任何库内容：先 `engram resolve --format json` 拿到库路径，再 `engram list --general-db G --project-db n=p --status all`

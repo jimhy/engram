@@ -42,7 +42,7 @@ Then `/doctor` should report no plugin errors. (If `/plugin update` doesn't pick
 | Hook | What it does |
 |------|--------------|
 | `SessionStart` | Injects the **hot index** (relevant memory) into context; also **catches up** any consolidation a previous session didn't finish (crash / abrupt exit) |
-| `UserPromptSubmit` | **Dynamically mounts** the L4 memory of whichever sub-project you're working on — re-injects only when the active project changes |
+| `UserPromptSubmit` | Re-resolves the current project from the nearest **`.engram/` anchor** and re-injects its L4 — only when the project scope (root) changes |
 | `SessionEnd` | Spins up an **independent reviewer** that consolidates only the **increment since the last watermark** (token-thrifty on long / resumed sessions): writes new memories, promotes/demotes, supersedes, merges |
 
 **Slash commands:** `/engram list` · `/engram recall <query>` · `/engram status` · `/engram render`
@@ -58,7 +58,7 @@ Memory is **tiered**, like human memory:
 | **L1** | "subconscious" — core identity / preferences | almost never (high floor) |
 | **L2** | important | slow |
 | **L3** | ordinary | medium |
-| **L4** | per-project, lives in `<project>/.claude/engram.redb` | scoped, mounted on demand |
+| **L4** | per-project, lives in `<project>/.engram/engram.redb` | scoped to the project, located via the `.engram/` anchor |
 
 - **Activation = importance + recency + frequency** (ACT-R base-level), with a per-tier floor so L1 stays put.
 - **Climbing requires earned activation; falling is cushioned** by the floor and a grace period — new and important memories aren't killed early.
@@ -67,7 +67,7 @@ Memory is **tiered**, like human memory:
 ## Where memory lives
 
 - **Shared** (cross-project L1-3): `~/.engram/general.redb` (auto-created)
-- **Per-project** (L4): `<project>/.claude/engram.redb` (travels with the project)
+- **Per-project** (L4): `<project>/.engram/engram.redb` (travels with the project)
 
 Storage is **[redb](https://github.com/cberner/redb)** (embedded, single-file, ACID) — no server, no external database.
 

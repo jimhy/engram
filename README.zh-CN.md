@@ -42,7 +42,7 @@
 | Hook | 作用 |
 |------|------|
 | `SessionStart` | 把**热索引**（相关记忆）注入上下文；并**补跑**上次会话异常退出（崩溃/强关）未完成的巩固 |
-| `UserPromptSubmit` | **动态挂载**你当前正在做的子项目的 L4 记忆——只在活跃项目变化时才重注入 |
+| `UserPromptSubmit` | 按最近的 **`.engram/` 锚点**重解析当前项目，并重注入其 L4——仅当项目作用域（根）变化时才触发 |
 | `SessionEnd` | 起一个**独立复盘者**，只巩固**自上次水位线以来的增量**（长会话/续接会话更省 token）：写入新记忆、升降级、标记取代、合并 |
 
 **slash 命令：** `/engram list` · `/engram recall <词>` · `/engram status` · `/engram render`
@@ -58,7 +58,7 @@
 | **L1** | "潜意识"——核心身份 / 偏好 | 几乎不忘（高 floor） |
 | **L2** | 重要 | 慢 |
 | **L3** | 普通 | 中等 |
-| **L4** | 项目级，存于 `<项目>/.claude/engram.redb` | 作用域内、按需挂载 |
+| **L4** | 项目级，存于 `<项目>/.engram/engram.redb` | 项目作用域，按 `.engram/` 锚点定位 |
 
 - **activation = 重要度 + 近因 + 频率**（ACT-R base-level），每层带 floor，让 L1 站得住。
 - **爬升要靠挣来的活跃度；下跌有 floor 和宽限期兜底**——新记忆、重要记忆不会被过早杀掉。
@@ -67,7 +67,7 @@
 ## 记忆存哪
 
 - **公共库**（跨项目 L1-3）：`~/.engram/general.redb`（首次自动建）
-- **项目库**（L4）：`<项目>/.claude/engram.redb`（随项目走）
+- **项目库**（L4）：`<项目>/.engram/engram.redb`（随项目走）
 
 存储用 **[redb](https://github.com/cberner/redb)**（嵌入式、单文件、ACID）——无服务、无外部数据库。
 
