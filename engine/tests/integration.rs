@@ -3694,13 +3694,14 @@ fn root_rejects_nesting_under_existing_workspace() {
     let _ = std::fs::remove_dir_all(&parent);
 }
 
-// 45. root 冲突：目录已是普通项目（有项目库、无 workspace 标记）时 root 应失败。
+// 45. root 不因「目录已有 .engram/ 项目库」而拒绝：hot-index hook 会在任意目录自动建该库，
+//     唯一的拒绝条件是防嵌套（见 #44）。已有库时 root 应成功、写出 workspace 标记、保留原库内容。
 #[test]
-fn root_rejects_existing_plain_project() {
+fn root_succeeds_when_engram_db_preexists() {
     let _guard = test_guard();
     let now = 1_000_000_000.0;
-    let dir = unique_workspace_root("root_conflict");
-    // 先把它建成普通项目（有 .engram/engram.redb、无 workspace 标记）。
+    let dir = unique_workspace_root("root_preexist");
+    // 先把它建成普通项目（有 .engram/engram.redb、无 workspace 标记），模拟 hook 自动建库。
     let _db = seed_engram_db(
         &dir,
         &[make(
@@ -3713,23 +3714,27 @@ fn root_rejects_existing_plain_project() {
             vec![now],
         )],
     );
-    let general_path = unique_db_path("root_conflict_g");
+    let general_path = unique_db_path("root_preexist_g");
     let d = dir.to_string_lossy().to_string();
     let g = general_path.to_string_lossy().to_string();
 
     let out = run_root_raw(&["--project-dir", &d, "--general-db", &g]);
-    assert!(!out.status.success(), "已是普通项目时 root 应失败（非 0）");
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("已是 engram 项目"),
-        "stderr 应提示已是普通项目，实得：{stderr}"
+        out.status.success(),
+        "已有 .engram/ 库时 root 仍应成功（hook 自动建库不应阻止），stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    // 不应写出 workspace 标记。
+    // 应写出 workspace 标记，使其成为管理目录。
     let canon = canonicalize_no_verbatim(&dir);
     assert!(
-        !canon.join(".engram").join("workspace").exists(),
-        "冲突失败时不应写出 workspace 标记"
+        canon.join(".engram").join("workspace").is_file(),
+        "root 成功后应写出 workspace 标记"
     );
+    // 原项目库内容应被保留（store::open 打开既有库、不清空）。
+    let pdb = store::open(&canon.join(".engram").join("engram.redb")).expect("应能打开项目库");
+    let mems = store::all(&pdb).expect("应能读项目库");
+    drop(pdb);
+    assert_eq!(mems.len(), 1, "原项目库的记忆应保留，实得 {} 条", mems.len());
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&dir);

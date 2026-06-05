@@ -1294,11 +1294,13 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
 /// 2. 防嵌套：沿其**父链（不含自己）**向上，若任一祖先已是项目管理目录
 ///    （`<祖先>/.engram/workspace` 是文件）→ 失败返回（不允许嵌套管理目录）。
 /// 3. 幂等：若本目录 `.engram/workspace` 已存在 → 打印「已是」并成功返回。
-/// 4. 冲突：若本目录已是普通项目（有 `.engram/engram.redb` 但无 workspace 标记）→
-///    失败返回（不能把已有项目库的目录再设为管理目录）。
-/// 5. 否则：建 `.engram/` → 写 `workspace` 标记（`engram-workspace v1 created_at=<秒>`）
-///    → 用 [`store::open`] 建空项目库 → 往公共库追加一条 L2「管理目录」记忆 →
-///    打印该管理目录的**绝对路径**（供调用脚本使用）。
+/// 4. 否则：建 `.engram/`（已存在则复用）→ 写 `workspace` 标记（`engram-workspace v1
+///    created_at=<秒>`）→ 用 [`store::open`] 打开/建项目库（已有库则保留其内容）→
+///    往公共库追加一条 L2「管理目录」记忆 → 打印该管理目录的**绝对路径**。
+///
+/// 注：唯一的拒绝条件是「防嵌套」（父链已有管理目录，第 2 步）。本目录已存在
+/// `.engram/` 或项目库**不**构成拒绝——hot-index hook 会在任意目录自动建
+/// `.engram/engram.redb`，若据此拒绝，则任何开过会话的目录都再也无法设为管理目录。
 fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
     // 1. 解析并规范化目标目录。
     let raw_dir = match resolve_project_dir(project_dir) {
@@ -1332,21 +1334,12 @@ fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // 4. 冲突：已是普通项目（有库无 workspace 标记）则拒绝。
-    if scope_db.is_file() {
-        eprintln!(
-            "engram root 失败：{} 已是 engram 项目（已有项目库），不能再设为项目管理目录",
-            dir.display()
-        );
-        return ExitCode::FAILURE;
-    }
-
     // 取当前时间（用于 workspace 标记内容、记忆 created_at / id）。
     let Some(now) = resolve_now(None) else {
         return ExitCode::FAILURE;
     };
 
-    // 5a. 建 .engram/ 目录。
+    // 4a. 建 .engram/ 目录（已存在则复用）。
     if let Err(e) = std::fs::create_dir_all(&engram_dir) {
         eprintln!(
             "engram root 失败：创建目录 {} 失败：{e}",
@@ -1355,7 +1348,7 @@ fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 5b. 写 workspace 标记文件。
+    // 4b. 写 workspace 标记文件。
     let marker_content = format!("engram-workspace v1 created_at={}", now.max(0.0) as u64);
     if let Err(e) = std::fs::write(&workspace_marker, marker_content) {
         eprintln!(
@@ -1365,7 +1358,7 @@ fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 5c. 用 store::open 建出空项目库（不存在即建）。
+    // 4c. 用 store::open 打开/建项目库（已有库则保留其内容）。
     if let Err(e) = store::open(&scope_db) {
         eprintln!(
             "engram root 失败：创建项目库 {} 失败：{e}",
@@ -1374,7 +1367,7 @@ fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 5d. 往公共库追加一条 L2「管理目录」记忆。
+    // 4d. 往公共库追加一条 L2「管理目录」记忆。
     let general_db: PathBuf = match general_db {
         Some(p) => p.to_path_buf(),
         None => match home_dir(real_env_lookup) {
