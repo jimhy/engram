@@ -46,9 +46,9 @@
 | `UserPromptSubmit` | 按最近的 **`.engram/` 锚点**重解析当前项目，并重注入其 L4——仅当项目作用域（根）变化时才触发 |
 | `SessionEnd` | 起一个**独立复盘者**，只巩固**自上次水位线以来的增量**（长会话/续接会话更省 token）：写入新记忆、升降级、标记取代、合并 |
 
-**slash 命令：** `/engram list` · `/engram recall <词>` · `/engram status` · `/engram render`
+**slash 命令：** `/engram list` · `/engram recall <词>` · `/engram status` · `/engram render` · `/engram root` · `/engram statusline [on|off]`
 
-**状态栏指示**（可选）：`● Engram | L1:2 L2:0 L3:1`
+**状态栏指示**（可选，**默认关闭**）：`● Engram | L1:2 L2:0 L3:1`
 
 ## 工作原理
 
@@ -97,9 +97,18 @@
 /engram render            # 预览会注入什么
 ```
 
-## 状态栏
+## 状态栏（可选，默认关闭）
 
-想显示实时的 `● Engram | …` 指示，把 `settings.json` 的 `statusLine.command` 指向 `statusline/engram-statusline.sh` 即可——它读 `~/.engram/status.txt`（每轮刷新、不开库）。
+engram 状态栏**默认关闭**——装好插件不会自动显示。想常显 `● Engram | L1:n L2:n L3:n`，用开关启用 / 关闭：
+
+```
+/engram:statusline on      # 启用（不带参数等同 on）
+/engram:statusline off     # 关闭（移除配置，不影响你为别的工具配的状态栏）
+```
+
+`on` 会把状态栏脚本固化到 `~/.engram/engram-statusline.sh`（与插件版本无关的稳定路径），把 `statusLine.command` 合并进你的**用户级** `settings.json`，再提示你重启。状态栏内容由 hooks 每轮刷新的 `~/.engram/status.txt` 驱动——不开数据库、极快。装了 [claude-hud](https://github.com/jarrodwatts/claude-hud) 会自动在前面拼上它的状态行，没装就只显示 Engram 段。`off` 只移除 engram 自己写的那条配置、不碰你为别的工具配的 `statusLine`。
+
+> 为什么默认关闭、还要这一步：`statusLine` 是用户级配置，插件**无法**随分发自动写入（plugin.json 没有该字段）——这既是「默认关闭」的根本原因，也是为什么得由本命令替你写进 `settings.json`。之后插件升级**无需重配**——仅当某次升级改动了状态栏脚本本身时，重跑一次 `/engram:statusline on` 同步即可。
 
 ## 配置
 

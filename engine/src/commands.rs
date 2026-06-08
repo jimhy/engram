@@ -670,6 +670,93 @@ pub fn build_merged_memory(
     }
 }
 
+/// 计算毕业（§6 L4 → L1-3 毕业通道）的目标通用层级。
+///
+/// 把一条**项目记忆**（L4.x）提拔进通用层时落哪一层：
+/// - `to_override` 给定：必须是通用层 L1/L2/L3，否则报错（不能毕业到另一个 L4）；
+/// - `to_override` 为 `None`：按**子层同构**默认映射 `L4.1→L1` / `L4.2→L2` / `L4.3→L3`。
+///
+/// 源层级必须是 L4.x（[`is_l4`]）——通用层记忆本就在通用轨道，无所谓「毕业」。
+///
+/// # 参数
+/// - `src`：源记忆的层级（应为 L4.x）。
+/// - `to_override`：`--to-level` 显式指定的目标层；`None` 时用同构默认。
+///
+/// # Errors
+/// - 源不是 L4.x（通用记忆无需毕业）；
+/// - `to_override` 落在 L4 轨道（毕业必须去通用层）。
+pub fn graduate_target_level(src: Level, to_override: Option<Level>) -> Result<Level, String> {
+    if !is_l4(src) {
+        return Err(
+            "graduate 失败：源不是项目记忆（L4.1/L4.2/L4.3），通用层记忆无需毕业".to_string(),
+        );
+    }
+    match to_override {
+        Some(lv) if is_l4(lv) => {
+            Err("graduate 失败：--to-level 必须是通用层 L1/L2/L3，不能毕业到另一个 L4".to_string())
+        }
+        Some(lv) => Ok(lv),
+        None => Ok(match src {
+            Level::L4_1 => Level::L1,
+            Level::L4_2 => Level::L2,
+            Level::L4_3 => Level::L3,
+            // is_l4 已保证落在 L4.x，其余分支不可达。
+            _ => unreachable!("is_l4 已确保源层级为 L4.x"),
+        }),
+    }
+}
+
+/// 构造毕业后的**新通用记忆**（纯逻辑，不做 IO、不生成 id）。
+///
+/// 字段来源（§6 毕业通道：移动到通用层、不复制）：
+/// - `id` = 传入的 `new_id`（调用方已决定，`--new-id` 或 [`generate_id`]）；
+/// - `cue` = `cue_override` 或源 `cue`；
+/// - `level` = `to_level`（[`graduate_target_level`] 算出的通用层）；
+/// - `project` = `None`（脱离项目作用域，进通用轨道）；
+/// - `importance` = `importance_override` 或源 `importance`；
+/// - `access_log` = 源 access_log 克隆（**继承真使用痕迹**，毕业不清零频率/近因）；
+/// - `created_at` = 源 `created_at`（保留资历）；
+/// - `pointer` = 源 pointer 克隆（指针照旧指向 ground truth）；
+/// - `pinned` = 源 `pinned`；`status` = [`Status::Active`]；`superseded_by = None`；
+/// - `tags` = 源 tags 并补一个 `"graduated"` 血缘标记（不重复添加）。
+///
+/// 注意：原 L4 记忆**不在本函数处理**——调用方负责把它转 [`Status::Superseded`]、
+/// `superseded_by = new_id`，作为留在项目库里的「已上浮」指针（§6：留指针、不复制）。
+///
+/// # 参数
+/// - `new_id`：新通用记忆 id（调用方已决定）。
+/// - `src`：源 L4 记忆。
+/// - `to_level`：目标通用层。
+/// - `cue_override`：`--cue` 覆盖；`None` 时沿用源 cue。
+/// - `importance_override`：`--importance` 覆盖；`None` 时沿用源 importance。
+pub fn build_graduated_memory(
+    new_id: &str,
+    src: &Memory,
+    to_level: Level,
+    cue_override: Option<&str>,
+    importance_override: Option<f64>,
+) -> Memory {
+    let mut tags = src.tags.clone();
+    let graduated = "graduated".to_string();
+    if !tags.contains(&graduated) {
+        tags.push(graduated);
+    }
+    Memory {
+        id: new_id.to_string(),
+        cue: cue_override.unwrap_or(&src.cue).to_string(),
+        pointer: src.pointer.clone(),
+        level: to_level,
+        project: None,
+        importance: importance_override.unwrap_or(src.importance),
+        pinned: src.pinned,
+        access_log: src.access_log.clone(),
+        status: Status::Active,
+        superseded_by: None,
+        created_at: src.created_at,
+        tags,
+    }
+}
+
 /// 计算一条记忆的“最后触碰时间” `last_touch`：`access_log` 的最大值；为空则取 `created_at`。
 ///
 /// gc 用它作 TTL 计时基准：任何 `recall`→`confirm-use` 给 `access_log` 追加新时间戳，
@@ -688,33 +775,51 @@ pub fn last_touch(m: &Memory) -> f64 {
         .unwrap_or(m.created_at)
 }
 
-/// 判定一条记忆是否应被 gc 硬删除（§7.4 TTL 硬删除）。
+/// 判定一条记忆是否应被 gc 硬删除（§7.4 TTL 硬删除的「与门」）。
 ///
-/// 规则（`age_days = (now - last_touch) / 86400`，[`last_touch`] 见上）：
-/// - `status == Cold` 且 `age_days > ttl_days` → 删除；
-/// - `status == Tombstone` 且 `age_days > tombstone_ttl_days` → 删除；
+/// 删除需**两臂同时成立**（与门），缺一不可：
+/// 1. **超 TTL**：`age_days = (now - last_touch) / 86400` 超过该类型的 TTL
+///    （Cold 用 `ttl_days`，Tombstone 用 `tombstone_ttl_days`，[`last_touch`] 见上）。
+/// 2. **极少真使用**：真使用次数 `access_log.len() <= min_uses`（缺省阈值 1）。
+///    `write` 创建时 `access_log` 为空、不计入；只有 `confirm-use`（真使用）才
+///    向其追加时间戳，故 `access_log.len()` 即「这条被真正用上过几次」。
+///
+/// 即：
+/// - `Cold` 且 `age_days > ttl_days` 且 `access_log.len() <= min_uses` → 删除；
+/// - `Tombstone` 且 `age_days > tombstone_ttl_days` 且 `access_log.len() <= min_uses` → 删除；
 /// - `Active` / `Superseded` → **永不删**。
 ///
-/// 设计说明：
-/// - **冷条目以 age 为闸**：冷条目本就是被淘汰的低价值记忆，长期无人 `recall`
-///   即可清理；任何 `recall`→`confirm-use` 会向 `access_log` 追加新时间戳、刷新
-///   `last_touch`，从而重置 TTL 计时（重新被需要的记忆不会被误删）。
-/// - **tombstone TTL 极长**：墓碑是“负知识”（曾认为 X、后被 Y 推翻），长期保留以
-///   防重蹈覆辙，故其 TTL 远长于冷条目（缺省 3650 天 vs 180 天）。
-/// - **Active/Superseded 永不删**：活跃记忆显然要留；superseded 仍是有效的指向链
-///   （`superseded_by` 链路）的一环，由后续可能的 supersede→merge 流程接管，不在
-///   gc 的硬删除范围内。
+/// 设计说明（设计文档 §7.4「删除条件（与门）」）：
+/// - **两扇与门，宁留勿删**（删除不可逆）：只「很久不用」不够，还得「从没真正用上过」。
+///   一条被 `confirm-use` 过 ≥ `min_uses+1` 次的记忆，即便如今冷却也已**证明过有用**，
+///   永久保留、不被 TTL 清理——这正是第二臂相对旧版（仅 age 一臂）补上的那条胳膊。
+/// - **第一臂以 age 为闸**：任何 `recall`→`confirm-use` 既刷新 `last_touch`（重置 TTL
+///   计时），又增长 `access_log`（推动第二臂转向「保留」），双重保护重新被需要的记忆。
+/// - **tombstone TTL 极长**：墓碑是「负知识」（曾认为 X、后被 Y 推翻），长期保留以防
+///   重蹈覆辙，故其 TTL 远长于冷条目（缺省 3650 天 vs 180 天）；其第二臂同样要求极少使用。
+/// - **Active/Superseded 永不删**：活跃记忆显然要留；superseded 仍是有效指向链
+///   （`superseded_by`）的一环，由后续 supersede→merge 流程接管，不在 gc 范围内。
 ///
 /// # 参数
 /// - `m`：待判定的记忆。
 /// - `now`：当前时间（unix 秒）。
 /// - `ttl_days`：冷条目存活上限（天）。
 /// - `tombstone_ttl_days`：墓碑存活上限（天）。
-pub fn gc_should_delete(m: &Memory, now: f64, ttl_days: f64, tombstone_ttl_days: f64) -> bool {
+/// - `min_uses`：第二臂阈值——真使用次数不超过此值才算「极少使用」（缺省 1）。
+pub fn gc_should_delete(
+    m: &Memory,
+    now: f64,
+    ttl_days: f64,
+    tombstone_ttl_days: f64,
+    min_uses: usize,
+) -> bool {
     let age_days = (now - last_touch(m)) / crate::model::SECS_PER_DAY;
+    // 第二臂：真使用次数极低。access_log 仅由 confirm-use 追加（write 时为空），
+    // 故其长度即「被真正用上过几次」；<= min_uses 视为「从没真正用上过」。
+    let rarely_used = m.access_log.len() <= min_uses;
     match m.status {
-        Status::Cold => age_days > ttl_days,
-        Status::Tombstone => age_days > tombstone_ttl_days,
+        Status::Cold => age_days > ttl_days && rarely_used,
+        Status::Tombstone => age_days > tombstone_ttl_days && rarely_used,
         Status::Active | Status::Superseded => false,
     }
 }
@@ -1546,6 +1651,90 @@ mod tests {
 
     // --- gc：last_touch 取 access_log 最大值，空则取 created_at ---
     #[test]
+    fn graduate_target_level_maps_and_validates() {
+        // 同构默认映射 L4.1→L1 / L4.2→L2 / L4.3→L3。
+        assert_eq!(graduate_target_level(Level::L4_1, None).unwrap(), Level::L1);
+        assert_eq!(graduate_target_level(Level::L4_2, None).unwrap(), Level::L2);
+        assert_eq!(graduate_target_level(Level::L4_3, None).unwrap(), Level::L3);
+        // override 生效（可跨档：L4.3 也能直接毕业到 L1）。
+        assert_eq!(
+            graduate_target_level(Level::L4_3, Some(Level::L1)).unwrap(),
+            Level::L1
+        );
+        assert_eq!(
+            graduate_target_level(Level::L4_1, Some(Level::L3)).unwrap(),
+            Level::L3
+        );
+        // 源非 L4（通用记忆）→ 报错。
+        assert!(graduate_target_level(Level::L1, None).is_err());
+        assert!(graduate_target_level(Level::L3, Some(Level::L2)).is_err());
+        // override 落在 L4 轨道（毕业必须去通用层）→ 报错。
+        assert!(graduate_target_level(Level::L4_2, Some(Level::L4_1)).is_err());
+    }
+
+    #[test]
+    fn build_graduated_memory_moves_to_general_and_keeps_lineage() {
+        let src = Memory {
+            id: "src_l4".to_string(),
+            cue: "项目里悟出的通用原则".to_string(),
+            pointer: Pointer {
+                kind: "file".to_string(),
+                reference: Some("a.rs:10".to_string()),
+                detail: None,
+            },
+            level: Level::L4_2,
+            project: Some("engram".to_string()),
+            importance: 0.6,
+            pinned: false,
+            access_log: vec![100.0, 200.0, 300.0],
+            status: Status::Active,
+            superseded_by: None,
+            created_at: 50.0,
+            tags: vec!["arch".to_string()],
+        };
+        // 默认映射 L4.2→L2；cue/importance 未覆盖时沿用源。
+        let to = graduate_target_level(src.level, None).unwrap();
+        let g = build_graduated_memory("new_gen", &src, to, None, None);
+        assert_eq!(g.id, "new_gen");
+        assert_eq!(g.level, Level::L2);
+        assert_eq!(g.project, None, "毕业后脱离项目作用域");
+        assert_eq!(g.cue, src.cue, "未覆盖时沿用源 cue");
+        assert!(
+            (g.importance - 0.6).abs() < 1e-12,
+            "未覆盖时沿用源 importance"
+        );
+        assert_eq!(g.access_log, vec![100.0, 200.0, 300.0], "继承真使用痕迹");
+        assert!(
+            (g.created_at - 50.0).abs() < 1e-12,
+            "保留资历（沿用 created_at）"
+        );
+        assert_eq!(
+            g.pointer.reference.as_deref(),
+            Some("a.rs:10"),
+            "指针照旧指向 ground truth"
+        );
+        assert_eq!(g.status, Status::Active);
+        assert!(g.superseded_by.is_none());
+        assert!(g.tags.contains(&"arch".to_string()), "保留源 tags");
+        assert!(
+            g.tags.contains(&"graduated".to_string()),
+            "补 graduated 血缘标记"
+        );
+
+        // 覆盖 cue / importance / to-level（跨档到 L1）。
+        let g2 = build_graduated_memory(
+            "g2",
+            &src,
+            graduate_target_level(src.level, Some(Level::L1)).unwrap(),
+            Some("更精炼的通用 cue"),
+            Some(0.9),
+        );
+        assert_eq!(g2.level, Level::L1);
+        assert_eq!(g2.cue, "更精炼的通用 cue");
+        assert!((g2.importance - 0.9).abs() < 1e-12);
+    }
+
+    #[test]
     fn last_touch_uses_max_access_or_created() {
         let m = ms(
             "x",
@@ -1576,6 +1765,7 @@ mod tests {
         let day = crate::model::SECS_PER_DAY;
         let ttl = 180.0;
         let tomb_ttl = 3650.0;
+        let min_uses = 1;
 
         // cold 超 ttl（200 天未触碰）→ 删。
         let cold_old = ms(
@@ -1588,7 +1778,7 @@ mod tests {
             vec![now - 200.0 * day],
         );
         assert!(
-            gc_should_delete(&cold_old, now, ttl, tomb_ttl),
+            gc_should_delete(&cold_old, now, ttl, tomb_ttl, min_uses),
             "cold 超 ttl 应删"
         );
 
@@ -1603,7 +1793,7 @@ mod tests {
             vec![now - 100.0 * day],
         );
         assert!(
-            !gc_should_delete(&cold_fresh, now, ttl, tomb_ttl),
+            !gc_should_delete(&cold_fresh, now, ttl, tomb_ttl, min_uses),
             "cold 未超 ttl 应保留"
         );
 
@@ -1618,7 +1808,7 @@ mod tests {
             vec![now - 999.0 * day, now - day],
         );
         assert!(
-            !gc_should_delete(&cold_touched, now, ttl, tomb_ttl),
+            !gc_should_delete(&cold_touched, now, ttl, tomb_ttl, min_uses),
             "最近 confirm-use 刷新 last_touch 的 cold 不应被删"
         );
 
@@ -1633,7 +1823,7 @@ mod tests {
             vec![now - 1000.0 * day],
         );
         assert!(
-            !gc_should_delete(&tomb_fresh, now, ttl, tomb_ttl),
+            !gc_should_delete(&tomb_fresh, now, ttl, tomb_ttl, min_uses),
             "tombstone 未超长 ttl 应保留"
         );
 
@@ -1648,7 +1838,7 @@ mod tests {
             vec![now - 4000.0 * day],
         );
         assert!(
-            gc_should_delete(&tomb_old, now, ttl, tomb_ttl),
+            gc_should_delete(&tomb_old, now, ttl, tomb_ttl, min_uses),
             "tombstone 超长 ttl 应删"
         );
 
@@ -1672,12 +1862,57 @@ mod tests {
             vec![now - 9999.0 * day],
         );
         assert!(
-            !gc_should_delete(&active_old, now, ttl, tomb_ttl),
+            !gc_should_delete(&active_old, now, ttl, tomb_ttl, min_uses),
             "active 永不删"
         );
         assert!(
-            !gc_should_delete(&sup_old, now, ttl, tomb_ttl),
+            !gc_should_delete(&sup_old, now, ttl, tomb_ttl, min_uses),
             "superseded 永不删"
+        );
+
+        // —— 第二臂（与门）：极少真使用才删；真用过多次的即便冷掉也保留 ——
+
+        // cold 超 ttl，但被 confirm-use 过 3 次（access_log.len()=3 > min_uses=1）→ 保留。
+        // 三次真使用都在 200 天前以上，故 last_touch 仍 200 天前、age>ttl（第一臂成立），
+        // 仅靠第二臂「极少使用不成立」挡住删除。
+        let cold_used = ms(
+            "c4",
+            Level::L3,
+            None,
+            Status::Cold,
+            0.0,
+            now - 210.0 * day,
+            vec![now - 210.0 * day, now - 205.0 * day, now - 200.0 * day],
+        );
+        assert!(
+            !gc_should_delete(&cold_used, now, ttl, tomb_ttl, min_uses),
+            "cold 超 ttl 但真用过多次（第二臂不成立）应保留"
+        );
+        // 放宽 min_uses 到 3：同一条真使用次数 3<=3，两臂皆成立 → 删（证明 min_uses 生效）。
+        assert!(
+            gc_should_delete(&cold_used, now, ttl, tomb_ttl, 3),
+            "min_uses 放宽到 3 后，真使用 3 次的 cold 两臂皆成立应删"
+        );
+
+        // tombstone 超长 ttl，但被 recall/confirm-use 过多次（len=4 > min_uses）→ 保留。
+        // 仍在持续防坑的负知识不该被清掉。
+        let tomb_used = ms(
+            "t3",
+            Level::L3,
+            None,
+            Status::Tombstone,
+            0.0,
+            now - 4000.0 * day,
+            vec![
+                now - 4000.0 * day,
+                now - 3990.0 * day,
+                now - 3980.0 * day,
+                now - 3970.0 * day,
+            ],
+        );
+        assert!(
+            !gc_should_delete(&tomb_used, now, ttl, tomb_ttl, min_uses),
+            "tombstone 超长 ttl 但仍被反复 recall（第二臂不成立）应保留"
         );
     }
 

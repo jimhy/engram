@@ -46,9 +46,9 @@ Then `/doctor` should report no plugin errors. (If `/plugin update` doesn't pick
 | `UserPromptSubmit` | Re-resolves the current project from the nearest **`.engram/` anchor** and re-injects its L4 — only when the project scope (root) changes |
 | `SessionEnd` | Spins up an **independent reviewer** that consolidates only the **increment since the last watermark** (token-thrifty on long / resumed sessions): writes new memories, promotes/demotes, supersedes, merges |
 
-**Slash commands:** `/engram list` · `/engram recall <query>` · `/engram status` · `/engram render`
+**Slash commands:** `/engram list` · `/engram recall <query>` · `/engram status` · `/engram render` · `/engram root` · `/engram statusline [on|off]`
 
-**Status-line indicator** (optional): `● Engram | L1:2 L2:0 L3:1`
+**Status-line indicator** (optional, **off by default**): `● Engram | L1:2 L2:0 L3:1`
 
 ## How it works
 
@@ -97,9 +97,18 @@ Storage is **[redb](https://github.com/cberner/redb)** (embedded, single-file, A
 /engram render            # preview what gets injected
 ```
 
-## Status line
+## Status line (optional, off by default)
 
-To show the live `● Engram | …` indicator, point your `settings.json` `statusLine.command` at `statusline/engram-statusline.sh` — it reads `~/.engram/status.txt` (refreshed every turn, no DB hit).
+The engram status line is **off by default** — installing the plugin won't show it. To toggle the live `● Engram | L1:n L2:n L3:n` indicator:
+
+```
+/engram:statusline on      # enable (no argument is the same as on)
+/engram:statusline off     # disable (removes the config; leaves any status line you set for other tools untouched)
+```
+
+`on` pins the status-line script to `~/.engram/engram-statusline.sh` (a stable, version-independent path), merges `statusLine.command` into your **user-level** `settings.json`, and tells you to restart. The content is driven by `~/.engram/status.txt`, which the hooks refresh every turn — no DB hit. If you also have [claude-hud](https://github.com/jarrodwatts/claude-hud) installed, its line is prepended automatically; if not, only the Engram segment shows. `off` removes only the entry engram wrote, never a `statusLine` you configured for another tool.
+
+> Why off by default, and why this step: `statusLine` is user-level config that a plugin **cannot** ship automatically (plugin.json has no such field) — that's both why it's off by default and why this command writes it into your `settings.json` for you. Plugin upgrades need **no** reconfiguration — only re-run `/engram:statusline on` if a future upgrade changes the status-line script itself.
 
 ## Configuration
 

@@ -270,6 +270,10 @@ enum Command {
         /// 墓碑存活上限（天）；缺省 3650。
         #[arg(long, default_value_t = 3650.0)]
         tombstone_ttl_days: f64,
+        /// 与门第二臂阈值：真使用次数（access_log 长度）不超过此值才算「极少使用」，
+        /// 须与「超 TTL」同时成立方可删除；缺省 1（至多被 confirm-use 过一次）。
+        #[arg(long, default_value_t = 1)]
+        min_uses: usize,
         /// 当前时间（unix 秒）；缺省取系统时间。
         #[arg(long)]
         now: Option<f64>,
@@ -424,6 +428,34 @@ enum Command {
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
         #[arg(long)]
         general_db: Option<PathBuf>,
+    },
+    /// 毕业通道（§6 L4 → L1-3）：把一条项目记忆（L4.x）提拔进通用层；原 L4 记忆转
+    /// superseded 留作「已上浮」指针（移动 + 留指针、不复制，避免两层各存一份打架）。
+    Graduate {
+        /// 公共库 redb 文件路径（必填，新通用记忆写这里）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个（源 L4 记忆所属项目须在此映射中）。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 要毕业的源项目记忆 id（须为 L4.x 且 active）。
+        #[arg(long)]
+        id: String,
+        /// 目标通用层 L1|L2|L3；缺省按子层同构 L4.1→L1 / L4.2→L2 / L4.3→L3。
+        #[arg(long)]
+        to_level: Option<String>,
+        /// 覆盖新通用记忆的 cue；缺省沿用源 cue。
+        #[arg(long)]
+        cue: Option<String>,
+        /// 覆盖新通用记忆的重要度 [0,1]；缺省沿用源 importance。
+        #[arg(long)]
+        importance: Option<f64>,
+        /// 显式指定新通用记忆 id；缺省自动生成。
+        #[arg(long)]
+        new_id: Option<String>,
+        /// 当前时间（unix 秒）；缺省取系统时间。
+        #[arg(long)]
+        now: Option<f64>,
     },
 }
 
@@ -666,6 +698,7 @@ fn main() -> ExitCode {
             project_db,
             ttl_days,
             tombstone_ttl_days,
+            min_uses,
             now,
             dry_run,
         } => run_gc(GcArgs {
@@ -673,6 +706,7 @@ fn main() -> ExitCode {
             project_db: &project_db,
             ttl_days,
             tombstone_ttl_days,
+            min_uses,
             now,
             dry_run,
         }),
@@ -759,6 +793,25 @@ fn main() -> ExitCode {
             project_dir,
             general_db,
         } => run_root(project_dir.as_deref(), general_db.as_deref()),
+        Command::Graduate {
+            general_db,
+            project_db,
+            id,
+            to_level,
+            cue,
+            importance,
+            new_id,
+            now,
+        } => run_graduate(GraduateArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            id: &id,
+            to_level: to_level.as_deref(),
+            cue: cue.as_deref(),
+            importance,
+            new_id: new_id.as_deref(),
+            now,
+        }),
     }
 }
 
@@ -2775,6 +2828,160 @@ fn run_supersede(
     }
 }
 
+/// `graduate` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
+struct GraduateArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    id: &'a str,
+    to_level: Option<&'a str>,
+    cue: Option<&'a str>,
+    importance: Option<f64>,
+    new_id: Option<&'a str>,
+    now: Option<f64>,
+}
+
+/// 执行 `graduate` 子命令（§6 毕业通道 L4 → L1-3）：把一条 active 的项目记忆（L4.x）
+/// 提拔进通用层——在公共库写入一条新通用记忆（[`commands::build_graduated_memory`]），并把
+/// 原 L4 记忆转 [`Status::Superseded`]、`superseded_by = 新 id`，作为留在项目库里的
+/// 「已上浮」指针（§6：移动 + 留指针、不复制，避免两层各存一份打架）。
+///
+/// 校验（任一失败即非 0 退出且不写任何库）：
+/// - 源 id 存在且 `status == Active`；
+/// - 源是 L4.x、`--to-level`（若给）为通用层 L1/L2/L3（[`commands::graduate_target_level`] 把关）；
+/// - `--importance`（若给）落在 `[0,1]`；
+/// - 源所属项目在 `--project-db` 映射中（否则无法写回「已上浮」指针）；
+/// - 新 id 不与任何已有记忆冲突。
+///
+/// 写入顺序：先把新通用记忆落公共库，确认成功后再把源转 superseded 写回项目库——
+/// 即便第二步失败，毕业目标也已存在、不会丢失上浮内容。
+fn run_graduate(args: GraduateArgs<'_>) -> ExitCode {
+    let Some(now) = resolve_now(args.now) else {
+        return ExitCode::FAILURE;
+    };
+
+    // 解析可选 --to-level 覆盖（仅校验格式；是否落通用层由 graduate_target_level 把关）。
+    let to_override = match args.to_level {
+        None => None,
+        Some(s) => match parse_level(s) {
+            Ok(lv) => Some(lv),
+            Err(e) => {
+                eprintln!("graduate 失败：{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // 校验可选 --importance 覆盖范围。
+    if let Some(imp) = args.importance {
+        if !(0.0..=1.0).contains(&imp) {
+            eprintln!("graduate 失败：importance={imp} 超出范围 [0,1]");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let dbs = match DbSet::open(args.general_db, &project_dbs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let merged = match dbs.read_all() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 定位源记忆：必须存在且 active（superseded/cold/tombstone 的不再毕业）。
+    let Some(mut src) = merged.iter().find(|m| m.id == args.id).cloned() else {
+        eprintln!("graduate 失败：未找到源记忆 {}", args.id);
+        return ExitCode::FAILURE;
+    };
+    if src.status != Status::Active {
+        eprintln!(
+            "graduate 失败：源记忆 {} 状态为 {:?}，仅 active 的项目记忆可毕业",
+            args.id, src.status
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 算目标通用层（内部校验源须为 L4.x、--to-level 须落通用层）。
+    let to_level = match commands::graduate_target_level(src.level, to_override) {
+        Ok(lv) => lv,
+        Err(e) => {
+            eprintln!("graduate 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 源所属项目必须在 --project-db 映射中（既已读到、也要能写回「已上浮」指针）。
+    let Some(project_name) = src.project.as_deref() else {
+        // L4 记忆按不变量必带 project；走到这里说明数据异常，防御性报错。
+        eprintln!(
+            "graduate 失败：源记忆 {} 是项目记忆却无所属项目，数据异常",
+            args.id
+        );
+        return ExitCode::FAILURE;
+    };
+    if dbs.route(Some(project_name)).is_none() {
+        eprintln!(
+            "graduate 失败：源记忆所属项目 {project_name} 不在 --project-db 映射中，无法写回"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 决定新通用记忆 id，并防其与任何已有记忆冲突（--new-id 可能撞）。
+    let new_id = match args.new_id {
+        Some(s) => s.to_string(),
+        None => generate_id(args.cue.unwrap_or(&src.cue), now),
+    };
+    if merged.iter().any(|m| m.id == new_id) {
+        eprintln!("graduate 失败：新通用记忆 id {new_id} 与已有记忆冲突");
+        return ExitCode::FAILURE;
+    }
+
+    // 构造毕业后的新通用记忆（脱离项目、继承使用痕迹/资历/指针，补 graduated 血缘）。
+    let graduated =
+        commands::build_graduated_memory(&new_id, &src, to_level, args.cue, args.importance);
+
+    // 第一步：把新通用记忆写入公共库。
+    if let Err(e) = store::put(&dbs.general, &graduated) {
+        eprintln!("graduate 失败：写入新通用记忆 {new_id} 失败：{e}");
+        return ExitCode::FAILURE;
+    }
+
+    // 第二步：把源 L4 记忆转 superseded、superseded_by=新 id，写回其项目库（留作已上浮指针）。
+    src.status = Status::Superseded;
+    src.superseded_by = Some(new_id.clone());
+    match dbs.route(src.project.as_deref()) {
+        Some(db) => {
+            if let Err(e) = store::put(db, &src) {
+                eprintln!(
+                    "graduate 失败：写回源记忆 {} 的已上浮指针失败：{e}",
+                    args.id
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        None => {
+            // 前已校验映射存在，理论不可达；防御性报错。
+            eprintln!("graduate 失败：源记忆所属项目不在 --project-db 映射中，无法写回");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!(
+        "graduate: {} ({:?}) → 毕业为通用记忆 {new_id} ({:?})；原记忆已转 superseded 留作已上浮指针",
+        args.id, src.level, graduated.level
+    );
+    ExitCode::SUCCESS
+}
+
 /// `merge` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
 struct MergeArgs<'a> {
     general_db: &'a Path,
@@ -2932,6 +3139,7 @@ struct GcArgs<'a> {
     project_db: &'a [String],
     ttl_days: f64,
     tombstone_ttl_days: f64,
+    min_uses: usize,
     now: Option<f64>,
     dry_run: bool,
 }
@@ -2965,9 +3173,10 @@ fn run_gc(args: GcArgs<'_>) -> ExitCode {
     };
 
     println!(
-        "== gc (now={now}, ttl={} 天, tombstone_ttl={} 天){} ==",
+        "== gc (now={now}, ttl={} 天, tombstone_ttl={} 天, min_uses={}){} ==",
         args.ttl_days,
         args.tombstone_ttl_days,
+        args.min_uses,
         if args.dry_run {
             "（dry-run，不删除）"
         } else {
@@ -2980,7 +3189,13 @@ fn run_gc(args: GcArgs<'_>) -> ExitCode {
     let mut total = 0usize;
 
     for m in &merged {
-        if !gc_should_delete(m, now, args.ttl_days, args.tombstone_ttl_days) {
+        if !gc_should_delete(
+            m,
+            now,
+            args.ttl_days,
+            args.tombstone_ttl_days,
+            args.min_uses,
+        ) {
             continue;
         }
         let scope_label = m.project.as_deref().unwrap_or("(general)").to_string();

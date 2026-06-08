@@ -1841,6 +1841,255 @@ fn merge_mixed_scope_fails() {
     cleanup_file(&project_path);
 }
 
+// 20a. graduate（§6 毕业通道 L4→L1-3）：一条 active 的 L4.2 项目记忆毕业为通用 L2 记忆；
+//      新记忆继承使用痕迹/资历/指针并补 graduated 血缘、cue 可覆盖；源转 superseded 留作已上浮指针。
+#[test]
+fn graduate_promotes_l4_to_general_and_supersedes_source() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    // 项目库放一条 active 的 L4.2 记忆（带使用痕迹、资历、指针、重要度）。
+    let src = make(
+        "g_src",
+        Level::L4_2,
+        Some("engram"),
+        Status::Active,
+        0.6,
+        now - 1000.0,
+        vec![now - 500.0, now - 100.0],
+    );
+    let expect_ref = src.pointer.reference.clone();
+    let expect_access = src.access_log.clone();
+    let general_path = seed_db("grad_g", &[]);
+    let project_path = seed_db("grad_p", &[src]);
+    let g = general_path.to_string_lossy().to_string();
+    let p_kv = format!("engram={}", project_path.display());
+
+    let out = run_subcommand_raw(
+        "graduate",
+        &[
+            "--general-db",
+            &g,
+            "--project-db",
+            &p_kv,
+            "--id",
+            "g_src",
+            "--cue",
+            "毕业后的通用原则xyz",
+            "--new-id",
+            "grad_new",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "graduate 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("grad_new"),
+        "应打印新通用记忆 id，实得：{stdout}"
+    );
+
+    // 公共库：新通用记忆字段。
+    let gdb = store::open(&general_path).expect("应能打开公共库");
+    let n = store::get(&gdb, "grad_new")
+        .expect("get 应成功")
+        .expect("公共库应有毕业记忆");
+    assert_eq!(n.level, Level::L2, "L4.2 默认毕业到 L2");
+    assert_eq!(n.project, None, "毕业后脱离项目作用域");
+    assert_eq!(n.status, Status::Active);
+    assert_eq!(n.superseded_by, None);
+    assert_eq!(n.cue, "毕业后的通用原则xyz", "--cue 应覆盖");
+    assert!(
+        (n.importance - 0.6).abs() < 1e-9,
+        "未覆盖应继承源 importance"
+    );
+    assert_eq!(n.access_log, expect_access, "应继承真使用痕迹");
+    assert!(
+        (n.created_at - (now - 1000.0)).abs() < 1e-9,
+        "应保留资历（沿用源 created_at）"
+    );
+    assert_eq!(
+        n.pointer.reference, expect_ref,
+        "指针应照旧指向 ground truth"
+    );
+    assert!(
+        n.tags.contains(&"graduated".to_string()),
+        "应补 graduated 血缘标记"
+    );
+    drop(gdb);
+
+    // 项目库：源转 superseded、superseded_by=新 id（留作「已上浮」指针，不复制）。
+    let pdb = store::open(&project_path).expect("应能打开项目库");
+    let s = store::get(&pdb, "g_src")
+        .expect("get 应成功")
+        .expect("项目库应仍保留源作指针");
+    assert_eq!(s.status, Status::Superseded, "源应转 superseded");
+    assert_eq!(
+        s.superseded_by,
+        Some("grad_new".to_string()),
+        "superseded_by 应指向新通用记忆"
+    );
+    drop(pdb);
+
+    // render：源 superseded 不再显示，新通用记忆出现在通用层。
+    let rendered = run_render(&general_path, &[("engram", &project_path)], now);
+    assert!(
+        rendered.contains("毕业后的通用原则xyz"),
+        "毕业后的新通用记忆应出现在 render，实得：\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("cue-g_src"),
+        "源转 superseded 后不应再出现在 render，实得：\n{rendered}"
+    );
+
+    cleanup_file(&general_path);
+    cleanup_file(&project_path);
+}
+
+// 20b. graduate --to-level 跨档覆盖：L4.3 直接毕业到 L1（而非默认同构 L4.3→L3）。
+#[test]
+fn graduate_to_level_override_crosses_tier() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let src = make(
+        "xt_src",
+        Level::L4_3,
+        Some("engram"),
+        Status::Active,
+        0.4,
+        now,
+        vec![now],
+    );
+    let general_path = seed_db("grad_xt_g", &[]);
+    let project_path = seed_db("grad_xt_p", &[src]);
+    let g = general_path.to_string_lossy().to_string();
+    let p_kv = format!("engram={}", project_path.display());
+
+    let out = run_subcommand_raw(
+        "graduate",
+        &[
+            "--general-db",
+            &g,
+            "--project-db",
+            &p_kv,
+            "--id",
+            "xt_src",
+            "--to-level",
+            "L1",
+            "--new-id",
+            "xt_new",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "跨档毕业应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let gdb = store::open(&general_path).expect("应能打开公共库");
+    let n = store::get(&gdb, "xt_new")
+        .expect("get 应成功")
+        .expect("应有毕业记忆");
+    assert_eq!(n.level, Level::L1, "--to-level L1 应覆盖默认 L4.3→L3");
+    drop(gdb);
+
+    cleanup_file(&general_path);
+    cleanup_file(&project_path);
+}
+
+// 20c. graduate 拒绝非法源：通用记忆（非 L4）与非 active 的 L4 源都应非 0 退出且不产生新记忆。
+#[test]
+fn graduate_rejects_non_l4_or_inactive_source() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+
+    // 场景一：源是通用 L2（非 L4）→ 拒绝，不产生新记忆、源状态不变。
+    let g_only = make(
+        "gen_src",
+        Level::L2,
+        None,
+        Status::Active,
+        0.5,
+        now,
+        vec![now],
+    );
+    let gp1 = seed_db("grad_rej_g1", &[g_only]);
+    let g1 = gp1.to_string_lossy().to_string();
+    let out1 = run_subcommand_raw(
+        "graduate",
+        &[
+            "--general-db",
+            &g1,
+            "--id",
+            "gen_src",
+            "--new-id",
+            "should_not",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(!out1.status.success(), "通用记忆毕业应被拒绝");
+    let db1 = store::open(&gp1).expect("应能打开库");
+    assert!(
+        store::get(&db1, "should_not")
+            .expect("get 应成功")
+            .is_none(),
+        "拒绝时不应产生新记忆"
+    );
+    let s1 = store::get(&db1, "gen_src")
+        .expect("get 应成功")
+        .expect("源仍在");
+    assert_eq!(s1.status, Status::Active, "拒绝时源状态不应改动");
+    drop(db1);
+    cleanup_file(&gp1);
+
+    // 场景二：源是 superseded 的 L4（非 active）→ 拒绝（仅 active 可毕业）。
+    let dead = make(
+        "dead_src",
+        Level::L4_2,
+        Some("engram"),
+        Status::Superseded,
+        0.5,
+        now,
+        vec![now],
+    );
+    let gp2 = seed_db("grad_rej_g2", &[]);
+    let pp2 = seed_db("grad_rej_p2", &[dead]);
+    let g2 = gp2.to_string_lossy().to_string();
+    let p_kv2 = format!("engram={}", pp2.display());
+    let out2 = run_subcommand_raw(
+        "graduate",
+        &[
+            "--general-db",
+            &g2,
+            "--project-db",
+            &p_kv2,
+            "--id",
+            "dead_src",
+            "--new-id",
+            "should_not2",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(!out2.status.success(), "非 active 源毕业应被拒绝");
+    let gdb2 = store::open(&gp2).expect("应能打开公共库");
+    assert!(
+        store::get(&gdb2, "should_not2")
+            .expect("get 应成功")
+            .is_none(),
+        "拒绝时不应产生新记忆"
+    );
+    drop(gdb2);
+    cleanup_file(&gp2);
+    cleanup_file(&pp2);
+}
+
 // 21. gc：cold 超 ttl 被删；cold 未超 ttl 保留；cold 但最近 confirm-use 过不被删；
 //     tombstone 未超长 ttl 保留；active/superseded 永不删。
 #[test]
@@ -2035,6 +2284,64 @@ fn gc_deletes_old_tombstone_and_routes_per_db() {
 
     cleanup_file(&general_path);
     cleanup_file(&project_path);
+}
+
+// 23. gc 与门第二臂：cold 超 ttl 但真用过多次（access_log 长）默认不删；
+//     --min-uses 放大到覆盖其真使用次数后两臂皆成立才删。
+#[test]
+fn gc_second_arm_protects_truly_used_cold() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let day = 86400.0;
+    // cold 超 ttl（最后一次真使用 200 天前，age>180），但被 confirm-use 过 3 次。
+    let gmems = vec![make(
+        "gc_used_cold",
+        Level::L3,
+        None,
+        Status::Cold,
+        0.0,
+        now - 210.0 * day,
+        vec![now - 210.0 * day, now - 205.0 * day, now - 200.0 * day],
+    )];
+    let general_path = seed_db("gc_arm_g", &gmems);
+    let g = general_path.to_string_lossy().to_string();
+
+    // 默认 min_uses=1：真使用 3 次 > 1，第二臂不成立 → 不删。
+    let out = run_subcommand_raw("gc", &["--general-db", &g, "--now", "1000000000"]);
+    assert!(
+        out.status.success(),
+        "gc 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let gdb = store::open(&general_path).expect("应能重新打开公共库");
+    assert!(
+        store::get(&gdb, "gc_used_cold")
+            .expect("get 应成功")
+            .is_some(),
+        "默认 min_uses=1 下，真用过 3 次的 cold 不应被删（第二臂保护）"
+    );
+    drop(gdb);
+
+    // 放大 --min-uses 到 3：真使用 3 <= 3，两臂皆成立 → 删。
+    let out2 = run_subcommand_raw(
+        "gc",
+        &["--general-db", &g, "--min-uses", "3", "--now", "1000000000"],
+    );
+    assert!(
+        out2.status.success(),
+        "gc 应成功，stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let gdb = store::open(&general_path).expect("应能重新打开公共库");
+    assert!(
+        store::get(&gdb, "gc_used_cold")
+            .expect("get 应成功")
+            .is_none(),
+        "--min-uses 3 后，真用 3 次的 cold 两臂皆成立应被删"
+    );
+    drop(gdb);
+
+    cleanup_file(&general_path);
 }
 
 // ============================================================================
@@ -3735,7 +4042,12 @@ fn root_succeeds_when_engram_db_preexists() {
     let pdb = store::open(&canon.join(".engram").join("engram.redb")).expect("应能打开项目库");
     let mems = store::all(&pdb).expect("应能读项目库");
     drop(pdb);
-    assert_eq!(mems.len(), 1, "原项目库的记忆应保留，实得 {} 条", mems.len());
+    assert_eq!(
+        mems.len(),
+        1,
+        "原项目库的记忆应保留，实得 {} 条",
+        mems.len()
+    );
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&dir);
