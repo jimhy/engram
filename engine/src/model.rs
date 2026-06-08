@@ -141,48 +141,98 @@ pub struct TierParams {
     pub load_full: bool,
 }
 
-/// 查询指定层级的参数。
+/// 全部可整定参数的运行时配置（设计文档 §14 #1 列的待整定项汇成一处）。
 ///
-/// 各层参数为本切片锁定的实测候选值（设计文档 §14 列为待整定项，此处取本指令给定值）。
-pub fn params(level: Level) -> TierParams {
-    match level {
-        Level::L1 => TierParams {
-            capacity: 7,
-            d: 0.10,
-            floor: 4.5,
-            load_full: true,
-        },
-        Level::L2 => TierParams {
-            capacity: 30,
-            d: 0.25,
-            floor: 1.0,
-            load_full: true,
-        },
-        Level::L3 => TierParams {
-            capacity: 150,
-            d: 0.50,
-            floor: -10.0,
-            load_full: false,
-        },
-        Level::L4_1 => TierParams {
-            capacity: 10,
-            d: 0.15,
-            floor: 3.0,
-            load_full: true,
-        },
-        Level::L4_2 => TierParams {
-            capacity: 50,
-            d: 0.30,
-            floor: 0.5,
-            load_full: true,
-        },
-        Level::L4_3 => TierParams {
-            capacity: 200,
-            d: 0.50,
-            floor: -10.0,
-            load_full: false,
-        },
+/// 引入它的唯一目的，是把历来散落、硬编码的 6 类参数——各层容量 / 衰减率 d /
+/// tier_floor / 升降迟滞阈值 / grace boost / TTL 硬删除——收拢成**一个可注入的值**，
+/// 以便整定 harness 系统化扫描，并让生产侧将来可从配置加载。
+///
+/// **行为不变保证**：[`EngramConfig::default`] 即历来硬编码的实测候选值；所有不带
+/// `cfg` 的旧签名函数（[`params`]、[`crate::activation::effective`]、
+/// [`crate::consolidate::consolidate`] 等）都委托到 `default()`，故现有调用方与测试
+/// 的行为与重构前**逐位一致**。需要扫参的新路径改调带 `_with` 后缀的同名函数并传入
+/// 自定义 `EngramConfig`。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EngramConfig {
+    /// L1 潜意识层参数。
+    pub l1: TierParams,
+    /// L2 重要层参数。
+    pub l2: TierParams,
+    /// L3 普通层参数。
+    pub l3: TierParams,
+    /// L4.1 项目潜意识层参数。
+    pub l4_1: TierParams,
+    /// L4.2 项目重要层参数。
+    pub l4_2: TierParams,
+    /// L4.3 项目普通层参数。
+    pub l4_3: TierParams,
+    /// 升 L2 / L4.2 的 `promotion_score` 阈值。
+    pub promote_l2: f64,
+    /// 升 L1 / L4.1 的 `promotion_score` 阈值。
+    pub promote_l1: f64,
+    /// 降到 L3 / L4.3 的 `effective` 阈值。
+    pub demote_l2: f64,
+    /// 降到 L2 / L4.2 的 `effective` 阈值。
+    pub demote_l1: f64,
+    /// 淘汰阈值：底层 `effective` 低于此值转 Cold。
+    pub evict_threshold: f64,
+    /// grace boost 初始幅度 B₀。
+    pub grace_b0: f64,
+    /// grace boost 时间常数 τ（天）。
+    pub grace_tau_days: f64,
+    /// gc 冷条目存活上限（天）。须与 `main.rs` 的 `gc --ttl-days` 缺省一致。
+    pub ttl_days: f64,
+    /// gc 墓碑存活上限（天）。须与 `main.rs` 的 `gc --tombstone-ttl-days` 缺省一致。
+    pub tombstone_ttl_days: f64,
+    /// gc「与门」第二臂阈值：真使用次数不超过此值才算「极少使用」。
+    /// 须与 `main.rs` 的 `gc --min-uses` 缺省一致。
+    pub min_uses: usize,
+}
+
+impl Default for EngramConfig {
+    /// 历来硬编码的实测候选值（设计文档 §14 列为待整定项，此处取本指令给定值）。
+    fn default() -> Self {
+        EngramConfig {
+            l1: TierParams { capacity: 7, d: 0.10, floor: 4.5, load_full: true },
+            l2: TierParams { capacity: 30, d: 0.25, floor: 1.0, load_full: true },
+            l3: TierParams { capacity: 150, d: 0.50, floor: -10.0, load_full: false },
+            l4_1: TierParams { capacity: 10, d: 0.15, floor: 3.0, load_full: true },
+            l4_2: TierParams { capacity: 50, d: 0.30, floor: 0.5, load_full: true },
+            l4_3: TierParams { capacity: 200, d: 0.50, floor: -10.0, load_full: false },
+            promote_l2: PROMOTE_L2,
+            promote_l1: PROMOTE_L1,
+            demote_l2: DEMOTE_L2,
+            demote_l1: DEMOTE_L1,
+            evict_threshold: EVICT_THRESHOLD,
+            grace_b0: GRACE_B0,
+            grace_tau_days: GRACE_TAU_DAYS,
+            ttl_days: 180.0,
+            tombstone_ttl_days: 3650.0,
+            min_uses: 1,
+        }
     }
+}
+
+impl EngramConfig {
+    /// 取指定层级的 [`TierParams`]（容量 / d / floor / 加载详略）。
+    pub fn tier(&self, level: Level) -> TierParams {
+        match level {
+            Level::L1 => self.l1,
+            Level::L2 => self.l2,
+            Level::L3 => self.l3,
+            Level::L4_1 => self.l4_1,
+            Level::L4_2 => self.l4_2,
+            Level::L4_3 => self.l4_3,
+        }
+    }
+}
+
+/// 查询指定层级的参数（等价于 [`EngramConfig::default`] 的对应层）。
+///
+/// 历史签名，保留以兼容现有调用方与测试；需要自定义参数时改用
+/// [`EngramConfig::tier`]。各层默认值见 [`EngramConfig::default`]。
+pub fn params(level: Level) -> TierParams {
+    EngramConfig::default().tier(level)
 }
 
 #[cfg(test)]

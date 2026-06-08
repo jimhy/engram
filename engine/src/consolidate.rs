@@ -13,10 +13,14 @@
 //! - **逐级**：一次最多移动一层。
 //! - **只处理 `status == Active` 的记忆**；Cold/Superseded/Tombstone 一律不动。
 
+use crate::activation::{effective_with, promotion_score_with};
+use crate::model::{EngramConfig, Level, Memory, Status};
+// 以下符号重构后仅测试用到（生产路径改走 `cfg` 字段与 `*_with`）；
+// 标 cfg(test) 免生产侧 unused 警告。
+#[cfg(test)]
 use crate::activation::{effective, promotion_score};
-use crate::model::{
-    params, Level, Memory, Status, DEMOTE_L1, DEMOTE_L2, EVICT_THRESHOLD, PROMOTE_L1, PROMOTE_L2,
-};
+#[cfg(test)]
+use crate::model::{params, DEMOTE_L2, EVICT_THRESHOLD, PROMOTE_L2};
 
 /// 一次状态变迁的种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +106,12 @@ fn tier_role(level: Level) -> TierRole {
 /// - 顶层（L1/L4.1）：`effective < DEMOTE_L1` → 降一层；否则不动。
 ///
 /// 升级判据用 `promotion_score`、降级判据用 `effective`，二者阈值间留死区，构成迟滞。
-fn step_threshold(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transition>) {
+fn step_threshold(
+    memories: &mut [Memory],
+    now: f64,
+    cfg: &EngramConfig,
+    transitions: &mut Vec<Transition>,
+) {
     for m in memories.iter_mut() {
         if m.status != Status::Active {
             continue;
@@ -110,23 +119,23 @@ fn step_threshold(memories: &mut [Memory], now: f64, transitions: &mut Vec<Trans
         let from = m.level;
         let target = match tier_role(from) {
             TierRole::Bottom => {
-                if promotion_score(m, now) >= PROMOTE_L2 {
+                if promotion_score_with(m, now, cfg) >= cfg.promote_l2 {
                     level_up(from)
                 } else {
                     None
                 }
             }
             TierRole::Middle => {
-                if promotion_score(m, now) >= PROMOTE_L1 {
+                if promotion_score_with(m, now, cfg) >= cfg.promote_l1 {
                     level_up(from)
-                } else if effective(m, now) < DEMOTE_L2 {
+                } else if effective_with(m, now, cfg) < cfg.demote_l2 {
                     level_down(from)
                 } else {
                     None
                 }
             }
             TierRole::Top => {
-                if effective(m, now) < DEMOTE_L1 {
+                if effective_with(m, now, cfg) < cfg.demote_l1 {
                     level_down(from)
                 } else {
                     None
@@ -193,7 +202,12 @@ fn scope_key(m: &Memory) -> ScopeKey {
 /// 从底层（L3/L4.3）挤出的记忆转 `status = Cold`。
 ///
 /// pinned 记忆 effective 为 INF，恒在前列，不会被下推。
-fn step_overflow(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transition>) {
+fn step_overflow(
+    memories: &mut [Memory],
+    now: f64,
+    cfg: &EngramConfig,
+    transitions: &mut Vec<Transition>,
+) {
     // 自上而下的层级处理顺序：顶层在前，底层在后，保证下推可级联传播。
     // 两条轨道相互独立，合在一个序列里逐层处理即可。
     const ORDER: [Level; 6] = [
@@ -206,7 +220,7 @@ fn step_overflow(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transi
     ];
 
     for &level in ORDER.iter() {
-        let capacity = params(level).capacity;
+        let capacity = cfg.tier(level).capacity;
 
         // 收集本层、active 记忆的索引，按作用域分组。
         // 用 BTreeMap 保证遍历顺序确定（便于测试稳定）。
@@ -230,8 +244,8 @@ fn step_overflow(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transi
             }
             // 按 effective 降序排序；NaN 视作最小沉底。
             idxs.sort_by(|&a, &b| {
-                let ea = effective(&memories[a], now);
-                let eb = effective(&memories[b], now);
+                let ea = effective_with(&memories[a], now, cfg);
+                let eb = effective_with(&memories[b], now, cfg);
                 eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
             });
             // 前 capacity 条保留，其余下推。
@@ -270,7 +284,12 @@ fn step_overflow(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transi
 ///
 /// 任何仍为 Active 的底层（L3/L4.3）记忆，若 `effective < EVICT_THRESHOLD`
 /// 则 `status = Cold`。
-fn step_evict(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transition>) {
+fn step_evict(
+    memories: &mut [Memory],
+    now: f64,
+    cfg: &EngramConfig,
+    transitions: &mut Vec<Transition>,
+) {
     for m in memories.iter_mut() {
         if m.status != Status::Active {
             continue;
@@ -278,7 +297,7 @@ fn step_evict(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transitio
         if !matches!(tier_role(m.level), TierRole::Bottom) {
             continue;
         }
-        if effective(m, now) < EVICT_THRESHOLD {
+        if effective_with(m, now, cfg) < cfg.evict_threshold {
             let from = m.level;
             m.status = Status::Cold;
             transitions.push(Transition {
@@ -311,10 +330,20 @@ fn step_evict(memories: &mut [Memory], now: f64, transitions: &mut Vec<Transitio
 /// # 返回
 /// 本次产生的所有 [`Transition`]，按发生顺序排列（先升降级、后溢出、再淘汰）。
 pub fn consolidate(memories: &mut [Memory], now: f64) -> Vec<Transition> {
+    consolidate_with(memories, now, &EngramConfig::default())
+}
+
+/// 同 [`consolidate`]，但用给定 `cfg` 扫参（整定 harness 入口）。三步均把 `cfg`
+/// 透传到升降阈值、容量与淘汰判定。
+pub fn consolidate_with(
+    memories: &mut [Memory],
+    now: f64,
+    cfg: &EngramConfig,
+) -> Vec<Transition> {
     let mut transitions = Vec::new();
-    step_threshold(memories, now, &mut transitions);
-    step_overflow(memories, now, &mut transitions);
-    step_evict(memories, now, &mut transitions);
+    step_threshold(memories, now, cfg, &mut transitions);
+    step_overflow(memories, now, cfg, &mut transitions);
+    step_evict(memories, now, cfg, &mut transitions);
     transitions
 }
 

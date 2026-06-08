@@ -6,7 +6,10 @@
 //!
 //! 设计文档参考：§5 衰减与加固模型、§6 grace boost。
 
-use crate::model::{params, Memory, GRACE_B0, GRACE_TAU_DAYS, MIN_DT_DAYS, SECS_PER_DAY};
+use crate::model::{EngramConfig, Memory, MIN_DT_DAYS, SECS_PER_DAY};
+// `params` 重构后仅测试用到（生产路径改走 `cfg.tier`）；标 cfg(test) 免生产侧 unused 警告。
+#[cfg(test)]
+use crate::model::params;
 
 /// 计算 base-level activation：`ln( Σⱼ (Δtⱼ_day)^(−d) )`。
 ///
@@ -51,8 +54,13 @@ pub fn activation(access_log: &[f64], now: f64, d: f64) -> f64 {
 /// - `created_at`：记忆创建时间（unix 秒）。
 /// - `now`：当前时间（unix 秒）。
 pub fn grace_boost(created_at: f64, now: f64) -> f64 {
+    grace_boost_with(created_at, now, &EngramConfig::default())
+}
+
+/// 同 [`grace_boost`]，但用给定 `cfg` 的 B₀/τ（整定 harness 扫参入口）。
+pub fn grace_boost_with(created_at: f64, now: f64, cfg: &EngramConfig) -> f64 {
     let age_day = ((now - created_at) / SECS_PER_DAY).max(0.0);
-    GRACE_B0 * (-age_day / GRACE_TAU_DAYS).exp()
+    cfg.grace_b0 * (-age_day / cfg.grace_tau_days).exp()
 }
 
 /// 计算一条记忆的有效权重 `effective`。
@@ -69,11 +77,16 @@ pub fn grace_boost(created_at: f64, now: f64) -> f64 {
 /// - `m`：待评估的记忆。
 /// - `now`：当前时间（unix 秒）。
 pub fn effective(m: &Memory, now: f64) -> f64 {
+    effective_with(m, now, &EngramConfig::default())
+}
+
+/// 同 [`effective`]，但用给定 `cfg` 的层参数与 grace（整定 harness 扫参入口）。
+pub fn effective_with(m: &Memory, now: f64, cfg: &EngramConfig) -> f64 {
     // 置顶记忆永远排在最前，豁免一切衰减。
     if m.pinned {
         return f64::INFINITY;
     }
-    let p = params(m.level);
+    let p = cfg.tier(m.level);
     // access_log 为空时，用创建时间作隐式首次访问。
     let implicit = [m.created_at];
     let log: &[f64] = if m.access_log.is_empty() {
@@ -81,7 +94,7 @@ pub fn effective(m: &Memory, now: f64) -> f64 {
     } else {
         &m.access_log
     };
-    let raw = m.importance + activation(log, now, p.d) + grace_boost(m.created_at, now);
+    let raw = m.importance + activation(log, now, p.d) + grace_boost_with(m.created_at, now, cfg);
     raw.max(p.floor)
 }
 
@@ -106,11 +119,16 @@ pub fn effective(m: &Memory, now: f64) -> f64 {
 /// - `m`：待评估的记忆。
 /// - `now`：当前时间（unix 秒）。
 pub fn promotion_score(m: &Memory, now: f64) -> f64 {
+    promotion_score_with(m, now, &EngramConfig::default())
+}
+
+/// 同 [`promotion_score`]，但用给定 `cfg` 的层参数（整定 harness 扫参入口）。
+pub fn promotion_score_with(m: &Memory, now: f64, cfg: &EngramConfig) -> f64 {
     // 置顶记忆永远具备最高升级资格。
     if m.pinned {
         return f64::INFINITY;
     }
-    let p = params(m.level);
+    let p = cfg.tier(m.level);
     // access_log 为空时，用创建时间作隐式首次访问。
     let implicit = [m.created_at];
     let log: &[f64] = if m.access_log.is_empty() {
