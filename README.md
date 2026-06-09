@@ -4,6 +4,8 @@
 
 **English** | [中文](./README.zh-CN.md)
 
+> **Using Codex instead of — or alongside — Claude Code?** There's a Codex adapter too: **[engram-codex](https://github.com/jimhy/engram-codex)**. Same engine, **shared memory store** (`~/.engram` + per-project `.engram/`), so memories are common to both CLIs.
+
 ---
 
 ## Why
