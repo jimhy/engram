@@ -24,6 +24,15 @@ $pending   = & $fs $Pending
 $watermark = & $fs $Watermark
 $skill     = & $fs (Join-Path $Root 'skills\engram\SKILL.md')
 
+# scope kind: the engine puts a 'workspace' marker next to a management-directory db
+# (<dir>/.engram/workspace). Detect it here so BOTH callers (session-end + catch-up,
+# whose pending plan has no kind field) get the right reviewer rules.
+$kind = 'project'
+try {
+    $marker = Join-Path (Split-Path -Parent $ProjectDb) 'workspace'
+    if (Test-Path -LiteralPath $marker) { $kind = 'workspace' }
+} catch {}
+
 $tpl = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $Root 'scripts\reviewer-prompt.md')
 $prompt = $tpl
 $prompt = $prompt.Replace('{{TRANSCRIPT}}', $slice)
@@ -31,6 +40,7 @@ $prompt = $prompt.Replace('{{ENGRAM}}', $engramFwd)
 $prompt = $prompt.Replace('{{GENERAL_DB}}', $general)
 $prompt = $prompt.Replace('{{PROJECT_DB}}', $project)
 $prompt = $prompt.Replace('{{PROJECT_NAME}}', $ProjectName)
+$prompt = $prompt.Replace('{{KIND}}', $kind)
 $prompt = $prompt.Replace('{{PENDING}}', $pending)
 $prompt = $prompt.Replace('{{WATERMARK}}', $watermark)
 $prompt = $prompt.Replace('{{SKILL}}', $skill)
@@ -39,7 +49,7 @@ if ($env:ENGRAM_HOOK_DRYRUN -eq '1') {
     Write-Host "[dry-run] reviewer-cli = $Cli"
     Write-Host "[dry-run] slice        = $slice"
     Write-Host "[dry-run] general      = $general"
-    Write-Host "[dry-run] project      = $project ($ProjectName)"
+    Write-Host "[dry-run] project      = $project ($ProjectName, kind=$kind)"
     Write-Host "[dry-run] pending      = $pending"
     Write-Host "[dry-run] watermark    = $watermark"
     Write-Host "[dry-run] skill        = $skill"
