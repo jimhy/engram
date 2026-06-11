@@ -394,7 +394,8 @@ pub fn all(db: &Database) -> Result<Vec<Memory>, StoreError> {
 /// `Ok(true)`；删除不存在的 key 返回 `Ok(false)`（不视作错误）。表尚不存在
 /// （全新库从未写入过）时同样返回 `Ok(false)`，不报错。
 ///
-/// 本函数供 `gc` 命令做 TTL 硬删除（§7.4）使用。
+/// 本函数供 `gc`（按 TTL 硬删除过期 Cold/Tombstone，§7.4）与 `forget`
+/// （按 id 直接物理删除、不留 superseded/tombstone 痕迹）两个命令使用。
 ///
 /// # 参数
 /// - `db`：已打开的数据库。
@@ -553,7 +554,8 @@ mod tests {
         cleanup(&path);
     }
 
-    // 6. remove 删除存在的记忆：返回 Ok(true)，删后 get 为 None。
+    // 6. remove 删除存在的记忆：返回 Ok(true)，删后 get 为 None；
+    //    对同 id 再次 remove 返回 Ok(false)（幂等，重复删除不报错）。
     #[test]
     fn remove_existing_returns_true_and_gone() {
         let path = unique_db_path("remove_existing");
@@ -567,6 +569,10 @@ mod tests {
             None,
             "删除后 get 应为 None"
         );
+
+        // 幂等：对刚删掉的同一 id 再删一次，应返回 false 而非报错。
+        let again = remove(&db, "to_del").expect("重复 remove 应成功且不报错");
+        assert!(!again, "重复删除同一 id 应返回 false（幂等）");
 
         drop(db);
         cleanup(&path);

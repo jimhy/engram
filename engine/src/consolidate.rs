@@ -335,11 +335,7 @@ pub fn consolidate(memories: &mut [Memory], now: f64) -> Vec<Transition> {
 
 /// 同 [`consolidate`]，但用给定 `cfg` 扫参（整定 harness 入口）。三步均把 `cfg`
 /// 透传到升降阈值、容量与淘汰判定。
-pub fn consolidate_with(
-    memories: &mut [Memory],
-    now: f64,
-    cfg: &EngramConfig,
-) -> Vec<Transition> {
+pub fn consolidate_with(memories: &mut [Memory], now: f64, cfg: &EngramConfig) -> Vec<Transition> {
     let mut transitions = Vec::new();
     step_threshold(memories, now, cfg, &mut transitions);
     step_overflow(memories, now, cfg, &mut transitions);

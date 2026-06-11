@@ -256,6 +256,21 @@ enum Command {
         #[arg(long)]
         now: Option<f64>,
     },
+    /// 直接遗忘：按 id 在所有挂载库中查找并**物理删除**记忆，不留 superseded/tombstone 痕迹。
+    Forget {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 要删除的记忆 id，可重复给 0..N 个；未找到的 id 仅报告、不算失败。
+        #[arg(long = "id")]
+        id: Vec<String>,
+        /// 当前时间（unix 秒）；缺省取系统时间（本命令未直接用 now，仅为接口一致）。
+        #[arg(long)]
+        now: Option<f64>,
+    },
     /// 垃圾回收：按 §7.4 TTL 硬删除过期的 Cold / Tombstone 记忆。
     Gc {
         /// 公共库 redb 文件路径（必填）。
@@ -691,6 +706,17 @@ fn main() -> ExitCode {
             importance,
             project: project.as_deref(),
             id: id.as_deref(),
+            now,
+        }),
+        Command::Forget {
+            general_db,
+            project_db,
+            id,
+            now,
+        } => run_forget(ForgetArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            ids: &id,
             now,
         }),
         Command::Gc {
@@ -1265,14 +1291,34 @@ fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // 领单：对该 pending 原子建 claim 锁，宣示本场复盘所有权——挡住 SessionStart
+    // catchup 同时领走同一个 pending 的竞态。本进程是新建 pending 的天然 owner，
+    // 正常必 Acquired；极罕见撞上 Held（同 sid 已有人在复盘）或建锁出错也不失败，
+    // 照常输出复盘 JSON，仅记一行 stderr 供诊断（claim 是保护层，不是硬前置）。
+    let claim_path = session::claim_path_for(&pending_path);
+    match session::try_claim(&claim_path, now, std::process::id()) {
+        Ok(session::ClaimOutcome::Acquired) => {}
+        Ok(session::ClaimOutcome::Held) => {
+            eprintln!(
+                "review-prepare：{} 的 claim 已被他人持有（同 sid 复盘进行中？），照常输出",
+                pending_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("review-prepare：建 claim 失败（不影响复盘输出）：{e}");
+        }
+    }
+
     print_review_json(&pending, &pending_path)
 }
 
 /// 执行 `catchup-scan`（SessionStart 调）：补最近一场残留 pending、清掉更早的。
 ///
-/// 无残留时打印 `{"action":"none"}`。有残留时取 `created_at` 最大的一条补跑（其余
-/// 连切片一并删除——轻量策略只补最近一场）；若其切片已不在则据 pending 区间重切，
-/// 再打印 `{"action":"review", ...}`。
+/// 无残留时打印 `{"action":"none"}`。有残留时取 `created_at` 最大的一条，先对其
+/// claim 锁 [`session::try_claim`] 领单——领不到（已被在跑的复盘者持有）说明这场
+/// 正有人复盘，打印 `{"action":"none"}` 直接返回，**这就是挡住双复盘竞态的关口**；
+/// 领到才补跑（其余更早残留连切片、claim 一并删除——轻量策略只补最近一场）；若其
+/// 切片已不在则据 pending 区间重切，再打印 `{"action":"review", ...}`。
 fn run_catchup_scan(work_dir: &Path) -> ExitCode {
     let mut list = match session::list_pending(work_dir) {
         Ok(l) => l,
@@ -1286,9 +1332,30 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
         println!(r#"{{"action":"none"}}"#);
         return ExitCode::SUCCESS;
     };
-    // 其余（更早的）残留连切片一并清掉：轻量策略只补最近一场。
+
+    // 领单：claim 被持有（未陈旧）= 另一个复盘者正在处理这场（典型：SessionEnd
+    // 刚起的 reviewer 还在跑）——本次不补跑，输出 none，避免两套重复记忆入库。
+    // 更早的残留也先不动：等在跑的那场收尾后，下次 catchup 再统一清。
+    let Some(now) = resolve_now(None) else {
+        return ExitCode::FAILURE;
+    };
+    let claim_path = session::claim_path_for(&pending_path);
+    match session::try_claim(&claim_path, now, std::process::id()) {
+        Ok(session::ClaimOutcome::Acquired) => {}
+        Ok(session::ClaimOutcome::Held) => {
+            println!(r#"{{"action":"none"}}"#);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("catchup-scan 失败：建 claim 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // 其余（更早的）残留连切片、claim 一并清掉：轻量策略只补最近一场，不留孤儿锁。
     for (pp, p) in &list {
         session::remove_pending(pp, Path::new(&p.slice));
+        session::release_claim(&session::claim_path_for(pp));
     }
 
     // 切片可能已被清理；不在就据 pending 记录的区间重切，保证复盘者有增量可读。
@@ -1302,6 +1369,8 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
             &slice_path,
         ) {
             eprintln!("catchup-scan 失败：重切增量失败：{e}");
+            // 补跑没起成，释放刚领的 claim，让下次会话能立即重试（不必等 TTL）。
+            session::release_claim(&claim_path);
             return ExitCode::FAILURE;
         }
     }
@@ -1309,10 +1378,10 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
     print_review_json(&pending, &pending_path)
 }
 
-/// 执行 `consolidate-done`（复盘者收尾调）：推进水位线 + 删 pending 与切片。
+/// 执行 `consolidate-done`（复盘者收尾调）：推进水位线 + 删 pending、切片与 claim。
 ///
 /// 读 pending → 把 `watermark[transcript]` 抬到 `end_line`（取较大值，幂等）→ 写回 →
-/// 删 pending 与切片，最后打印 `{"action":"done", ...}`。
+/// 删 pending 与切片 → 释放 claim 锁（领单收尾闭环），最后打印 `{"action":"done", ...}`。
 fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
     let pending = match session::read_pending(pending_path) {
         Ok(p) => p,
@@ -1331,6 +1400,8 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     session::remove_pending(pending_path, Path::new(&pending.slice));
+    // 释放本场的 claim 锁（与领单配对的收尾；best-effort，同 remove_pending 风格）。
+    session::release_claim(&session::claim_path_for(pending_path));
 
     let obj = serde_json::json!({
         "action": "done",
@@ -2826,6 +2897,87 @@ fn run_supersede(
             ExitCode::FAILURE
         }
     }
+}
+
+/// `forget` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
+struct ForgetArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    ids: &'a [String],
+    now: Option<f64>,
+}
+
+/// 执行 `forget` 子命令：按 id **物理删除**记忆，不留任何痕迹。
+///
+/// 与软删除家族语义不同：`supersede` 把旧记忆转 Superseded、`merge` 把源转
+/// Tombstone、`gc` 只按 TTL 删过期的 Cold/Tombstone——而 `forget` 是**直接
+/// 硬删除**：在「公共库 + 所有挂载项目库」里逐库找每个 id，命中哪个库就从哪个
+/// 库 [`store::remove`]，不写 superseded、不写 tombstone。路由不预设 id 属于
+/// 哪层/哪库（不依赖记忆的 `project` 字段），按「哪个库真有这个 id」来删；同一
+/// id 若（异常地）同时存在于多个库，每个命中的库都会删掉。
+///
+/// 逐 id 打印「已删除（来自哪个库）/ 未找到」，末尾汇总条数。未找到不算失败、
+/// 不影响其它 id 的删除；即便全部 id 都未找到也 exit 0（幂等友好）。仅当解析
+/// 参数、打开库或删除时发生底层存储错误才非 0 退出。
+fn run_forget(args: ForgetArgs<'_>) -> ExitCode {
+    // now 当前命令未直接使用，但仍解析以统一接口并校验系统时钟。
+    let Some(_now) = resolve_now(args.now) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let dbs = match DbSet::open(args.general_db, &project_dbs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 去空白、去空项、按给定顺序去重（同一 id 重复给只删一次、只报一次）。
+    let mut ids: Vec<&str> = Vec::new();
+    for raw in args.ids {
+        let id = raw.trim();
+        if !id.is_empty() && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    let mut deleted = 0usize;
+    let mut missing = 0usize;
+    for id in &ids {
+        // 在所有挂载库里找：命中哪个库就从哪个库物理删除。
+        let mut hit_libs: Vec<String> = Vec::new();
+        match store::remove(&dbs.general, id) {
+            Ok(true) => hit_libs.push("(general)".to_string()),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("forget: 从公共库删除 {id} 失败：{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        for (name, db) in &dbs.projects {
+            match store::remove(db, id) {
+                Ok(true) => hit_libs.push(name.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("forget: 从项目库 {name} 删除 {id} 失败：{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if hit_libs.is_empty() {
+            println!("forget: 未找到 {id}");
+            missing += 1;
+        } else {
+            println!("forget: 已删除 {id}（来自 {}）", hit_libs.join("、"));
+            deleted += 1;
+        }
+    }
+
+    println!("forget: 共删除 {deleted} 条 / {missing} 个未找到");
+    ExitCode::SUCCESS
 }
 
 /// `graduate` 命令的全部参数（聚成一个结构体，规避过多函数形参）。

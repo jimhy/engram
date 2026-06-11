@@ -2344,6 +2344,176 @@ fn gc_second_arm_protects_truly_used_cold() {
     cleanup_file(&general_path);
 }
 
+// 24. forget 物理删除（跨库路由按「哪个库真有这个 id」）：公共库一条 + 项目库一条，
+//     forget 两个 id 后两库各自 get 为 None，且 list --status all 完全查不到
+//     （确认是物理删除，不是转 superseded/tombstone 留痕）。
+#[test]
+fn forget_hard_deletes_across_dbs_without_trace() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let gmems = vec![make(
+        "fg_g",
+        Level::L2,
+        None,
+        Status::Active,
+        0.5,
+        now,
+        vec![now],
+    )];
+    let pmems = vec![make(
+        "fg_p",
+        Level::L4_2,
+        Some("engram"),
+        Status::Active,
+        0.5,
+        now,
+        vec![now],
+    )];
+    let general_path = seed_db("forget_g", &gmems);
+    let project_path = seed_db("forget_p", &pmems);
+    let g = general_path.to_string_lossy().to_string();
+    let p_kv = format!("engram={}", project_path.display());
+
+    let out = run_subcommand_raw(
+        "forget",
+        &[
+            "--general-db",
+            &g,
+            "--project-db",
+            &p_kv,
+            "--id",
+            "fg_g",
+            "--id",
+            "fg_p",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "forget 应成功退出，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("已删除 fg_g") && stdout.contains("(general)"),
+        "应报告 fg_g 已从公共库删除，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("已删除 fg_p") && stdout.contains("engram"),
+        "应报告 fg_p 已从项目库 engram 删除，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("共删除 2 条 / 0 个未找到"),
+        "末尾应汇总条数，实得：{stdout}"
+    );
+
+    // 重开两库直读：两条都应物理消失（get 为 None），且互不串库误删。
+    let gdb = store::open(&general_path).expect("应能重新打开公共库");
+    assert!(
+        store::get(&gdb, "fg_g").expect("get 应成功").is_none(),
+        "fg_g 应已从公共库物理删除"
+    );
+    drop(gdb);
+    let pdb = store::open(&project_path).expect("应能重新打开项目库");
+    assert!(
+        store::get(&pdb, "fg_p").expect("get 应成功").is_none(),
+        "fg_p 应已从项目库物理删除"
+    );
+    drop(pdb);
+
+    // list --status all（含 superseded/tombstone/cold）也完全查不到 → 不是软删留痕。
+    let out_all = run_list(&[
+        "--general-db",
+        &g,
+        "--project-db",
+        &p_kv,
+        "--status",
+        "all",
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        !out_all.contains("fg_g") && !out_all.contains("cue-fg_g"),
+        "list --status all 不应再含 fg_g（物理删除无痕），实得：{out_all}"
+    );
+    assert!(
+        !out_all.contains("fg_p") && !out_all.contains("cue-fg_p"),
+        "list --status all 不应再含 fg_p（物理删除无痕），实得：{out_all}"
+    );
+
+    cleanup_file(&general_path);
+    cleanup_file(&project_path);
+}
+
+// 25. forget 多 id 且其中一个不存在：存在的被删、不存在的报「未找到」，
+//     exit 0（幂等友好），其它记忆不受影响。
+#[test]
+fn forget_with_missing_id_reports_and_exits_zero() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let gmems = vec![
+        make("fg_b", Level::L3, None, Status::Active, 0.5, now, vec![now]),
+        make(
+            "fg_keep",
+            Level::L3,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        ),
+    ];
+    let general_path = seed_db("forget_missing_g", &gmems);
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_subcommand_raw(
+        "forget",
+        &[
+            "--general-db",
+            &g,
+            "--id",
+            "fg_b",
+            "--id",
+            "ghost_fg",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "含不存在 id 的 forget 仍应 exit 0，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("已删除 fg_b"),
+        "存在的 fg_b 应被删除并报告，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("未找到 ghost_fg"),
+        "不存在的 ghost_fg 应报告未找到（stdout），实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("共删除 1 条 / 1 个未找到"),
+        "末尾应汇总「1 删除 / 1 未找到」，实得：{stdout}"
+    );
+
+    // fg_b 已物理消失；fg_keep 不受影响。
+    let gdb = store::open(&general_path).expect("应能重新打开公共库");
+    assert!(
+        store::get(&gdb, "fg_b").expect("get 应成功").is_none(),
+        "fg_b 应已被物理删除"
+    );
+    assert!(
+        store::get(&gdb, "fg_keep").expect("get 应成功").is_some(),
+        "未点名的 fg_keep 不应受影响"
+    );
+    drop(gdb);
+
+    cleanup_file(&general_path);
+}
+
 // ============================================================================
 // hook 辅助命令：resolve / session-start 的集成测试
 // ============================================================================

@@ -193,12 +193,42 @@ impl Default for EngramConfig {
     /// 历来硬编码的实测候选值（设计文档 §14 列为待整定项，此处取本指令给定值）。
     fn default() -> Self {
         EngramConfig {
-            l1: TierParams { capacity: 7, d: 0.10, floor: 4.5, load_full: true },
-            l2: TierParams { capacity: 30, d: 0.25, floor: 1.0, load_full: true },
-            l3: TierParams { capacity: 150, d: 0.50, floor: -10.0, load_full: false },
-            l4_1: TierParams { capacity: 10, d: 0.15, floor: 3.0, load_full: true },
-            l4_2: TierParams { capacity: 50, d: 0.30, floor: 0.5, load_full: true },
-            l4_3: TierParams { capacity: 200, d: 0.50, floor: -10.0, load_full: false },
+            l1: TierParams {
+                capacity: 7,
+                d: 0.10,
+                floor: 4.5,
+                load_full: true,
+            },
+            l2: TierParams {
+                capacity: 30,
+                d: 0.25,
+                floor: 1.0,
+                load_full: true,
+            },
+            l3: TierParams {
+                capacity: 150,
+                d: 0.50,
+                floor: -10.0,
+                load_full: false,
+            },
+            l4_1: TierParams {
+                capacity: 10,
+                d: 0.15,
+                floor: 3.0,
+                load_full: true,
+            },
+            l4_2: TierParams {
+                capacity: 50,
+                d: 0.30,
+                floor: 0.5,
+                load_full: true,
+            },
+            l4_3: TierParams {
+                capacity: 200,
+                d: 0.50,
+                floor: -10.0,
+                load_full: false,
+            },
             promote_l2: PROMOTE_L2,
             promote_l1: PROMOTE_L1,
             demote_l2: DEMOTE_L2,

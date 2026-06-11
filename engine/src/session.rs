@@ -6,6 +6,10 @@
 //! 2. **补偿巩固**：会话末起复盘者前先落一个 pending 标记，复盘者成功收尾才
 //!    删除它；若进程被强杀 / 断电没删成，下次会话启动扫到残留 pending，对它
 //!    补跑，既不丢增量也不重复。
+//! 3. **领单互斥（claim）**：SessionEnd 复盘与 SessionStart 补偿巩固可能同时
+//!    领走同一个 pending（两个复盘者各写一套高度重复的记忆）。每个 pending 配
+//!    一个 `<sid>.claim` 锁文件，用 `create_new` 的 OS 级原子语义「谁先建谁
+//!    拥有」互斥，输家不跑；陈旧锁（持有者崩溃残留）超 [`CLAIM_TTL_SECS`] 可夺取。
 //!
 //! 水位线以**行数**为单位（transcript 是 JSONL，一行一条消息），按行切不会切断
 //! 半条记录。所有 IO / 序列化错误统一包进 [`SessionError`] 向上传播，不 panic。
@@ -232,6 +236,136 @@ pub fn remove_pending(pending_path: &Path, slice_path: &Path) {
     let _ = fs::remove_file(slice_path);
 }
 
+/// claim 锁的陈旧阈值（秒）= 15 分钟。
+///
+/// 远大于一次正常复盘的耗时（分钟级），持有者活着绝不会被误夺；又足够短，
+/// 持有者崩溃 / 被强杀残留的锁最多卡一个 TTL 就会被下一个领单者按陈旧夺取。
+pub const CLAIM_TTL_SECS: f64 = 900.0;
+
+/// claim 锁文件的内容：持有者 pid 与创建时间，序列化为 JSON。
+///
+/// `pid` 仅作诊断（看锁是谁建的）；陈旧判定只看 `created_at`——pid 复用 / 共享
+/// 目录跨机的场景下「查 pid 是否存活」并不可靠，统一走 TTL 时间判定更稳。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimInfo {
+    /// 持有者进程 id（诊断用，不参与陈旧判定）。
+    pub pid: u32,
+    /// claim 创建时间（unix 秒）；距今超过 [`CLAIM_TTL_SECS`] 即视为陈旧可夺取。
+    pub created_at: f64,
+}
+
+/// [`try_claim`] 的两种结果：抢到了，或已被他人持有。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// 成功占用（含夺取陈旧 claim）——本进程现在是该 pending 的复盘 owner。
+    Acquired,
+    /// 已被他人持有且未陈旧——本进程不应再对该 pending 起复盘。
+    Held,
+}
+
+/// 由 pending 标记路径推导其 claim 锁文件路径：`<sid>.json` → `<sid>.claim`。
+///
+/// claim 是「领单占用」标记：复盘者起跑前原子新建它宣示所有权，挡住 SessionEnd
+/// 复盘与 SessionStart 补偿巩固同时领走同一个 pending 的竞态。
+pub fn claim_path_for(pending_path: &Path) -> PathBuf {
+    pending_path.with_extension("claim")
+}
+
+/// 原子新建 claim 文件并写入持有者信息（[`try_claim`] 的底层一步）。
+///
+/// `create_new` 保证「文件已存在则失败」在 OS 层是原子的（Windows / Unix 皆然），
+/// 即跨进程互斥的「谁先建谁拥有」；已存在时返回 [`ClaimOutcome::Held`]。新建成功
+/// 但写内容失败时回滚删除半成品，避免留下一个空锁迷惑后来者。
+///
+/// # Errors
+/// 序列化 `info`、新建文件（非「已存在」）或写入失败时返回 [`SessionError`]。
+fn create_claim(claim_path: &Path, info: &ClaimInfo) -> Result<ClaimOutcome, SessionError> {
+    let bytes = serde_json::to_vec_pretty(info)?;
+    let mut f = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(claim_path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(ClaimOutcome::Held),
+        Err(e) => return Err(e.into()),
+    };
+    if let Err(e) = f.write_all(&bytes) {
+        drop(f);
+        let _ = fs::remove_file(claim_path);
+        return Err(e.into());
+    }
+    Ok(ClaimOutcome::Acquired)
+}
+
+/// 判定既有 claim 是否陈旧（可被夺取）。
+///
+/// 正常路径：读回 [`ClaimInfo`] 的 `created_at`，距 `now` 超过 [`CLAIM_TTL_SECS`]
+/// 即陈旧。内容解析失败（半截写入 / 损坏）时**不轻易夺取**——改用文件 mtime 兜底：
+/// 同样超过 TTL 才算陈旧；mtime 也读不到则保守当作未陈旧（Held）。取舍：宁可这
+/// 一轮不补跑（下次会话还有机会），也不抢一个状态完全未知的锁；坏文件最终会因
+/// mtime 超时被夺取，不会永久卡死。
+fn claim_is_stale(claim_path: &Path, now: f64) -> bool {
+    if let Ok(bytes) = fs::read(claim_path) {
+        if let Ok(info) = serde_json::from_slice::<ClaimInfo>(&bytes) {
+            return now - info.created_at > CLAIM_TTL_SECS;
+        }
+    }
+    // 解析失败：按文件 mtime 兜底判定。
+    match fs::metadata(claim_path).and_then(|m| m.modified()) {
+        Ok(mtime) => match mtime.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => now - d.as_secs_f64() > CLAIM_TTL_SECS,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// 尝试领走（占用）一个 pending：对其 claim 路径原子建锁。
+///
+/// 互斥根基是 `OpenOptions::create_new`——「文件已存在则失败」由 OS 保证原子
+/// （Windows / Unix 皆然），故两个进程同时领同一个 pending 时必恰有一方
+/// [`ClaimOutcome::Acquired`]、另一方 [`ClaimOutcome::Held`]。
+///
+/// 已存在的 claim 若距 `now` 超过 [`CLAIM_TTL_SECS`]（持有者大概率已崩），按陈旧
+/// **夺取**：先删旧锁再原子新建；夺取途中任一步竞争失败（他人抢先重建 / 删除受阻）
+/// 一律退回 [`ClaimOutcome::Held`]，绝不出现双 owner。
+///
+/// # Errors
+/// 建父目录、序列化 [`ClaimInfo`] 或写新锁文件失败时返回 [`SessionError`]；
+/// 「锁被他人持有」不是错误（以 [`ClaimOutcome::Held`] 表达）。
+pub fn try_claim(claim_path: &Path, now: f64, pid: u32) -> Result<ClaimOutcome, SessionError> {
+    ensure_parent(claim_path)?;
+    let info = ClaimInfo {
+        pid,
+        created_at: now,
+    };
+    // 第一步：直接抢——文件不存在时原子新建即获得。
+    if create_claim(claim_path, &info)? == ClaimOutcome::Acquired {
+        return Ok(ClaimOutcome::Acquired);
+    }
+    // 已存在：未陈旧则尊重现有持有者。
+    if !claim_is_stale(claim_path, now) {
+        return Ok(ClaimOutcome::Held);
+    }
+    // 陈旧 → 夺取：先删旧锁再原子新建。删除失败（除「已不存在」外）保守按 Held；
+    // 新建撞上「已存在」（他人抢先重建）也按 Held——竞争输了就让对方跑。
+    if let Err(e) = fs::remove_file(claim_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Ok(ClaimOutcome::Held);
+        }
+    }
+    create_claim(claim_path, &info)
+}
+
+/// 释放 claim 锁（best-effort，忽略不存在 / 删除失败）。
+///
+/// 与 [`remove_pending`] 同风格：清理是收尾旁路，失败无需上抛——残留锁超过
+/// [`CLAIM_TTL_SECS`] 后会被下一个领单者按陈旧夺取，不会永久卡死。
+pub fn release_claim(claim_path: &Path) {
+    let _ = fs::remove_file(claim_path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +511,104 @@ mod tests {
         assert!(!sf.exists(), "切片应被删");
         // 再删一次（已不存在）不应 panic
         remove_pending(&pf, &sf);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 8. claim_path_for：<sid>.json → <sid>.claim。
+    #[test]
+    fn claim_path_for_swaps_extension() {
+        assert_eq!(
+            claim_path_for(Path::new("w/sid-1.json")),
+            PathBuf::from("w/sid-1.claim")
+        );
+    }
+
+    // 9. try_claim 原子互斥：首领 Acquired，紧接（同 now）二领 Held。
+    #[test]
+    fn try_claim_first_acquires_second_held() {
+        let dir = unique_dir("claim");
+        let cp = claim_path_for(&dir.join("sid.json"));
+        assert_eq!(
+            try_claim(&cp, 1000.0, 1).expect("首领应成功"),
+            ClaimOutcome::Acquired
+        );
+        assert_eq!(
+            try_claim(&cp, 1000.0, 2).expect("二领应正常返回"),
+            ClaimOutcome::Held,
+            "未陈旧的 claim 不应被二次领走"
+        );
+        // 锁内容应可读回且记录首位持有者。
+        let info: ClaimInfo =
+            serde_json::from_slice(&fs::read(&cp).expect("读锁应成功")).expect("解析锁应成功");
+        assert_eq!(info.pid, 1, "锁应仍属首位持有者");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 10. 陈旧夺取：超 TTL 后 try_claim → Acquired，且锁归新持有者。
+    #[test]
+    fn try_claim_steals_stale() {
+        let dir = unique_dir("claim_stale");
+        let cp = claim_path_for(&dir.join("sid.json"));
+        assert_eq!(
+            try_claim(&cp, 1000.0, 1).expect("首领应成功"),
+            ClaimOutcome::Acquired
+        );
+        let later = 1000.0 + CLAIM_TTL_SECS + 1.0;
+        assert_eq!(
+            try_claim(&cp, later, 2).expect("夺取应成功"),
+            ClaimOutcome::Acquired,
+            "超过 TTL 的陈旧 claim 应被夺取"
+        );
+        // 夺取后立刻再领（同 later）应 Held——锁已归新持有者且不陈旧。
+        assert_eq!(
+            try_claim(&cp, later, 3).expect("应正常返回"),
+            ClaimOutcome::Held
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 11. release_claim 后可再次 Acquired；释放不存在的锁不 panic。
+    #[test]
+    fn release_claim_allows_reacquire() {
+        let dir = unique_dir("claim_release");
+        let cp = claim_path_for(&dir.join("sid.json"));
+        assert_eq!(
+            try_claim(&cp, 1.0, 1).expect("首领应成功"),
+            ClaimOutcome::Acquired
+        );
+        release_claim(&cp);
+        assert!(!cp.exists(), "释放后锁文件应不存在");
+        assert_eq!(
+            try_claim(&cp, 2.0, 2).expect("释放后再领应成功"),
+            ClaimOutcome::Acquired
+        );
+        release_claim(&cp);
+        // 再释放一次（已不存在）不应 panic。
+        release_claim(&cp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 12. 内容损坏的 claim：TTL 内保守 Held；超 TTL（按 mtime 兜底）可夺取。
+    #[test]
+    fn try_claim_garbage_held_then_stolen_by_mtime() {
+        let dir = unique_dir("claim_garbage");
+        let cp = claim_path_for(&dir.join("sid.json"));
+        write_file(&cp, "not json");
+        // 文件刚写下，mtime ≈ 真实当前时间——TTL 内不可夺取。
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .expect("系统时钟应晚于 unix 纪元");
+        assert_eq!(
+            try_claim(&cp, wall, 1).expect("应正常返回"),
+            ClaimOutcome::Held,
+            "TTL 内的坏 claim 应保守视作被持有"
+        );
+        assert_eq!(
+            try_claim(&cp, wall + CLAIM_TTL_SECS + 60.0, 2).expect("应成功"),
+            ClaimOutcome::Acquired,
+            "坏 claim 超 TTL（按 mtime 兜底）应可夺取，不会永久卡死"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
