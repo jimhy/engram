@@ -22,8 +22,13 @@ if [ -n "$node_bin" ]; then
   fi
 fi
 
-# ---- Engram 段（快：读 hook 每轮刷新的状态文件）----
-eng=$(cat "$HOME/.engram/status.txt" 2>/dev/null)
+# ---- Engram 段（快：读 hook 每轮刷新的、按会话分的状态文件，不开库）----
+# 从状态栏 stdin JSON 取 session_id，只读本会话自己的状态文件，避免多窗口互相覆盖。
+sid=$(printf '%s' "$input" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+eng=""
+[ -n "$sid" ] && eng=$(cat "$HOME/.engram/status/$sid.txt" 2>/dev/null)
+# 回退：旧单文件（兼容尚未升级到 --status-dir 的引擎/hook）。
+[ -z "$eng" ] && eng=$(cat "$HOME/.engram/status.txt" 2>/dev/null)
 [ -z "$eng" ] && eng="● Engram (idle)"
 
 # ---- 合并输出 ----

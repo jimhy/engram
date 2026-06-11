@@ -354,6 +354,11 @@ enum Command {
         /// 让状态栏始终最新。写失败静默忽略，不影响注入主流程。
         #[arg(long)]
         status_file: Option<PathBuf>,
+        /// 状态栏目录；给定时把状态串写入 `<dir>/<session_id>.txt`（按会话分文件，
+        /// 多窗口/多项目各读各的、互不覆盖）。优先于 `--status-file`；从 hook stdin 取
+        /// session_id，缺失时回退 `<dir>/default.txt`。顺手清理目录内过期的旧会话文件。
+        #[arg(long)]
+        status_dir: Option<PathBuf>,
         /// 输出格式：text（前言 + 热索引，缺省）或 json（合成 hook 单行 JSON）。
         #[arg(long, default_value = "text")]
         emit: String,
@@ -761,6 +766,7 @@ fn main() -> ExitCode {
             prompt,
             state,
             status_file,
+            status_dir,
             emit,
             hook_event,
             from_hook_stdin,
@@ -773,6 +779,7 @@ fn main() -> ExitCode {
             prompt: prompt.as_deref(),
             state: state.as_deref(),
             status_file: status_file.as_deref(),
+            status_dir: status_dir.as_deref(),
             emit: &emit,
             hook_event: &hook_event,
             from_hook_stdin,
@@ -1591,6 +1598,9 @@ struct HotIndexArgs<'a> {
     state: Option<&'a Path>,
     /// `--status-file`；给定时每次都把挂载集的一行状态串写入该文件（覆盖）。
     status_file: Option<&'a Path>,
+    /// `--status-dir`；给定时按 `<dir>/<session_id>.txt` 分会话写状态串（优先于
+    /// `status_file`，多窗口互不覆盖）。
+    status_dir: Option<&'a Path>,
     /// 输出格式：`text`（缺省）或 `json`。
     emit: &'a str,
     /// `--emit json` 时写入的 hookEventName。
@@ -1605,12 +1615,15 @@ struct HotIndexArgs<'a> {
 
 /// 从 stdin 解析出的 hook 兜底字段（缺失即为 `None`）。
 ///
-/// 新作用域模型只需 hook 给的 `cwd`（用于从其向上锚定作用域）；历史的
+/// 新作用域模型需 hook 给的 `cwd`（用于从其向上锚定作用域）与 `session_id`
+/// （状态栏按会话分文件用，避免多窗口共用单文件互相覆盖）；历史的
 /// `transcript_path` / `prompt` 已不再参与判定，故不再解析。
 #[derive(Debug, Default)]
 struct HookStdin {
     /// hook 给的当前工作目录。
     cwd: Option<PathBuf>,
+    /// hook 给的会话 id（状态栏按会话分文件用）。
+    session_id: Option<String>,
 }
 
 /// 读取整段 stdin、按 hook JSON 解析出 `cwd`。
@@ -1638,7 +1651,13 @@ fn read_hook_stdin() -> HookStdin {
         None => return HookStdin::default(),
     };
     let cwd = obj.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-    HookStdin { cwd }
+    // session_id：状态栏按会话分文件用（避免多窗口共用单文件互相覆盖）；空串视作无。
+    let session_id = obj
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    HookStdin { cwd, session_id }
 }
 
 /// 读状态文件里上次记录的作用域根路径（去首尾空白）。文件不存在/读失败/为空 → `None`。
@@ -1786,10 +1805,15 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         }
     };
 
-    // 5. 状态栏小文件（best-effort）：把挂载集的一行状态串写入 --status-file（覆盖）。
-    //    无论后面状态门控是否判空、是否注入，都先把状态栏文件刷成最新；写失败静默忽略。
-    if let Some(status_path) = args.status_file {
-        write_status_file_silent(status_path, &oneline_status(&merged, now));
+    // 5. 状态栏小文件（best-effort）：无论后面状态门控是否判空、是否注入，都先把状态栏
+    //    刷成最新；写失败静默忽略。优先按会话分文件（--status-dir/<session_id>.txt），让每个
+    //    窗口只读自己会话的状态、不被别的窗口的 hook 覆盖；否则回退单文件（--status-file）。
+    let status_line = oneline_status(&merged, now);
+    if let Some(dir) = args.status_dir {
+        let sid = hook.session_id.as_deref().unwrap_or("default");
+        write_session_status_silent(dir, sid, &status_line);
+    } else if let Some(status_path) = args.status_file {
+        write_status_file_silent(status_path, &status_line);
     }
 
     // 6. 状态门控（仅当 --state 给出）：与上次 scope.root 相同则输出空、exit 0。
@@ -1880,6 +1904,63 @@ fn write_status_file_silent(path: &Path, content: &str) {
     }
     // 覆盖写入；失败静默忽略。
     let _ = std::fs::write(path, content);
+}
+
+/// 状态栏会话文件的保留窗口（秒）：超过此时长未更新的旧会话状态文件，在下次写入时被清理。
+/// 取 7 天——足够覆盖跨天的长会话，又不至于让 `~/.engram/status/` 无限堆积。
+const STATUS_SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// 按会话把状态栏一行串写入 `<dir>/<session_id>.txt`（**覆盖**），best-effort：全程失败静默。
+///
+/// 分会话写是为了让每个 Claude Code 窗口的状态栏只读到**自己会话**的快照，不被别的窗口的
+/// hook 覆盖（旧版所有窗口共用单文件 `status.txt`，导致多窗口显示雷同）。写完顺手清理目录内
+/// 过期的旧会话文件（见 [`cleanup_stale_status`]），避免长期堆积。
+///
+/// # 参数
+/// - `dir`：状态栏会话目录（如 `~/.engram/status`）。
+/// - `session_id`：会话 id；非文件名安全字符会被替换为 `_`，空则记为 `default`。
+/// - `content`：要写入的一行状态串（[`oneline_status`] 的产物）。
+fn write_session_status_silent(dir: &Path, session_id: &str, content: &str) {
+    // 文件名净化：只留 ASCII 字母数字与 `-`/`_`，其余替换为 `_`，杜绝 `/`、`..` 穿出目录。
+    let safe: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() { "default" } else { safe.as_str() };
+    // 目录不存在先建；失败则放弃（不报错、不影响主输出）。
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{safe}.txt")), content);
+    cleanup_stale_status(dir);
+}
+
+/// 删 `dir` 内 mtime 早于「现在 − [`STATUS_SESSION_TTL_SECS`]」的 `*.txt`（best-effort，全程静默）。
+///
+/// 用文件 mtime 的 [`std::fs::Metadata::modified`] + `elapsed()` 判龄，避免与外部逻辑时钟耦合；
+/// 读目录 / 取元数据 / 删文件任一步失败或时钟异常都跳过（保守不删），绝不上抛。
+fn cleanup_stale_status(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        let Ok(age) = modified.elapsed() else { continue };
+        if age.as_secs() > STATUS_SESSION_TTL_SECS {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// `status` 命令的全部参数（聚成一个结构体，规避过多函数形参）。

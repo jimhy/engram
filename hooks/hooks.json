@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-file \"$HOME/.engram/status.txt\" --log \"$HOME/.engram/hook.log\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\""
           },
           {
             "type": "command",
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event UserPromptSubmit --state \"$HOME/.engram/active.state\" --status-file \"$HOME/.engram/status.txt\" --log \"$HOME/.engram/hook.log\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event UserPromptSubmit --state \"$HOME/.engram/active.state\" --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\""
           }
         ]
       }
