@@ -6,6 +6,10 @@ Thumbs.db
 
 # Rust build output (engine source committed, build artifacts not)
 engine/target/
+kb/target/
+
+# kb sidecar binaries are Release-only (downloaded on demand), never committed
+bin/engram-kb-*
 
 # local runtime / data - never commit dbs or logs
 *.redb

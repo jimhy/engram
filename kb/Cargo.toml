@@ -1,0 +1,58 @@
+[package]
+name = "engram-kb"
+version = "0.2.0"
+edition = "2021"
+description = "Engram 知识库 sidecar——本地 RAG：文档分块 + 中文嵌入 + LanceDB 混合检索"
+
+# 与主引擎（engine/）一致：同时提供库 target（供集成测试直接调用各模块）
+# 与二进制 target（CLI 入口）。本 crate 是独立 sidecar，不依赖 engine、不进插件包，
+# 经 GitHub Release 分发、首次使用时按需下载（见 docs/知识库设计文档.md §7）。
+[lib]
+name = "engram_kb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "engram-kb"
+path = "src/main.rs"
+
+[dependencies]
+# 向量库：default features 为空即最小本地配置（云存储 backend 全是 opt-in）。
+lancedb = "0.30"
+# arrow 大版本必须与 lancedb 内部一致（^58）；lancedb 不 re-export arrow_array。
+arrow-array = "58"
+arrow-schema = "58"
+# 嵌入：裁掉默认的 image-models；ort 静态链接（单文件 exe）、hf-hub 在线下载模型。
+fastembed = { version = "5.16", default-features = false, features = [
+    "ort-download-binaries-native-tls",
+    "hf-hub-native-tls",
+] }
+# 分块：markdown 语义分块 + 按 HF tokenizer 计 token（与 bge 模型对齐）。
+text-splitter = { version = "0.31", features = ["markdown", "tokenizers"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# markdown 标题树解析（拼标题面包屑用）。
+pulldown-cmark = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+# 文档内容 hash（增量入库判断）。
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+# 体积优化（CI 发布产物）：thin LTO 跨 crate 消除死代码 + 去符号，对
+# lancedb/ort 这种重依赖项目体积差异显著（本机实测 LTO off 时高达 213MB）。
+# 注意：本机编译请用 .tmp/cargo-retry.sh——其 CARGO_PROFILE_RELEASE_LTO=off
+# 环境变量会覆盖此处 lto 配置，绕开本机 bitcode 写盘损坏（设计文档 §9.2）。
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# 本机 Windows 实测：rustc 1.96.0 以 opt-level=3/1 编 datafusion 53.1 均稳定
+# ACCESS_VIOLATION 崩溃（详见设计文档 §9.2），单独降该包优化级别绕开。
+# datafusion 只承担查询计划，热路径在 lance 向量扫描与 ort 推理，性能无虞。
+# CI 上无此问题但保留无害（仅该包优化略低）。
+[profile.release.package.datafusion]
+opt-level = 1

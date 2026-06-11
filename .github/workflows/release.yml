@@ -52,6 +52,51 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
 
+  # 知识库 sidecar（plugin/kb/，独立 crate）：体积大（LanceDB + ONNX Runtime 静态链），
+  # 只附到 Release 供 scripts/ensure-kb.sh 按需下载，不 commit 进 bin/、不进插件包。
+  # 平台少一个 Intel Mac：上游 ort 无 x86_64-apple-darwin 预编译 CPU 包。
+  build-kb:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            out: engram-kb.exe
+            asset: engram-kb-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            out: engram-kb
+            asset: engram-kb-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            out: engram-kb
+            asset: engram-kb-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # lance 构建硬依赖完整 protoc（含 include/ 的 well-known types）。
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build kb
+        working-directory: kb
+        # --locked：严格按已提交的 Cargo.lock 解析，防止 CI 依赖漂移出已验证版本。
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "kb/target/${{ matrix.target }}/release/${{ matrix.out }}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
   publish:
     name: commit binaries + release
     needs: build
@@ -67,7 +112,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p bin
-          find artifacts -type f -exec cp {} bin/ \;
+          # kb sidecar 体积大、只走 Release 按需下载（见 publish-kb job），不入库。
+          find artifacts -type f ! -name 'engram-kb-*' -exec cp {} bin/ \;
           chmod +x bin/engram-linux-* bin/engram-macos-* 2>/dev/null || true
           ls -la bin
       - name: Commit binaries to main
@@ -87,3 +133,62 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: bin/engram-*
+
+  # kb sidecar 单独发布：只附 Release（softprops 同 tag 自动追加到同一个 Release），
+  # 不 commit 入库。设计要点：
+  # - needs publish：排在主发布之后追加资产，避免两个 job 并发创建同一 Release 的竞态；
+  # - 不要求 build-kb 全绿（!cancelled() + 只看 publish 结果）：单平台编译失败时
+  #   其余平台资产照发——否则 latest Release 一个 kb 资产都没有，所有用户的
+  #   ensure-kb.sh 下载全部 404；
+  # - 主引擎发版完全不被本 job 影响（publish 不依赖任何 kb job）。
+  publish-kb:
+    name: release kb sidecar
+    needs: [build-kb, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: engram-kb-*
+      - name: Stage kb assets + checksums
+        shell: bash
+        run: |
+          mkdir -p kb-dist
+          find artifacts -type f -name 'engram-kb-*' -exec cp {} kb-dist/ \; 2>/dev/null || true
+          cd kb-dist
+          if ! ls engram-kb-* >/dev/null 2>&1; then
+            echo "no kb assets built (all platforms failed?) — skip release upload"
+            exit 0
+          fi
+          sha256sum engram-kb-* > engram-kb-SHA256SUMS
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: kb-dist/engram-kb-*
+
+  notify-adapters:
+    name: notify adapter repos
+    needs: publish
+    # 只在真正发版（打 tag）时级联，手动 workflow_dispatch 不通知。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      # 通知 codex / opencode 适配器仓库：上游发了新版，去各自 sync-binaries
+      # workflow 拉这份四平台二进制。它们零编译、只复用本仓库的 CI 产物。
+      #
+      # 需要一个跨仓库凭证 secrets.ADAPTER_DISPATCH_TOKEN（fine-grained PAT，
+      # 对 jimhy/engram-codex 与 jimhy/engram-opencode 有 contents:write 权限）。
+      # 默认 GITHUB_TOKEN 无法触发别的仓库的 repository_dispatch，故必须用 PAT。
+      # 未配置该 secret 时此步会失败，但不影响上游发版本身（已在 publish 完成）。
+      - name: Dispatch to adapter repos
+        env:
+          GH_TOKEN: ${{ secrets.ADAPTER_DISPATCH_TOKEN }}
+        shell: bash
+        run: |
+          for repo in jimhy/engram-codex jimhy/engram-opencode; do
+            echo "dispatching engram-release(${GITHUB_REF_NAME}) -> $repo"
+            gh api "repos/$repo/dispatches" \
+              -f event_type=engram-release \
+              -F client_payload[version]="${GITHUB_REF_NAME}"
+          done
