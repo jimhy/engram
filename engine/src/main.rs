@@ -1397,6 +1397,28 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // 确定性巩固：复盘者一旦收尾，就在推进水位线前把升降级/容量/淘汰状态机跑一遍
+    // ——升降级本是纯算法、无需 LLM 判断，故不再依赖复盘者是否记得手动跑
+    // `consolidate`（confirm-use/supersede/merge 这类需语义判断的仍留给复盘者）。
+    // best-effort：巩固失败只记 stderr，绝不阻断水位线推进与 pending 清理。
+    if let Some(now) = resolve_now(None) {
+        let mut pmap: BTreeMap<String, PathBuf> = BTreeMap::new();
+        if !pending.project_name.is_empty() && !pending.project_db.is_empty() {
+            pmap.insert(
+                pending.project_name.clone(),
+                PathBuf::from(&pending.project_db),
+            );
+        }
+        match consolidate_libs(Path::new(&pending.general_db), &pmap, now, false) {
+            Ok(ts) if !ts.is_empty() => {
+                eprintln!("consolidate-done: 确定性巩固 {} 条变迁", ts.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("consolidate-done: 巩固跳过（{e}）"),
+        }
+    }
+
     let mut wm = session::read_watermark(watermark);
     let cur = wm.get(&pending.transcript).copied().unwrap_or(0);
     if pending.end_line > cur {
@@ -2627,36 +2649,13 @@ fn run_consolidate(
         return ExitCode::FAILURE;
     };
 
-    // 打开公共库并读出。
-    let (gdb, gmems) = match open_and_read(general_db) {
-        Ok(v) => v,
+    let transitions = match consolidate_libs(general_db, &project_dbs, now, dry_run) {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("读取公共库 {} 失败：{e}", general_db.display());
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
-
-    // 打开所有项目库并读出（保留各 Database 句柄用于写回）。
-    let mut merged = gmems;
-    let mut pdbs: BTreeMap<String, Database> = BTreeMap::new();
-    for (name, path) in &project_dbs {
-        match open_and_read(path) {
-            Ok((db, mut pmems)) => {
-                merged.append(&mut pmems);
-                pdbs.insert(name.clone(), db);
-            }
-            Err(e) => {
-                eprintln!("读取项目库 {name}（{}）失败：{e}", path.display());
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    // 记录变更前的 (level, status)，用于只写回真正变化的记忆。
-    let before: Vec<(Level, Status)> = merged.iter().map(|m| (m.level, m.status)).collect();
-
-    // 跑状态机（纯算法，原地修改）。
-    let transitions = consolidate(&mut merged, now);
 
     // 打印变迁摘要。
     if transitions.is_empty() {
@@ -2665,19 +2664,53 @@ fn run_consolidate(
         println!(
             "== consolidate (now={now}) == 共 {} 条变迁{}",
             transitions.len(),
-            if dry_run {
-                "（dry-run，不写回）"
-            } else {
-                ""
-            }
+            if dry_run { "（dry-run，不写回）" } else { "" }
         );
         for t in &transitions {
             print_transition(t);
         }
     }
 
+    ExitCode::SUCCESS
+}
+
+/// 载入公共库 + 各项目库、跑 consolidate 状态机、按层级/项目路由写回。
+///
+/// [`run_consolidate`] 与 [`run_consolidate_done`] 共用的执行核：纯执行、**不打印**
+/// 变迁摘要（交给调用方决定是打到 stdout 还是静默），故可在 consolidate-done 的
+/// 收尾里静默复用而不污染其 stdout JSON。`dry_run` 为真时只算变迁、不写回。
+///
+/// # 返回
+/// 本次状态机产生的全部变迁；载入/写回失败时返回 `Err(错误说明)`。无法路由的 L4
+/// 变更（其 `project` 不在映射中）仅记 stderr 警告、不算失败。
+fn consolidate_libs(
+    general_db: &Path,
+    project_dbs: &BTreeMap<String, PathBuf>,
+    now: f64,
+    dry_run: bool,
+) -> Result<Vec<Transition>, String> {
+    // 打开公共库并读出。
+    let (gdb, gmems) = open_and_read(general_db)
+        .map_err(|e| format!("读取公共库 {} 失败：{e}", general_db.display()))?;
+
+    // 打开所有项目库并读出（保留各 Database 句柄用于写回）。
+    let mut merged = gmems;
+    let mut pdbs: BTreeMap<String, Database> = BTreeMap::new();
+    for (name, path) in project_dbs {
+        let (db, mut pmems) = open_and_read(path)
+            .map_err(|e| format!("读取项目库 {name}（{}）失败：{e}", path.display()))?;
+        merged.append(&mut pmems);
+        pdbs.insert(name.clone(), db);
+    }
+
+    // 记录变更前的 (level, status)，用于只写回真正变化的记忆。
+    let before: Vec<(Level, Status)> = merged.iter().map(|m| (m.level, m.status)).collect();
+
+    // 跑状态机（纯算法，原地修改）。
+    let transitions = consolidate(&mut merged, now);
+
     if dry_run {
-        return ExitCode::SUCCESS;
+        return Ok(transitions);
     }
 
     // 挑出 level 或 status 有变化的记忆，按当前（变更后）层级 + 项目路由：
@@ -2707,23 +2740,15 @@ fn run_consolidate(
 
     // 写回公共库（仅在有变更时开事务）。
     if !general_changed.is_empty() {
-        if let Err(e) = store::put_many(&gdb, &general_changed) {
-            eprintln!("写回公共库失败：{e}");
-            return ExitCode::FAILURE;
-        }
+        store::put_many(&gdb, &general_changed).map_err(|e| format!("写回公共库失败：{e}"))?;
     }
 
     // 各项目库分别单事务写回其变更集。
     for (name, changed) in &project_changed {
-        let Some(db) = pdbs.get(name) else {
-            // 不可达：project_changed 的键来自 pdbs.contains_key 过滤。
-            eprintln!("内部错误：项目 {name} 无对应库句柄");
-            return ExitCode::FAILURE;
-        };
-        if let Err(e) = store::put_many(db, changed) {
-            eprintln!("写回项目库 {name} 失败：{e}");
-            return ExitCode::FAILURE;
-        }
+        let db = pdbs
+            .get(name)
+            .ok_or_else(|| format!("内部错误：项目 {name} 无对应库句柄"))?;
+        store::put_many(db, changed).map_err(|e| format!("写回项目库 {name} 失败：{e}"))?;
     }
 
     // 无法路由的 L4 变更：记 stderr 提示（不致命）。
@@ -2731,7 +2756,7 @@ fn run_consolidate(
         eprintln!("警告：{unrouted_l4} 条 L4 记忆的所属项目不在 --project-db 映射中，已跳过其写回");
     }
 
-    ExitCode::SUCCESS
+    Ok(transitions)
 }
 
 /// 执行 `import` 子命令：扫描 JSON 目录 → **按层级 + 项目路由**导入多库，打印各库条数。

@@ -250,8 +250,22 @@ fn fmt_eff(eff: f64) -> String {
     }
 }
 
+/// 取记忆 id 的稳定短标记（`mem-` 后的**首段**，形如 `18beb926f903e300`）。
+///
+/// 热索引每行前缀 `#<tok>`，让会话末复盘者能把「注入且真影响了输出」的记忆精确
+/// 映射回 id 去 `confirm-use`——闭合「注入(主通道)→真使用→加固」回路，而不必对
+/// 长 cue 做模糊反查。取首段是因为它由**创建时间派生、单调唯一**；次段是内容哈希，
+/// 同文/近义记忆会撞，不适合当唯一标记。非 `mem-<a>-<b>` 形制的 id 原样返回。
+fn id_tok(id: &str) -> &str {
+    id.strip_prefix("mem-")
+        .and_then(|rest| rest.split('-').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id)
+}
+
 /// 渲染单条记忆为一行文本。
 ///
+/// 行首统一带 `#<id 首段>` 短标记（见 [`id_tok`]），供复盘者映射回 id 做加固。
 /// `load_full` 为 `true` 时附带 `pointer.reference` 与 `imp`，否则只显示 cue 与 eff。
 /// 当 `eff` 跌破 [`EVICT_THRESHOLD`] 时，行尾追加 `[淘汰]` 标记
 /// （仅标注，不真正改状态——状态变更是 consolidate 的职责）。
@@ -262,10 +276,12 @@ fn format_line(m: &Memory, eff: f64, load_full: bool) -> String {
     } else {
         ""
     };
+    let tok = id_tok(&m.id);
     if load_full {
         let reference = m.pointer.reference.as_deref().unwrap_or("-");
         format!(
-            "  - {} | {} | [imp={:.2}/eff={}]{}\n",
+            "  #{} {} | {} | [imp={:.2}/eff={}]{}\n",
+            tok,
             m.cue,
             reference,
             m.importance,
@@ -273,7 +289,7 @@ fn format_line(m: &Memory, eff: f64, load_full: bool) -> String {
             evict_tag
         )
     } else {
-        format!("  - {} | [eff={}]{}\n", m.cue, fmt_eff(eff), evict_tag)
+        format!("  #{} {} | [eff={}]{}\n", tok, m.cue, fmt_eff(eff), evict_tag)
     }
 }
 
@@ -363,6 +379,43 @@ mod tests {
         let out = render(&mems, now);
         assert!(out.contains("降级/淘汰候选"), "超容应出现降级候选区");
         assert!(out.contains("[9/7]"), "标题应显示已用/容量");
+    }
+
+    #[test]
+    fn id_tok_takes_first_segment() {
+        // 标准 mem-<首段>-<次段> 取首段。
+        assert_eq!(id_tok("mem-18beb926f903e300-fb64bb2fae588bef"), "18beb926f903e300");
+        // 非标准 id 原样返回。
+        assert_eq!(id_tok("a"), "a");
+        assert_eq!(id_tok("mem-"), "mem-");
+    }
+
+    #[test]
+    fn render_line_prefixes_id_token() {
+        let now = 1_000_000_000.0;
+        let m = Memory {
+            id: "mem-18beb926f903e300-fb64bb2fae588bef".to_string(),
+            cue: "带标记的记忆".to_string(),
+            pointer: Pointer {
+                kind: "none".to_string(),
+                reference: None,
+                detail: None,
+            },
+            level: Level::L2,
+            project: None,
+            importance: 0.5,
+            pinned: false,
+            access_log: vec![now],
+            status: Status::Active,
+            superseded_by: None,
+            created_at: now,
+            tags: vec![],
+        };
+        let out = render(&[m], now);
+        assert!(
+            out.contains("#18beb926f903e300 带标记的记忆"),
+            "每行应带 #<id首段> 短标记，实得：\n{out}"
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ engram resolve --format json   # 输出 general_db / project_db / project_name /
 ## 1. 会话中：怎么用记忆（主 agent）
 
 ### 读
-- 热索引由 hook 在会话开始自动注入（你已能在上下文里看到 L1/L2/L3 + 各活跃项目 L4 的 cue）。**先读它**。
+- 热索引由 hook 在会话开始自动注入（你已能在上下文里看到 L1/L2/L3 + 各活跃项目 L4 的 cue）。**先读它**。每行行首的 `#<id首段>`（如 `#18beb926f903e300`）是该条记忆的短标记，供会话末复盘者把「真影响了输出」的记忆映射回 id 加固——你读记忆时可忽略它。
 - **被问"这个项目是什么 / 还有哪些待做 / 进度到哪 / 以前是否处理过 X"这类问题——先查记忆、别先翻代码**：热索引里 **L4.2**（定位 / 架构地图 / 已定型决策）和 **L4.3**（未完成开口 / 待做）通常已有答案；不够就 `recall`（带 `open-loop` / `todo` 等关键词）；**仍不够才扫代码**。代码是细节 ground truth，但"还剩什么、为什么这么做、否过什么"这类**意图 / 进度问题，记忆才是第一信源**。
 - 需要某条记忆的细节时：**顺着它的指针（`file:line` / doc / url）去查 ground truth**，而不是凭印象。指针就是为"验证而非重建"准备的。
 - 想找没在热索引里的旧事（"我们以前是不是处理过 X"）：
@@ -143,7 +143,9 @@ engram write --general-db G [--project-db n=p ...] \
 
 **铁律：与"被加载"解耦**——一条常驻 L1、每轮都被加载却没真正影响输出的记忆，也不该被加固。
 
-从转录里挑出第 3 档的记忆 id，加固：
+**但反过来也要注意**：hook **注入的热索引**是记忆到达 agent 的主通道，其中被真正采纳（第 3 档）的记忆**必须加固**——真使用**不限于显式 `recall`**。这类"注入即用"通常是最大的一类真使用，漏掉它会让整个 L3 因常年零加固而单调衰减成僵尸带。
+
+从转录里挑出第 3 档的记忆（注入热索引的行首带 `#<id首段>` 标记，据它到 `list --json` 里按 `mem-<标记>-...` 前缀锁定完整 id），加固：
 ```
 engram confirm-use --general-db G [--project-db n=p ...] --ids id1,id2,...
 ```
@@ -164,10 +166,10 @@ engram merge --general-db G [--project-db n=p ...] \
 源会转 tombstone（负知识），新记忆继承并集的访问历史。**让"实例"死、"schema"活。**
 
 ### 3.4 写入新记忆 + 升降级
-- 按 §2 salience 判定，对达标的新知识 `engram write`。
-- 跑一次升降级状态机（按 effective + 容量 + 迟滞自动升/降/淘汰）：
+- 按 §2 salience 判定，对达标的新知识 `engram write`（**写前先按第 ① 查重闸门 `recall` 查同事实**，命中改走 confirm-use/supersede，别写副本）。
+- 升降级状态机（按 effective + 容量 + 迟滞自动升/降/淘汰）**已由收尾的 `consolidate-done` 确定性自动执行**，无需手动跑；仅想预览变迁时可选：
   ```
-  engram consolidate --general-db G [--project-db n=p ...]   # 加 --dry-run 先看变迁
+  engram consolidate --general-db G [--project-db n=p ...] --dry-run   # 仅预览，不写回
   ```
 
 ### 3.5（可选）回收
