@@ -32,7 +32,7 @@
 //!
 //! 设计文档参考：§6 升降级、§7 降级去向、§13 交付形态（存储选定 redb、多库分置）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2152,6 +2152,14 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
 
     // 挂载集：公共库（全部）+ 作用域库（若文件存在）+ 各 --project-db（若文件存在）。
     // 缺失的库静默跳过（只读概况，库尚未创建时算作 0 条，不应报错）。
+    //
+    // 按规范化绝对路径去重：cwd 锚定的作用域库与显式 --project-db 可能指向**同一个**
+    // redb 文件（/engram:list 等 skill 的官方用法就是先 resolve 拿到路径、再用
+    // --project-db 显式传进来）。若不去重，同一个项目库会被读两遍、概况数字虚高一倍
+    // （唯独 status 有 cwd 锚定 + 显式挂载两条来源，故只有它会踩到）。以规范化路径为
+    // 准跳过重复来源，与 list/render/recall 的单次挂载语义对齐。
+    let mut mounted: HashSet<PathBuf> = HashSet::new();
+
     let mut merged = match open_and_read(&general_db) {
         Ok((_db, mems)) => mems,
         Err(e) => {
@@ -2159,8 +2167,9 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    mounted.insert(canonicalize_cwd(&general_db));
 
-    if scope.db.is_file() {
+    if scope.db.is_file() && mounted.insert(canonicalize_cwd(&scope.db)) {
         match open_and_read(&scope.db) {
             Ok((_db, mut mems)) => merged.append(&mut mems),
             Err(e) => {
@@ -2175,7 +2184,7 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
     }
 
     for (name, path) in &project_dbs {
-        if !path.is_file() {
+        if !path.is_file() || !mounted.insert(canonicalize_cwd(path)) {
             continue;
         }
         match open_and_read(path) {

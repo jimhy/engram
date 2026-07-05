@@ -4222,3 +4222,103 @@ fn root_succeeds_when_engram_db_preexists() {
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// 回归：status 命令在 cwd 锚定的作用域库与显式 --project-db 指向**同一个**redb 文件时，
+// 不应把项目层记忆统计两遍（/engram:list 等 skill 就是先 resolve 拿路径、再 --project-db
+// 显式传进来，很容易触发双挂载）。修复前 active 总数 / L4 子层计数会翻倍。
+#[test]
+fn status_dedups_same_db_mounted_as_scope_and_project_db() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let created = now - 86400.0;
+
+    // 项目根：自带 .engram/engram.redb，灌项目 L4.2/L4.3 各 1 条。
+    let proj = unique_workspace_root("status_dedup");
+    let scope_db = seed_engram_db(
+        &proj,
+        &[
+            make("p1", Level::L4_2, Some("proj"), Status::Active, 0.5, created, vec![]),
+            make("p2", Level::L4_3, Some("proj"), Status::Active, 0.5, created, vec![]),
+        ],
+    );
+
+    // 公共库：1 条 L3，验证公共库不受重复项目挂载影响。
+    let general = unique_db_path("status_dedup_g");
+    {
+        let gdb = store::open(&general).expect("应能建公共库");
+        store::put_many(
+            &gdb,
+            &[make("g1", Level::L3, None, Status::Active, 0.5, created, vec![])],
+        )
+        .expect("put_many 应成功");
+        drop(gdb);
+    }
+
+    let proj_s = proj.to_string_lossy().to_string();
+    let general_s = general.to_string_lossy().to_string();
+    let scope_db_s = scope_db.to_string_lossy().to_string();
+    let now_s = now.to_string();
+
+    // 基线：只靠 cwd 锚定（不传 --project-db）。
+    let base = run_subcommand_raw(
+        "status",
+        &[
+            "--general-db",
+            &general_s,
+            "--workspace-root",
+            &proj_s,
+            "--now",
+            &now_s,
+        ],
+    );
+    assert!(
+        base.status.success(),
+        "status（仅锚定）应成功，stderr={}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+    let base_out = String::from_utf8(base.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        base_out.contains("active 总数：3"),
+        "仅锚定时 active 总数应为 3（公共 1 + 项目 2），实得：\n{base_out}"
+    );
+    assert!(
+        base_out.contains("[proj] L4.1:0 L4.2:1 L4.3:1"),
+        "仅锚定时项目层应各 1 条，实得：\n{base_out}"
+    );
+
+    // 重复挂载：额外把同一个作用域库当 --project-db 传进来——不应翻倍。
+    let dup = run_subcommand_raw(
+        "status",
+        &[
+            "--general-db",
+            &general_s,
+            "--workspace-root",
+            &proj_s,
+            "--project-db",
+            &format!("proj={scope_db_s}"),
+            "--now",
+            &now_s,
+        ],
+    );
+    assert!(
+        dup.status.success(),
+        "status（重复挂载同一库）应成功，stderr={}",
+        String::from_utf8_lossy(&dup.stderr)
+    );
+    let dup_out = String::from_utf8(dup.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        dup_out.contains("active 总数：3"),
+        "重复挂载同一库不应翻倍，active 总数应仍为 3，实得：\n{dup_out}"
+    );
+    assert!(
+        dup_out.contains("[proj] L4.1:0 L4.2:1 L4.3:1"),
+        "重复挂载同一库不应翻倍，项目层应仍各 1 条，实得：\n{dup_out}"
+    );
+    assert_eq!(
+        base_out, dup_out,
+        "显式重复挂载 cwd 已锚定的同一个库，概况应与仅锚定完全一致"
+    );
+
+    cleanup_file(&general);
+    let _ = std::fs::remove_dir_all(&proj);
+}
