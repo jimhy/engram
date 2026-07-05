@@ -1,7 +1,7 @@
 {
   "name": "engram",
   "displayName": "Engram Memory",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "仿人脑的分层长期记忆系统：会话开始注入记忆热索引、会话结束自动复盘巩固、按 .engram 锚点稳定定位当前项目。单 Rust 二进制、零外部依赖、零安装。",
   "author": { "name": "jimhyliu", "email": "jimhyliu@gmail.com" },
   "keywords": ["memory", "engram", "rust", "hooks", "recall"],
