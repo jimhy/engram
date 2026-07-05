@@ -180,12 +180,19 @@ jobs:
       # 需要一个跨仓库凭证 secrets.ADAPTER_DISPATCH_TOKEN（fine-grained PAT，
       # 对 jimhy/engram-codex 与 jimhy/engram-opencode 有 contents:write 权限）。
       # 默认 GITHUB_TOKEN 无法触发别的仓库的 repository_dispatch，故必须用 PAT。
-      # 未配置该 secret 时此步会失败，但不影响上游发版本身（已在 publish 完成）。
+      #
+      # 未配置该 secret 时**有意跳过**（视作「暂不级联」的正常状态，不拉红整体 run）：
+      # 上游发版本身已在 publish 完成，级联只是锦上添花。一旦补上 PAT 无需再改本
+      # workflow 即自动生效；而 token 已配置却 dispatch 真失败时，仍照常报错暴露问题。
       - name: Dispatch to adapter repos
         env:
           GH_TOKEN: ${{ secrets.ADAPTER_DISPATCH_TOKEN }}
         shell: bash
         run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::notice::ADAPTER_DISPATCH_TOKEN 未配置，跳过适配器仓库级联通知（非致命，上游发版已完成）"
+            exit 0
+          fi
           for repo in jimhy/engram-codex jimhy/engram-opencode; do
             echo "dispatching engram-release(${GITHUB_REF_NAME}) -> $repo"
             gh api "repos/$repo/dispatches" \
