@@ -13,6 +13,7 @@
     "./commands/render.md",
     "./commands/root.md",
     "./commands/statusline.md",
-    "./commands/kb.md"
+    "./commands/kb.md",
+    "./commands/web.md"
   ]
 }

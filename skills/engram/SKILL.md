@@ -197,5 +197,16 @@ engram gc --general-db G [--project-db n=p ...] [--dry-run]
 | `import --from-json-dir` | 从 JSON 目录导入（迁移/灌库用） |
 | `resolve --format json\|env` | 按 `.engram/` 锚点解析当前作用域（general/project 库路径 + name + kind），手动跑读写命令前先来一次 |
 | `root --project-dir D` | 把 D 设为项目管理目录（防嵌套 + 建 `.engram/workspace` 标记与管理库 + 写 L2 登记） |
+| `serve [--open] [--port N]` | 起本地网页看板，浏览**本机全部记忆**（公共库 + 扫描到的所有项目库）；见下「网页看板」 |
 
 > 检视任何库内容：先 `engram resolve --format json` 拿到库路径，再 `engram list --general-db G --project-db n=p --status all`
+
+### 网页看板（用户想在浏览器里看记忆时）
+
+当用户说「**我要在网页端/浏览器里看记忆**」「打开记忆看板」这类意图时，**在后台**起看板服务并让它自动开浏览器（`serve` 是常驻进程，务必后台运行、别阻塞会话）：
+
+```bash
+engram serve --open
+```
+
+它从 `.engram/` 锚点向上找项目管理目录 → 扫其下所有子项目库 + 公共库 → 起本地 HTTP（默认 `http://127.0.0.1:8765/`）→ 开浏览器。端口被占（已在跑）会幂等复用。起好后把地址告诉用户，并说明页面右上角有「停止服务」按钮。等价的 slash 命令是 `/engram web`。

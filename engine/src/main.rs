@@ -48,6 +48,7 @@ use engram::commands::{
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::model::{Level, Memory, Pointer, Status};
 use engram::render::{load_store_entries, render, render_scoped};
+use engram::serve::{self, ServeConfig};
 use engram::session::{self, Pending};
 use engram::store::{self, StoreError};
 use redb::Database;
@@ -477,6 +478,29 @@ enum Command {
         #[arg(long)]
         now: Option<f64>,
     },
+    /// 启动本地网页看板：从 `.engram/` 锚点扫描本机全部项目库 + 公共库，在浏览器里
+    /// 浏览全部记忆。默认只监听回环地址（127.0.0.1），不对外网开放。
+    Serve {
+        /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
+        #[arg(long)]
+        general_db: Option<PathBuf>,
+        /// 额外项目库映射 `name=path`，可重复；与自动发现的库合并去重。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 额外的项目管理目录（扫其管理库与直接子项目库），可重复；与从 cwd 自动
+        /// 锚定的管理目录合并。
+        #[arg(long = "scan-root")]
+        scan_root: Vec<PathBuf>,
+        /// 监听端口（缺省 8765）。
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// 监听主机（缺省 127.0.0.1，仅本机可访问）。
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 启动后自动用系统默认浏览器打开看板页面。
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 /// 取系统当前时间的 unix 秒（f64）。
@@ -596,8 +620,31 @@ impl DbSet {
     }
 }
 
-/// 程序主逻辑。返回进程退出码。
+/// 进程入口：把真正的分发逻辑放到一个**显式大栈**的工作线程上执行。
+///
+/// Windows 主线程默认栈仅约 1 MiB；本二进制的命令分发（`dispatch` 里那个覆盖全部
+/// 子命令的巨型 `match`）在 **debug 构建**下单个栈帧就接近该上限，极易栈溢出
+/// （release 优化后栈帧大幅收缩，无此问题）。集成测试直接 spawn 的正是 debug 二进制，
+/// 故用一个 16 MiB 栈的工作线程承载逻辑，与优化级别无关地保证稳定，也为后续继续新增
+/// 子命令留足余量。
 fn main() -> ExitCode {
+    match std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(dispatch)
+    {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!("engram 工作线程异常终止");
+            ExitCode::FAILURE
+        }),
+        Err(e) => {
+            eprintln!("engram 启动工作线程失败：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 程序主逻辑（跑在 [`main`] 起的大栈工作线程上）。返回进程退出码。
+fn dispatch() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Render {
@@ -844,6 +891,21 @@ fn main() -> ExitCode {
             importance,
             new_id: new_id.as_deref(),
             now,
+        }),
+        Command::Serve {
+            general_db,
+            project_db,
+            scan_root,
+            port,
+            host,
+            open,
+        } => run_serve(ServeCliArgs {
+            general_db: general_db.as_deref(),
+            project_db: &project_db,
+            scan_root: &scan_root,
+            port,
+            host,
+            open,
         }),
     }
 }
@@ -2104,6 +2166,82 @@ fn render_status_full(memories: &[Memory], now: f64) -> String {
 ///
 /// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。作用域库 / 各项目库缺失时静默跳过
 /// （只读概况，库尚未创建时算作 0 条，不应报错）。
+/// `serve` 子命令的 CLI 参数（聚成结构体，规避过多形参）。
+struct ServeCliArgs<'a> {
+    general_db: Option<&'a Path>,
+    project_db: &'a [String],
+    scan_root: &'a [PathBuf],
+    port: u16,
+    host: String,
+    open: bool,
+}
+
+/// 从 `cwd` 向上收集所有「项目管理目录」（带 `.engram/workspace` 标记）的祖先路径。
+///
+/// 看板据此扫描各管理目录的直接子项目库，配合注册表累积，实现"本机全部项目库"的发现。
+fn collect_workspace_ancestors(cwd: &Path) -> Vec<PathBuf> {
+    let canon = canonicalize_cwd(cwd);
+    let mut roots = Vec::new();
+    for anc in canon.ancestors() {
+        if anc.join(ENGRAM_DIR).join(WORKSPACE_MARKER).is_file() {
+            roots.push(anc.to_path_buf());
+        }
+    }
+    roots
+}
+
+/// 执行 `serve` 子命令：锚定作用域 → 组装 [`ServeConfig`] → 起看板服务（阻塞在监听循环）。
+///
+/// 发现范围 = 公共库 + cwd 之上各项目管理目录的子项目库 + 注册表累积项 +
+/// `--project-db`/`--scan-root` 显式项 + 当前作用域库（兜底独立项目）。
+fn run_serve(args: ServeCliArgs<'_>) -> ExitCode {
+    let Some(extra_map) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("serve 失败：获取当前工作目录失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 锚定作用域：拿公共库路径 + 当前作用域库（供发现兜底当前项目/管理目录）。
+    let (general_db, scope) = match resolve_scope(&cwd, args.general_db) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("serve 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 扫描根：cwd 之上所有管理目录 + 显式 --scan-root（最终去重由 serve 侧按路径完成）。
+    let mut scan_roots = collect_workspace_ancestors(&cwd);
+    scan_roots.extend(args.scan_root.iter().cloned());
+
+    // 额外库：--project-db 显式项 + 当前作用域库（覆盖不在任何管理目录下的独立项目）。
+    let mut extra_project_dbs: Vec<(String, PathBuf)> = extra_map.into_iter().collect();
+    extra_project_dbs.push((scope.name.clone(), scope.db.clone()));
+
+    let cfg = ServeConfig {
+        host: args.host,
+        port: args.port,
+        general_db,
+        scan_roots,
+        extra_project_dbs,
+        open: args.open,
+    };
+
+    match serve::run(cfg) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve 失败：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_status(args: StatusArgs<'_>) -> ExitCode {
     let format = match parse_status_format(args.format) {
         Ok(f) => f,
