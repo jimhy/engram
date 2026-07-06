@@ -2518,13 +2518,51 @@ fn forget_with_missing_id_reports_and_exits_zero() {
 // hook 辅助命令：resolve / session-start 的集成测试
 // ============================================================================
 
-/// 在系统临时目录下构造一个进程内唯一的**空**项目目录，返回其路径（已创建）。
+/// 供「作用域锚定类」测试用的**共享沙箱根**：在系统临时目录下建一个带
+/// `.engram/workspace` 标记的目录，作为祖先遍历的**锚点天花板**。
+///
+/// 背景：`resolve_scope` 从传入路径向上遍历文件系统找 `.engram/` 锚点。系统临时目录
+/// 在某些平台（如 Windows 的 `%LOCALAPPDATA%\Temp`）恰好位于用户主目录之下；真机的
+/// 主目录常有真实的 `~/.engram/engram.redb`，遍历便会越过测试临时目录、锚定到真实库，
+/// 污染 resolve / status / session-start 的结果（CI 的 `/tmp` 不在主目录下故无此问题）。
+/// 让所有作用域测试目录都落在本沙箱之下，遍历就止于沙箱（workspace 天花板），与干净
+/// 环境行为一致、绝不触达真实主目录。
+///
+/// 沙箱下的具体测试目录（作为 workspace 的直接子目录）解析出的作用域仍是
+/// `kind=project`、名为该子目录名、库为 `<子目录>/.engram/engram.redb`——与「空目录即
+/// 独立项目」的可观察契约逐位一致。
+fn scope_sandbox_root() -> &'static Path {
+    static SANDBOX: OnceLock<PathBuf> = OnceLock::new();
+    SANDBOX.get_or_init(|| {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("engram_it_scope_sandbox_{}", std::process::id()));
+        let marker = dir.join(".engram").join("workspace");
+        std::fs::create_dir_all(marker.parent().expect("marker 应有父目录"))
+            .expect("应能创建作用域沙箱的 .engram 目录");
+        std::fs::write(&marker, "engram-workspace v1 test-sandbox")
+            .expect("应能写作用域沙箱 workspace 标记");
+        dir
+    })
+}
+
+/// 在**作用域沙箱**下构造一个进程内唯一的**空**项目目录，返回其路径（已创建）。
+///
+/// 目录是沙箱（workspace）的直接子目录，故 `resolve` 得到 `kind=project`、名为本目录名，
+/// 且向上遍历止于沙箱、不会触达真实 `~/.engram`（见 [`scope_sandbox_root`]）。
 fn unique_project_dir(tag: &str) -> PathBuf {
-    let mut dir = std::env::temp_dir();
     let pid = std::process::id();
-    dir.push(format!("engram_it_proj_{tag}_{pid}_{}", unique_suffix()));
+    let dir = scope_sandbox_root().join(format!("engram_it_proj_{tag}_{pid}_{}", unique_suffix()));
     std::fs::create_dir_all(&dir).expect("应能创建临时项目目录");
     dir
+}
+
+/// 返回作用域沙箱下一个进程内唯一、**尚不存在**的路径（不创建）。
+///
+/// 供需要「一个不存在的 workspace-root」的测试用：既让向上遍历止于沙箱天花板（不触达
+/// 真实 `~/.engram`），又保证该作用域库不存在、不会被 status 等命令加载而污染计数。
+fn nonexistent_scoped_root(tag: &str) -> PathBuf {
+    let pid = std::process::id();
+    scope_sandbox_root().join(format!("engram_it_{tag}_{pid}_{}", unique_suffix()))
 }
 
 // 23. resolve --format env：输出四行 ENGRAM_*（含 ENGRAM_SCOPE_KIND）且路径正确。
@@ -3654,7 +3692,8 @@ fn status_oneline_counts_across_dbs() {
     let pb_path = seed_db("status_one_pb", &pb_mems);
     let g = general_path.to_string_lossy().to_string();
     // 给一个不存在的 workspace-root，使根 L4 库不会被加载（避免污染计数）。
-    let bogus_ws = unique_db_path("status_one_ws_nonexist");
+    // 用沙箱下的路径：向上遍历止于沙箱天花板，不会锚定到真实 ~/.engram（见 scope_sandbox_root）。
+    let bogus_ws = nonexistent_scoped_root("status_one_ws_nonexist");
     let bogus_ws_str = bogus_ws.to_string_lossy().to_string();
     let pa_kv = format!("alpha={}", pa_path.display());
     let pb_kv = format!("beta={}", pb_path.display());
@@ -3749,7 +3788,8 @@ fn status_full_shows_breakdown_fields() {
     let general_path = seed_db("status_full_g", &gmems);
     let p_path = seed_db("status_full_p", &p_mems);
     let g = general_path.to_string_lossy().to_string();
-    let bogus_ws = unique_db_path("status_full_ws_nonexist");
+    // 沙箱下的不存在路径：向上遍历止于沙箱天花板，不会锚定到真实 ~/.engram（见 scope_sandbox_root）。
+    let bogus_ws = nonexistent_scoped_root("status_full_ws_nonexist");
     let bogus_ws_str = bogus_ws.to_string_lossy().to_string();
     let p_kv = format!("engram={}", p_path.display());
 
