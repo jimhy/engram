@@ -83,6 +83,15 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # 缓存 cargo registry + kb/target：lancedb/datafusion/ort 全栈冷编约 40 分钟，
+      # 依赖（Cargo.lock）不变时命中缓存可降到几分钟——kb 依赖稳定、极适合缓存。
+      # key 带 matrix.target 隔离各平台，避免不同 target 争用同一缓存；cache-on-failure
+      # 让偶发失败的 run 也留下缓存供下次续用（本仓库发版历史上确有过失败重试）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kb
+          key: ${{ matrix.target }}
+          cache-on-failure: true
       - name: Build kb
         working-directory: kb
         # --locked：严格按已提交的 Cargo.lock 解析，防止 CI 依赖漂移出已验证版本。
