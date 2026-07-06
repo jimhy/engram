@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Engram 记忆看板</title>
+<title>Engram 看板</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
 <style>
   :root{
@@ -14,42 +14,69 @@
     --accent:#6366f1; --danger:#ef4444;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--fg);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
     font-size:14px;line-height:1.5}
+  body{display:flex;flex-direction:column}
   code,.mono{font-family:"Cascadia Code",Consolas,"SF Mono",Menlo,monospace}
   a{color:var(--l3);text-decoration:none}
-  header{position:sticky;top:0;z-index:20;background:linear-gradient(180deg,#12141a,#12141aee);
-    border-bottom:1px solid var(--line);padding:14px 20px;backdrop-filter:blur(6px)}
+
+  header{flex-shrink:0;background:linear-gradient(180deg,#12141a,#12141aee);
+    border-bottom:1px solid var(--line);padding:12px 20px}
   .titlerow{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.3px}
+  h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.3px;white-space:nowrap}
   h1 .spark{color:var(--accent)}
   .meta{color:var(--dim);font-size:12px}
   .grow{flex:1}
+
+  .tabs{display:flex;gap:6px}
+  .tab{cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--dim);
+    padding:6px 14px;border-radius:8px;font-size:13px;font-weight:600;transition:.12s}
+  .tab:hover{border-color:var(--accent);color:var(--fg)}
+  .tab.on{color:var(--fg);border-color:var(--accent);background:#20233a}
+
   button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--fg);
     padding:6px 12px;border-radius:8px;font-size:13px;transition:.12s}
   button:hover{border-color:var(--accent)}
   button.danger{border-color:#5b2626;background:#241417;color:#fca5a5}
   button.danger:hover{border-color:var(--danger);background:#2e1518}
-  .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
   input[type=search],select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
     border-radius:8px;padding:6px 10px;font-size:13px}
-  input[type=search]{min-width:240px;flex:1}
+  input[type=search]{min-width:220px;flex:1}
   .chips{display:flex;gap:6px;flex-wrap:wrap}
   .chip{user-select:none;cursor:pointer;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
     background:var(--panel);font-size:12px;color:var(--dim)}
   .chip.on{color:var(--fg);border-color:var(--accent);background:#20233a}
-  .dbbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-  .dbcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px 12px;font-size:12px}
-  .dbcard b{font-size:15px}
-  .dbcard .k{color:var(--dim2);text-transform:uppercase;font-size:10px;letter-spacing:.5px}
-  main{padding:16px 20px 80px;max-width:1400px;margin:0 auto}
+
+  /* 两栏视图：左侧栏 + 右侧内容区，各自独立滚动 */
+  .view{flex:1;display:flex;min-height:0}
+  .view[hidden]{display:none}
+  .sidebar{width:288px;flex-shrink:0;border-right:1px solid var(--line);
+    overflow:auto;padding:14px 12px;background:#12141a}
+  .content{flex:1;overflow:auto;padding:16px 22px 80px;min-width:0}
+
+  /* 左侧栏：库列表 */
+  .sbgroup{margin-bottom:18px}
+  .sbtitle{color:var(--dim2);text-transform:uppercase;font-size:10px;letter-spacing:.6px;
+    margin:0 4px 8px;font-weight:700}
+  .dbitem{display:flex;align-items:center;gap:8px;cursor:pointer;padding:7px 10px;border-radius:8px;
+    border:1px solid transparent;margin-bottom:3px;transition:.1s}
+  .dbitem:hover{background:var(--panel)}
+  .dbitem.on{background:#20233a;border-color:var(--accent)}
+  .dbitem .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dbitem .ct{color:var(--dim);font-size:12px;background:var(--panel2);border-radius:999px;
+    padding:1px 8px;min-width:26px;text-align:center}
+  .dbitem .dot{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+  .dot-general{background:var(--l1)} .dot-workspace{background:var(--l2)} .dot-project{background:var(--l4)}
+
+  /* 记忆表格 */
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;
+    position:sticky;top:-16px;background:var(--bg);padding:14px 0 10px;z-index:5;border-bottom:1px solid var(--line)}
   .group{margin-bottom:26px}
   .ghead{display:flex;align-items:baseline;gap:10px;margin:0 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
   .ghead h2{font-size:15px;margin:0;font-weight:600}
   .ghead .count{color:var(--dim);font-size:12px}
-  .lvlblock{margin:8px 0 14px}
-  .lvlhead{color:var(--dim);font-size:12px;margin:6px 0;letter-spacing:.3px}
+  .lvlhead{color:var(--dim);font-size:12px;letter-spacing:.3px}
   table{width:100%;border-collapse:collapse}
   tr.m{border-bottom:1px solid #1c2029}
   tr.m:hover{background:#151922}
@@ -69,7 +96,36 @@
   .ptr .pk{color:var(--dim2)}
   .id{color:var(--dim2);font-size:11px}
   .eff-inf{color:var(--l1)}
-  .empty{color:var(--dim);text-align:center;padding:60px 0}
+  .empty{color:var(--dim);text-align:center;padding:60px 20px}
+  .empty code{background:var(--panel2);padding:1px 6px;border-radius:5px}
+
+  /* 知识库树 */
+  .tree details{margin:1px 0}
+  .tree summary{cursor:pointer;padding:4px 6px;border-radius:6px;list-style:none;
+    display:flex;align-items:center;gap:6px;color:var(--dim);user-select:none}
+  .tree summary::-webkit-details-marker{display:none}
+  .tree summary::before{content:"▸";color:var(--dim2);font-size:10px;transition:.1s;width:10px;display:inline-block}
+  .tree details[open]>summary::before{transform:rotate(90deg)}
+  .tree summary:hover{background:var(--panel);color:var(--fg)}
+  .tree .kbroot>summary{color:var(--fg);font-weight:600}
+  .tree .kbroot>summary .dot{width:8px;height:8px;border-radius:2px}
+  .tree .children{margin-left:14px;border-left:1px solid var(--line);padding-left:6px}
+  .tree .file{cursor:pointer;padding:4px 6px 4px 22px;border-radius:6px;color:var(--dim);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid transparent}
+  .tree .file:hover{background:var(--panel);color:var(--fg)}
+  .tree .file.on{background:#20233a;border-color:var(--accent);color:var(--fg)}
+  .tree .file .fchunks{color:var(--dim2);font-size:11px;margin-left:6px}
+
+  /* 知识库右侧原文 */
+  .dochead{margin:0 0 16px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+  .dochead h2{font-size:16px;margin:0 0 4px;font-weight:600;word-break:break-all}
+  .dochead .sub{color:var(--dim);font-size:12px}
+  .chunk{border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden;background:var(--panel)}
+  .chunk .crumb{background:var(--panel2);border-bottom:1px solid var(--line);padding:7px 12px;
+    color:var(--l3);font-size:12px;font-weight:600}
+  .chunk .body{padding:12px 14px;white-space:pre-wrap;word-break:break-word;color:var(--fg);font-size:13.5px;line-height:1.7}
+  .chunk .cmeta{padding:5px 12px;color:var(--dim2);font-size:11px;border-top:1px solid var(--line)}
+
   .foot{color:var(--dim2);font-size:11px;text-align:center;margin-top:30px}
   #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#20233a;
     border:1px solid var(--accent);color:var(--fg);padding:10px 18px;border-radius:10px;
@@ -80,34 +136,59 @@
 <body>
 <header>
   <div class="titlerow">
-    <h1><span class="spark">◈</span> Engram 记忆看板</h1>
+    <h1><span class="spark">◈</span> Engram</h1>
+    <nav class="tabs">
+      <button class="tab on" data-tab="mem">🧠 记忆看板</button>
+      <button class="tab" data-tab="kb">📚 知识库看板</button>
+    </nav>
     <span class="meta" id="summary">加载中…</span>
     <span class="grow"></span>
     <label class="chip" id="autochip"><input type="checkbox" id="auto" style="vertical-align:-1px"> 自动刷新</label>
     <button id="refresh">刷新</button>
     <button class="danger" id="stop">停止服务</button>
   </div>
-  <div class="controls">
-    <input type="search" id="q" placeholder="搜索 cue / id / 标签 / 指针…">
-    <div class="chips" id="levels"></div>
-    <div class="chips" id="statuses"></div>
-    <select id="project"><option value="">全部范围</option></select>
-  </div>
-  <div class="dbbar" id="dbbar"></div>
 </header>
-<main id="main"><div class="empty">加载中…</div></main>
+
+<!-- ========== 记忆看板 ========== -->
+<div class="view" id="view-mem">
+  <aside class="sidebar" id="mem-sidebar"><div class="empty">加载中…</div></aside>
+  <main class="content" id="mem-content">
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="搜索 cue / id / 标签 / 指针…">
+      <div class="chips" id="levels"></div>
+      <div class="chips" id="statuses"></div>
+    </div>
+    <div id="mem-main"></div>
+  </main>
+</div>
+
+<!-- ========== 知识库看板 ========== -->
+<div class="view" id="view-kb" hidden>
+  <aside class="sidebar" id="kb-sidebar"><div class="empty">加载中…</div></aside>
+  <main class="content" id="kb-content">
+    <div class="empty">← 从左侧选一个文档查看原文。</div>
+  </main>
+</div>
+
 <div id="toast"></div>
 
 <script>
 const LEVELS = ["L1","L2","L3","L4.1","L4.2","L4.3"];
 const STATUSES = ["active","cold","superseded","tombstone"];
 const STATUS_LABEL = {active:"活跃",cold:"冷藏",superseded:"被取代",tombstone:"墓碑"};
+const KIND_LABEL = {general:"公共库",workspace:"管理库",project:"项目库"};
+const GENERAL_KEY = "__general__";
+
 const state = {
-  data:null,
+  tab:"mem",
+  mem:null,          // /api/memories
+  kb:null,           // /api/kb
+  kbLoaded:false,
   q:"",
   levels:new Set(LEVELS),
   statuses:new Set(["active"]),   // 默认只看活跃，减少噪声
-  project:"",
+  memDb:"",          // 选中的记忆库 groupKey（"" = 全部）
+  kbSel:null,        // {db, doc, scope} 选中的知识库文档
   timer:null,
 };
 
@@ -123,39 +204,92 @@ function fmtTime(t){
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function lvlClass(l){return "b-"+l.replace(/\./g,"-");}
+function groupKey(m){ return m.project==null ? GENERAL_KEY : m.project; }
 
+function toast(msg){
+  const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"),2200);
+}
+
+/* ---------- Tab 切换 ---------- */
+function switchTab(tab){
+  state.tab=tab;
+  document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("on",b.dataset.tab===tab));
+  document.getElementById("view-mem").hidden = tab!=="mem";
+  document.getElementById("view-kb").hidden  = tab!=="kb";
+  if(tab==="kb" && !state.kbLoaded){ loadKb(); }
+}
+
+/* ---------- 记忆看板 ---------- */
 function buildChips(){
-  const lv=document.getElementById("levels");
-  lv.innerHTML="";
+  const lv=document.getElementById("levels"); lv.innerHTML="";
   LEVELS.forEach(l=>{
     const c=document.createElement("span");
     c.className="chip"+(state.levels.has(l)?" on":"");
     c.textContent=l;
-    c.onclick=()=>{state.levels.has(l)?state.levels.delete(l):state.levels.add(l);render();};
+    c.onclick=()=>{state.levels.has(l)?state.levels.delete(l):state.levels.add(l);renderMem();};
     lv.appendChild(c);
   });
-  const st=document.getElementById("statuses");
-  st.innerHTML="";
+  const st=document.getElementById("statuses"); st.innerHTML="";
   STATUSES.forEach(s=>{
     const c=document.createElement("span");
     c.className="chip"+(state.statuses.has(s)?" on":"");
     c.textContent=STATUS_LABEL[s];
-    c.onclick=()=>{state.statuses.has(s)?state.statuses.delete(s):state.statuses.add(s);render();};
+    c.onclick=()=>{state.statuses.has(s)?state.statuses.delete(s):state.statuses.add(s);renderMem();};
     st.appendChild(c);
   });
 }
 
-function groupKey(m){ return m.project==null ? "__general__" : m.project; }
+// 左侧栏：库列表（全部 + 通用 + 各项目库）
+function renderMemSidebar(){
+  const d=state.mem; const sb=document.getElementById("mem-sidebar");
+  if(!d){ return; }
+  // 每个 groupKey 的记忆总数（用全量，不受当前筛选影响，作库规模指示）
+  const counts={};
+  d.memories.forEach(m=>{ const k=groupKey(m); counts[k]=(counts[k]||0)+1; });
 
-function render(){
-  const d=state.data;
-  if(!d){return;}
-  const main=document.getElementById("main");
+  const dbByName={}; (d.dbs||[]).forEach(x=>dbByName[x.name]=x);
+  // 把发现到的库映射成 {key, name, kind, count}
+  const rows=(d.dbs||[]).map(x=>{
+    const key = x.kind==="general" ? GENERAL_KEY : x.name;
+    return {key, name:x.kind==="general"?"通用（公共库）":x.name, kind:x.kind, count:counts[key]||x.count||0};
+  });
+  const generals=rows.filter(r=>r.kind==="general");
+  const projects=rows.filter(r=>r.kind!=="general").sort((a,b)=>a.name.localeCompare(b.name));
+  const total=d.memories.length;
+
+  let html="";
+  const item=(key,label,kind,count)=>
+    `<div class="dbitem${state.memDb===key?' on':''}" data-key="${esc(key)}">`+
+    `<span class="dot dot-${kind}"></span><span class="nm">${esc(label)}</span>`+
+    `<span class="ct">${count}</span></div>`;
+
+  html+=`<div class="sbgroup">`+
+    `<div class="dbitem${state.memDb===''?' on':''}" data-key="">`+
+    `<span class="dot" style="background:var(--accent)"></span><span class="nm">全部范围</span>`+
+    `<span class="ct">${total}</span></div></div>`;
+  if(generals.length){
+    html+=`<div class="sbgroup"><div class="sbtitle">通用</div>`+
+      generals.map(r=>item(r.key,r.name,r.kind,r.count)).join("")+`</div>`;
+  }
+  if(projects.length){
+    html+=`<div class="sbgroup"><div class="sbtitle">项目（${projects.length}）</div>`+
+      projects.map(r=>item(r.key,r.name,r.kind,r.count)).join("")+`</div>`;
+  }
+  sb.innerHTML=html;
+  sb.querySelectorAll(".dbitem").forEach(el=>{
+    el.onclick=()=>{ state.memDb=el.dataset.key; renderMemSidebar(); renderMem(); };
+  });
+}
+
+function renderMem(){
+  const d=state.mem; if(!d) return;
+  const main=document.getElementById("mem-main");
   const q=state.q.trim().toLowerCase();
   const rows=d.memories.filter(m=>{
     if(!state.levels.has(m.level)) return false;
     if(!state.statuses.has(m.status)) return false;
-    if(state.project && groupKey(m)!==state.project) return false;
+    if(state.memDb && groupKey(m)!==state.memDb) return false;
     if(q){
       const hay=(m.cue+" "+m.id+" "+(m.tags||[]).join(" ")+" "+
         (m.pointer?(m.pointer.reference||"")+" "+(m.pointer.detail||""):"")).toLowerCase();
@@ -164,22 +298,20 @@ function render(){
     return true;
   });
 
-  // 分组：先通用，再各项目（按名字）
   const groups={};
   rows.forEach(m=>{ (groups[groupKey(m)] ||= []).push(m); });
   const order=Object.keys(groups).sort((a,b)=>{
-    if(a==="__general__") return -1; if(b==="__general__") return 1;
+    if(a===GENERAL_KEY) return -1; if(b===GENERAL_KEY) return 1;
     return a.localeCompare(b);
   });
-
   if(order.length===0){ main.innerHTML='<div class="empty">没有符合当前筛选的记忆。</div>'; return; }
 
   const dbByName={}; (d.dbs||[]).forEach(x=>dbByName[x.name]=x);
   let html="";
   for(const g of order){
     const list=groups[g];
-    const label = g==="__general__" ? "通用记忆（公共库 L1–L3）" : g;
-    const kind = g==="__general__" ? "" : ((dbByName[g]&&dbByName[g].kind==="workspace")?" · 项目管理目录":" · 项目库");
+    const label = g===GENERAL_KEY ? "通用记忆（公共库 L1–L3）" : g;
+    const kind = g===GENERAL_KEY ? "" : ((dbByName[g]&&dbByName[g].kind==="workspace")?" · 项目管理目录":" · 项目库");
     list.sort((a,b)=>{
       const li=LEVELS.indexOf(a.level)-LEVELS.indexOf(b.level);
       if(li!==0) return li;
@@ -213,67 +345,161 @@ function render(){
   main.innerHTML=html;
 }
 
-function renderMeta(){
-  const d=state.data; if(!d) return;
-  const total=d.memories.length;
-  const active=d.memories.filter(m=>m.status==="active").length;
-  document.getElementById("summary").innerHTML=
-    `共 <b>${total}</b> 条 · 活跃 ${active} · ${d.dbs.length} 个库 · 更新于 ${fmtTime(d.generated_at)}`;
-  // 库汇总条
-  const bar=document.getElementById("dbbar"); bar.innerHTML="";
-  d.dbs.forEach(x=>{
-    const el=document.createElement("div"); el.className="dbcard";
-    const kindLabel={general:"公共库",workspace:"管理库",project:"项目库"}[x.kind]||x.kind;
-    el.innerHTML=`<span class="k">${esc(kindLabel)}</span><br><b>${x.count}</b> · ${esc(x.name)}`;
-    bar.appendChild(el);
-  });
-  // 项目下拉
-  const sel=document.getElementById("project");
-  const cur=state.project;
-  const names=[...new Set(d.memories.map(groupKey))].sort((a,b)=>{
-    if(a==="__general__")return -1; if(b==="__general__")return 1; return a.localeCompare(b);
-  });
-  sel.innerHTML='<option value="">全部范围</option>'+names.map(n=>{
-    const label=n==="__general__"?"通用（公共库）":n;
-    return `<option value="${esc(n)}"${n===cur?" selected":""}>${esc(label)}</option>`;
-  }).join("");
+function renderSummary(){
+  const el=document.getElementById("summary");
+  if(state.tab==="mem"){
+    const d=state.mem; if(!d){ el.textContent="加载中…"; return; }
+    const total=d.memories.length;
+    const active=d.memories.filter(m=>m.status==="active").length;
+    el.innerHTML=`共 <b>${total}</b> 条记忆 · 活跃 ${active} · ${d.dbs.length} 个库 · 更新于 ${fmtTime(d.generated_at)}`;
+  }else{
+    const d=state.kb; if(!d){ el.textContent="加载中…"; return; }
+    if(!d.kb_bin_found){ el.textContent="知识库组件未安装"; return; }
+    const nkb=d.kbs.length;
+    let docs=0, chunks=0;
+    d.kbs.forEach(k=>{ const dd=k.docs||{}; docs+=Object.keys(dd).length; Object.values(dd).forEach(e=>chunks+=(e.chunks||0)); });
+    el.innerHTML=`<b>${nkb}</b> 个知识库 · ${docs} 篇文档 · ${chunks} 个 chunk`;
+  }
 }
 
-function toast(msg){
-  const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
-  setTimeout(()=>t.classList.remove("show"),2200);
+/* ---------- 知识库看板 ---------- */
+// 把 {doc_path: entry} 建成目录树
+function buildDocTree(docs){
+  const root={dirs:{},files:[]};
+  Object.keys(docs).sort().forEach(path=>{
+    const parts=path.split("/");
+    let node=root;
+    for(let i=0;i<parts.length-1;i++){
+      node.dirs[parts[i]] ||= {dirs:{},files:[]};
+      node=node.dirs[parts[i]];
+    }
+    node.files.push({name:parts[parts.length-1], path, entry:docs[path]});
+  });
+  return root;
 }
 
-async function load(){
+function renderTreeNode(node, kb){
+  let html="";
+  Object.keys(node.dirs).sort().forEach(name=>{
+    html+=`<details open><summary>${esc(name)}</summary><div class="children">`+
+      renderTreeNode(node.dirs[name], kb)+`</div></details>`;
+  });
+  node.files.forEach(f=>{
+    const on = state.kbSel && state.kbSel.db===kb.db_dir && state.kbSel.doc===f.path;
+    html+=`<div class="file${on?' on':''}" data-db="${esc(kb.db_dir)}" data-doc="${esc(f.path)}" data-scope="${esc(kb.scope)}" title="${esc(f.path)}">`+
+      `${esc(f.name)}<span class="fchunks">${f.entry.chunks||0} chunk</span></div>`;
+  });
+  return html;
+}
+
+function renderKbSidebar(){
+  const d=state.kb; const sb=document.getElementById("kb-sidebar");
+  if(!d){ return; }
+  if(!d.kb_bin_found){
+    sb.innerHTML='<div class="empty">知识库组件未安装。<br>在会话里用 <code>/engram:engram-kb</code> 安装后即可。</div>';
+    return;
+  }
+  const withDocs=d.kbs.filter(k=>Object.keys(k.docs||{}).length>0);
+  if(withDocs.length===0){
+    sb.innerHTML='<div class="empty">还没有任何知识库内容。<br>把文档交给我、用 <code>/engram:engram-kb</code> 入库。</div>';
+    return;
+  }
+  let html='<div class="tree">';
+  withDocs.forEach((kb,i)=>{
+    const tree=buildDocTree(kb.docs);
+    const ndoc=Object.keys(kb.docs).length;
+    html+=`<details class="kbroot" ${i===0?'open':''}><summary>`+
+      `<span class="dot dot-${kb.kind}"></span>${esc(kb.scope)}`+
+      `<span class="fchunks">${ndoc} 篇</span></summary>`+
+      `<div class="children">`+renderTreeNode(tree, kb)+`</div></details>`;
+  });
+  html+='</div>';
+  sb.innerHTML=html;
+  sb.querySelectorAll(".file").forEach(el=>{
+    el.onclick=()=>{
+      state.kbSel={db:el.dataset.db, doc:el.dataset.doc, scope:el.dataset.scope};
+      renderKbSidebar();
+      loadKbDoc();
+    };
+  });
+}
+
+async function loadKbDoc(){
+  const sel=state.kbSel; if(!sel) return;
+  const c=document.getElementById("kb-content");
+  c.innerHTML='<div class="empty">加载文档原文…</div>';
+  try{
+    const url="/api/kb/doc?db="+encodeURIComponent(sel.db)+"&doc="+encodeURIComponent(sel.doc);
+    const r=await fetch(url,{cache:"no-store"});
+    if(!r.ok){ throw new Error(await r.text()||("HTTP "+r.status)); }
+    const data=await r.json();
+    const chunks=data.chunks||[];
+    let html=`<div class="dochead"><h2>${esc(sel.doc)}</h2>`+
+      `<div class="sub">${esc(sel.scope)} · ${chunks.length} 个 chunk</div></div>`;
+    if(chunks.length===0){
+      html+='<div class="empty">该文档没有 chunk（可能已被移除，刷新看板试试）。</div>';
+    }else{
+      chunks.forEach(ch=>{
+        const crumb=ch.breadcrumb?`<div class="crumb">${esc(ch.breadcrumb)}</div>`:"";
+        html+=`<div class="chunk">${crumb}<div class="body">${esc(ch.text)}</div>`+
+          `<div class="cmeta mono">${esc(ch.id)}</div></div>`;
+      });
+    }
+    c.innerHTML=html;
+    c.scrollTop=0;
+  }catch(e){
+    c.innerHTML=`<div class="empty">读取原文失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function loadKb(){
+  const sb=document.getElementById("kb-sidebar");
+  sb.innerHTML='<div class="empty">加载中…</div>';
+  try{
+    const r=await fetch("/api/kb",{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    state.kb=await r.json();
+    state.kbLoaded=true;
+    renderKbSidebar(); renderSummary();
+  }catch(e){
+    sb.innerHTML=`<div class="empty">读取知识库失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* ---------- 记忆数据加载 ---------- */
+async function loadMem(){
   try{
     const r=await fetch("/api/memories",{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
-    state.data=await r.json();
-    renderMeta(); render();
+    state.mem=await r.json();
+    renderMemSidebar(); renderMem(); renderSummary();
   }catch(e){
-    document.getElementById("main").innerHTML=
+    document.getElementById("mem-main").innerHTML=
       `<div class="empty">读取失败：${esc(e.message)}<br>服务可能已停止。</div>`;
   }
 }
 
-document.getElementById("refresh").onclick=()=>{load();toast("已刷新");};
-document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value;render();});
-document.getElementById("project").addEventListener("change",e=>{state.project=e.target.value;render();});
+/* ---------- 事件绑定 ---------- */
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{switchTab(b.dataset.tab);renderSummary();});
+document.getElementById("refresh").onclick=()=>{
+  if(state.tab==="mem"){ loadMem(); } else { loadKb(); if(state.kbSel) loadKbDoc(); }
+  toast("已刷新");
+};
+document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value;renderMem();});
 document.getElementById("auto").addEventListener("change",e=>{
-  if(e.target.checked){state.timer=setInterval(load,10000);toast("每 10 秒自动刷新");}
+  if(e.target.checked){state.timer=setInterval(()=>{ if(state.tab==="mem") loadMem(); },10000);toast("每 10 秒自动刷新记忆");}
   else{clearInterval(state.timer);state.timer=null;}
 });
 document.getElementById("stop").onclick=async()=>{
-  try{
-    await fetch("/shutdown",{method:"POST"});
-  }catch(e){/* 连接被切断属正常 */}
-  document.getElementById("main").innerHTML='<div class="empty">服务已停止，可关闭本页。</div>';
+  try{ await fetch("/shutdown",{method:"POST"}); }catch(e){/* 连接被切断属正常 */}
+  document.getElementById("mem-main").innerHTML='<div class="empty">服务已停止，可关闭本页。</div>';
+  document.getElementById("kb-content").innerHTML='<div class="empty">服务已停止，可关闭本页。</div>';
   document.getElementById("summary").textContent="服务已停止";
   toast("服务已停止");
 };
 
 buildChips();
-load();
+loadMem();
 </script>
 </body>
 </html>

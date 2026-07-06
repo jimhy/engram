@@ -21,7 +21,7 @@ set -e
 REPO="jimhy/engram"
 # 本插件期望的 sidecar 版本：发 kb 新版时，把此处与 kb/Cargo.toml 的 version 一起 bump。
 # check-only 时拿本地 `engram-kb --version` 与之比对，旧了就报 KB_OUTDATED 让 AI 提示升级。
-KB_WANT_VERSION="0.2.0"
+KB_WANT_VERSION="0.3.0"
 SIZE_HINT="约 60-80MB（另：首次入库/检索时还会自动下载嵌入模型约 95MB）"
 
 case "$(uname -s)" in

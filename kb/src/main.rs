@@ -44,6 +44,9 @@ enum Command {
         /// 知识库目录；缺省从 cwd 向上锚定 `.engram/` 取 `<锚点>/.engram/kb/`。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 入库到用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
         /// 要入库的文件或目录（目录递归遍历），可给多个。
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -62,6 +65,9 @@ enum Command {
         /// 知识库目录；缺省同 ingest 的锚定规则。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 使用用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
         /// 查询文本（编码时自动加 BGE 官方指令前缀）。
         #[arg(long)]
         query: String,
@@ -80,6 +86,9 @@ enum Command {
         /// 知识库目录；缺省同 ingest 的锚定规则。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 使用用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
         /// 以单行 JSON 输出（默认输出可读文本）。
         #[arg(long)]
         json: bool,
@@ -89,6 +98,9 @@ enum Command {
         /// 知识库目录；缺省同 ingest 的锚定规则。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 使用用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
         /// 要删除的文档路径（须与 `list` 列出的 doc_path 完全一致）。
         #[arg(long)]
         doc: String,
@@ -101,6 +113,26 @@ enum Command {
         /// 知识库目录；缺省同 ingest 的锚定规则。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 使用用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
+        /// 以单行 JSON 输出（默认输出可读文本）。
+        #[arg(long)]
+        json: bool,
+    },
+    /// 导出某文档的全部 chunk 原文（按 ord 顺序，含章节面包屑）。
+    ///
+    /// 纯读 LanceDB、不加载嵌入模型；供看板右侧内容区 / 外部工具「顺 doc_path 读原文」。
+    Dump {
+        /// 知识库目录；缺省同 ingest 的锚定规则。
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// 从用户级共享知识库（`<HOME>/.engram/kb/store/`）导出而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
+        /// 要导出的文档路径（须与 `list` 列出的 doc_path 完全一致）。
+        #[arg(long)]
+        doc: String,
         /// 以单行 JSON 输出（默认输出可读文本）。
         #[arg(long)]
         json: bool,
@@ -120,6 +152,9 @@ enum Command {
         /// 知识库目录；缺省同 ingest 的锚定规则（不在项目内则静默无输出）。
         #[arg(long)]
         db: Option<PathBuf>,
+        /// 对用户级共享知识库（`<HOME>/.engram/kb/store/`）出概览而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
         /// 输出格式：text（人读概览，缺省）或 json（包成 Claude Code SessionStart
         /// hook 的 `additionalContext` 单行 JSON，供 kb-session-digest.sh 注入）。
         #[arg(long, default_value = "text")]
@@ -148,17 +183,18 @@ fn main() -> ExitCode {
 /// 把子命令分发到各 run_* 函数。
 async fn dispatch(cli: Cli) -> ExitCode {
     let result = match cli.command {
-        Command::Ingest { db, paths, ext, force, json } => {
-            run_ingest(IngestArgs { db, paths, ext, force, json }).await
+        Command::Ingest { db, shared, paths, ext, force, json } => {
+            run_ingest(IngestArgs { db, shared, paths, ext, force, json }).await
         }
-        Command::Search { db, query, limit, filter, json } => {
-            run_search(SearchArgs { db, query, limit, filter, json }).await
+        Command::Search { db, shared, query, limit, filter, json } => {
+            run_search(SearchArgs { db, shared, query, limit, filter, json }).await
         }
-        Command::List { db, json } => run_list(db, json),
-        Command::Remove { db, doc, json } => run_remove(db, &doc, json).await,
-        Command::Status { db, json } => run_status(db, json).await,
+        Command::List { db, shared, json } => run_list(db, shared, json),
+        Command::Remove { db, shared, doc, json } => run_remove(db, shared, &doc, json).await,
+        Command::Status { db, shared, json } => run_status(db, shared, json).await,
+        Command::Dump { db, shared, doc, json } => run_dump(db, shared, &doc, json).await,
         Command::EnsureModel { json } => run_ensure_model(json),
-        Command::Digest { db, emit } => run_digest(db, &emit),
+        Command::Digest { db, shared, emit } => run_digest(db, shared, &emit),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -216,8 +252,8 @@ impl KbContext {
 /// 锚点**一律尝试推导**（即便 `--db` 显式给出）：锚点同时是 doc_path 相对化的
 /// 基准，保证两种调用方式对同一文件生成一致的 doc_path（否则混用会在库里
 /// 留下删不掉的重复文档）。
-fn resolve_kb_context(db_override: Option<PathBuf>) -> Result<KbContext, String> {
-    match resolve_kb_context_optional(db_override)? {
+fn resolve_kb_context(db_override: Option<PathBuf>, shared: bool) -> Result<KbContext, String> {
+    match resolve_kb_context_optional(db_override, shared)? {
         Some(ctx) => Ok(ctx),
         // 无 --db 且 cwd 不在任何 `.engram/` 锚点内：报错引导建锚点 / 显式指定。
         None => {
@@ -233,11 +269,26 @@ fn resolve_kb_context(db_override: Option<PathBuf>) -> Result<KbContext, String>
 }
 
 /// 解析知识库目录的**静默变体**（供 `digest` 用）：与 [`resolve_kb_context`] 同款
-/// 锚定规则，但「无 `--db` 且 cwd 不在任何 engram 项目内」时返回 `None` 而非报错——
-/// SessionStart 注入要求「不在项目内 → 静默」。`--db` 显式给出时一律返回 `Some`。
+/// 锚定规则，但「无 `--db`、非共享、且 cwd 不在任何 engram 项目内」时返回 `None`
+/// 而非报错——SessionStart 注入要求「不在项目内 → 静默」。`--db` 或 `--shared`
+/// 显式给出时一律返回 `Some`。
+///
+/// `shared` 为真时走用户级共享库（`<HOME>/.engram/kb/store/`，anchor_root 为 None、
+/// doc_path 用绝对路径），与 `--db` 互斥。
 fn resolve_kb_context_optional(
     db_override: Option<PathBuf>,
+    shared: bool,
 ) -> Result<Option<KbContext>, String> {
+    if shared {
+        if db_override.is_some() {
+            return Err(
+                "--shared 与 --db 不能同时使用（二者都在指定知识库位置，请只给其一）".to_string(),
+            );
+        }
+        let dir = scope::resolve_shared_kb_dir(|k| std::env::var(k).ok())?;
+        // 共享库不隶属任何锚点：doc_path 一律用绝对路径（anchor_root = None）。
+        return Ok(Some(KbContext { db_dir: dir, anchor_root: None }));
+    }
     let cwd = std::env::current_dir().map_err(|e| format!("获取当前工作目录失败：{e}"))?;
     let cwd = canonicalize_lenient(&cwd);
     let anchor = scope::find_anchor(&cwd);
@@ -357,6 +408,7 @@ fn open_chunker(model_cache: &Path) -> Result<Chunker, String> {
 /// `ingest` 的参数集合。
 struct IngestArgs {
     db: Option<PathBuf>,
+    shared: bool,
     paths: Vec<PathBuf>,
     ext: String,
     force: bool,
@@ -374,7 +426,7 @@ struct IngestArgs {
 ///   先把该文档从 manifest 移除再退出，维持「表里没有 ⇒ manifest 也没有」的
 ///   不变式（否则 --force 重入中途失败会造成永久静默丢块）。
 async fn run_ingest(args: IngestArgs) -> Result<(), String> {
-    let ctx = resolve_kb_context(args.db)?;
+    let ctx = resolve_kb_context(args.db, args.shared)?;
     let exts: Vec<String> = args
         .ext
         .split(',')
@@ -550,6 +602,7 @@ async fn ingest_one(
 /// `search` 的参数集合。
 struct SearchArgs {
     db: Option<PathBuf>,
+    shared: bool,
     query: String,
     limit: usize,
     filter: Option<String>,
@@ -558,7 +611,7 @@ struct SearchArgs {
 
 /// 执行 `search`：编码查询（加指令前缀）→ 混合检索 → 输出命中。
 async fn run_search(args: SearchArgs) -> Result<(), String> {
-    let ctx = resolve_kb_context(args.db)?;
+    let ctx = resolve_kb_context(args.db, args.shared)?;
     // 只读命令先探测目录：lancedb 的 connect 会隐式 create_dir_all，
     // 不探测会在从未 ingest 的项目里凭空制造杂散 kb 目录。
     if !ctx.lance_dir().is_dir() {
@@ -596,8 +649,8 @@ async fn run_search(args: SearchArgs) -> Result<(), String> {
 }
 
 /// 执行 `list`：读 manifest 输出文档清单。
-fn run_list(db: Option<PathBuf>, json: bool) -> Result<(), String> {
-    let ctx = resolve_kb_context(db)?;
+fn run_list(db: Option<PathBuf>, shared: bool, json: bool) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
     let manifest = Manifest::load(&manifest_path(&ctx.db_dir))?;
     if json {
         println!(
@@ -624,8 +677,8 @@ fn run_list(db: Option<PathBuf>, json: bool) -> Result<(), String> {
 ///
 /// 容忍表缺失：库被手动删除时仍允许清掉 manifest 里的幽灵条目（否则该条目
 /// 永远删不掉、list 永远显示它）。
-async fn run_remove(db: Option<PathBuf>, doc: &str, json: bool) -> Result<(), String> {
-    let ctx = resolve_kb_context(db)?;
+async fn run_remove(db: Option<PathBuf>, shared: bool, doc: &str, json: bool) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
     let mpath = manifest_path(&ctx.db_dir);
     let mut manifest = Manifest::load(&mpath)?;
     if manifest.docs.remove(doc).is_none() {
@@ -652,8 +705,8 @@ async fn run_remove(db: Option<PathBuf>, doc: &str, json: bool) -> Result<(), St
 }
 
 /// 执行 `status`：文档数 / chunk 数 / 模型就绪 / 路径概况。
-async fn run_status(db: Option<PathBuf>, json: bool) -> Result<(), String> {
-    let ctx = resolve_kb_context(db)?;
+async fn run_status(db: Option<PathBuf>, shared: bool, json: bool) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
     let manifest = Manifest::load(&manifest_path(&ctx.db_dir))?;
     let model_cache = scope::model_cache_dir(|k| std::env::var(k).ok())?;
     let model_ok = embedder::model_ready(&model_cache);
@@ -692,6 +745,42 @@ async fn run_status(db: Option<PathBuf>, json: bool) -> Result<(), String> {
             if model_ok { "已就绪" } else { "未下载（首次 ingest/search 时自动下载约 95MB）" },
             model_cache.display()
         );
+    }
+    Ok(())
+}
+
+/// 执行 `dump`：读某文档的全部 chunk 原文（按 ord 排序），供看板右侧内容区 / 外部工具。
+///
+/// 纯读 LanceDB、不加载嵌入模型。库目录不存在（从未 ingest）时报中文用户级错误；
+/// doc_path 无对应 chunk（未入库 / 名字不一致）时 JSON 出空数组、文本给出提示。
+async fn run_dump(db: Option<PathBuf>, shared: bool, doc: &str, json: bool) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
+    if !ctx.lance_dir().is_dir() {
+        return Err("知识库为空（尚未 ingest 过任何文档），请先执行 ingest 入库".to_string());
+    }
+    let kb = KbStore::open(&ctx.lance_dir()).await?;
+    let table = kb.open_table().await?;
+    let chunks = store::fetch_doc_chunks(&table, doc).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "dump",
+                "db": ctx.db_dir.to_string_lossy(),
+                "doc": doc,
+                "chunks": chunks,
+            })
+        );
+    } else if chunks.is_empty() {
+        println!("文档 {doc} 在知识库中没有 chunk（确认 doc_path 与 list 列出的完全一致）。");
+    } else {
+        for c in &chunks {
+            if !c.breadcrumb.is_empty() {
+                println!("## {}", c.breadcrumb);
+            }
+            println!("{}\n", c.text);
+        }
     }
     Ok(())
 }
@@ -791,9 +880,9 @@ fn build_digest_context(db_dir: &Path, manifest: &Manifest) -> String {
 ///
 /// # Errors
 /// `--emit` 非法、或 manifest 存在但损坏 / 序列化 hook JSON 失败时返回中文错误。
-fn run_digest(db: Option<PathBuf>, emit: &str) -> Result<(), String> {
+fn run_digest(db: Option<PathBuf>, shared: bool, emit: &str) -> Result<(), String> {
     let format = parse_emit_format(emit)?;
-    let ctx = match resolve_kb_context_optional(db)? {
+    let ctx = match resolve_kb_context_optional(db, shared)? {
         Some(c) => c,
         None => return Ok(()), // 不在项目内：静默。
     };

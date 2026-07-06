@@ -20,6 +20,8 @@ pub const ENGRAM_DB_FILE: &str = "engram.redb";
 pub const WORKSPACE_MARKER: &str = "workspace";
 /// 知识库子目录名（位于锚点 `.engram/` 之下）。
 pub const KB_DIR: &str = "kb";
+/// 共享知识库数据子目录名（位于 `<HOME>/.engram/kb/` 之下，与 `models/` 同级分开）。
+pub const SHARED_KB_SUBDIR: &str = "store";
 
 /// 判断目录 `d` 是否为 engram 锚点（`.engram/` 下有 redb 库或 workspace 标记）。
 fn is_anchor(d: &Path) -> bool {
@@ -86,6 +88,25 @@ pub fn model_cache_dir(env_lookup: impl Fn(&str) -> Option<String>) -> Result<Pa
         .join("models"))
 }
 
+/// 推导共享（用户级）知识库目录：`<HOME>/.engram/kb/store/`。
+///
+/// 与项目知识库（`<锚点>/.engram/kb/`）并列的跨项目共用库，类比公共记忆库
+/// （`<HOME>/.engram/general.redb`）：不隶属任何项目、任意目录下都可访问。放
+/// `store/` 子目录而非直接落在 `<HOME>/.engram/kb/`，是为了与同级的模型缓存
+/// `<HOME>/.engram/kb/models/` 分开、互不干扰（其下再有 `lancedb/` 与
+/// `manifest.json`，与项目库同构）。共享库无锚点，doc_path 一律用绝对路径。
+///
+/// # Errors
+/// 主目录无法确定时返回其错误说明。
+pub fn resolve_shared_kb_dir(
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
+    Ok(home_dir(env_lookup)?
+        .join(ENGRAM_DIR)
+        .join(KB_DIR)
+        .join(SHARED_KB_SUBDIR))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +156,20 @@ mod tests {
         assert_eq!(home_dir(unix).expect("应取到"), PathBuf::from("/home/x"));
         let none = |_: &str| None;
         assert!(home_dir(none).is_err());
+    }
+
+    /// 共享库目录：`<HOME>/.engram/kb/store/`，与模型缓存 `.../kb/models/` 同级分开。
+    #[test]
+    fn shared_kb_dir_layout() {
+        let env = |k: &str| (k == "USERPROFILE").then(|| "C:/Users/x".to_string());
+        let shared = resolve_shared_kb_dir(env).expect("应取到共享库目录");
+        assert_eq!(
+            shared,
+            PathBuf::from("C:/Users/x").join(".engram").join("kb").join("store")
+        );
+        // 与模型缓存同级、目录名不同（不会互相污染）。
+        let models = model_cache_dir(env).expect("应取到模型缓存目录");
+        assert_eq!(shared.parent(), models.parent());
+        assert_ne!(shared, models);
     }
 }

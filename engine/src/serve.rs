@@ -44,6 +44,11 @@ const VIEWER_HTML: &str = include_str!("web/viewer.html");
 /// 单个连接的读超时，避免半开连接长期占着线程。
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// 知识库子目录名（锚点 `.engram/` 之下），与 kb crate 的 `scope::KB_DIR` 约定一致。
+const KB_DIR_NAME: &str = "kb";
+/// 共享知识库数据子目录名，与 kb crate 的 `scope::SHARED_KB_SUBDIR` 约定一致。
+const KB_SHARED_SUBDIR: &str = "store";
+
 /// 库的种类，决定看板上的分组标签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbKind {
@@ -272,6 +277,169 @@ fn discover(cfg: &ServeConfig) -> Vec<DbEntry> {
     out
 }
 
+/// 平台对应的 engram-kb sidecar 资产名（与 `scripts/ensure-kb.sh` 一致）。
+fn kb_asset_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "engram-kb-windows-x86_64.exe"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "engram-kb-macos-aarch64"
+        } else {
+            "engram-kb-macos-x86_64"
+        }
+    } else {
+        "engram-kb-linux-x86_64"
+    }
+}
+
+/// 定位已安装的 engram-kb 二进制：`<HOME>/.engram/bin/<asset>`（与 ensure-kb.sh 同规则）。
+///
+/// 知识库 sidecar 独立于插件、按需下载，未装（用户从未用过知识库）时返回 `None`，
+/// 调用方据此在看板上给出"知识库组件未安装"提示而非报错。
+fn kb_binary() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let p = PathBuf::from(home)
+        .join(".engram")
+        .join("bin")
+        .join(kb_asset_name());
+    p.is_file().then_some(p)
+}
+
+/// 由记忆库推导其同锚点下的知识库目录：
+/// - 公共库 → 用户级共享知识库 `<HOME>/.engram/kb/store/`；
+/// - 项目 / 管理库 `<X>/.engram/engram.redb` → `<X>/.engram/kb/`。
+///
+/// 依据是记忆库文件的父目录恒为锚点的 `.engram/`（公共库为 `<HOME>/.engram/`）。
+fn kb_dir_for(entry: &DbEntry) -> Option<PathBuf> {
+    let engram_dir = entry.path.parent()?;
+    match entry.kind {
+        DbKind::General => Some(engram_dir.join(KB_DIR_NAME).join(KB_SHARED_SUBDIR)),
+        _ => Some(engram_dir.join(KB_DIR_NAME)),
+    }
+}
+
+/// 调用 engram-kb 子命令并解析其 `--json` 单行输出。
+///
+/// 只读命令（list/dump）不加载嵌入模型，stdout 是干净单行 JSON；非 0 退出时取
+/// stderr 的中文错误返回。engram-kb 参数不经 shell（[`Command`] 直接 exec），无注入风险。
+fn run_kb_json(bin: &Path, args: &[&str]) -> Result<Value, String> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| format!("调用 engram-kb 失败：{e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).map_err(|e| format!("解析 engram-kb 输出失败：{e}"))
+}
+
+/// 百分号解码（`%XX` → 字节，`+` → 空格）：解析 `/api/kb/doc` 的 query 参数用。
+/// 非法转义原样保留，UTF-8 无效时 lossy 转换（不 panic）。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push(h * 16 + l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 单个十六进制字符 → 数值（0–15）；非 hex 返回 `None`。
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 构造 `/api/kb` 响应体：发现各库 → 推导 kb 目录 → 对已建库调 `engram-kb list` 汇总。
+///
+/// sidecar 未安装时返回 `{kb_bin_found:false, kbs:[]}`，让前端给出安装提示而非报错；
+/// 只对存在 `manifest.json` 的目录起 list（避免对空目录凭空建 lancedb），坏库跳过。
+fn build_kb_payload(cfg: &ServeConfig) -> Result<String, String> {
+    let entries = discover(cfg);
+    let Some(bin) = kb_binary() else {
+        return Ok(json!({ "kb_bin_found": false, "kbs": [] }).to_string());
+    };
+    let mut kbs: Vec<Value> = Vec::new();
+    for e in &entries {
+        let Some(kb_dir) = kb_dir_for(e) else {
+            continue;
+        };
+        if !kb_dir.join("manifest.json").is_file() {
+            continue;
+        }
+        let dir_str = kb_dir.to_string_lossy().into_owned();
+        let Ok(v) = run_kb_json(&bin, &["list", "--db", &dir_str, "--json"]) else {
+            continue;
+        };
+        let docs = v.get("docs").cloned().unwrap_or_else(|| json!({}));
+        kbs.push(json!({
+            "scope": e.name,
+            "kind": e.kind.as_str(),
+            "db_dir": dir_str,
+            "docs": docs,
+        }));
+    }
+    serde_json::to_string(&json!({ "kb_bin_found": true, "kbs": kbs }))
+        .map_err(|e| format!("序列化知识库响应失败：{e}"))
+}
+
+/// 构造 `/api/kb/doc` 响应体：解析 query（`db` + `doc`）→ 校验 db 属于已发现的 kb
+/// 目录 → 调 `engram-kb dump` 透传该文档 chunk 原文。
+///
+/// db 必须命中 [`discover`] 推导出的某个 kb 目录，杜绝借 query 越权读任意目录。
+fn build_kb_doc_payload(cfg: &ServeConfig, query: &str) -> Result<String, String> {
+    let mut db: Option<String> = None;
+    let mut doc: Option<String> = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "db" => db = Some(percent_decode(v)),
+            "doc" => doc = Some(percent_decode(v)),
+            _ => {}
+        }
+    }
+    let db = db.ok_or_else(|| "缺少 db 参数".to_string())?;
+    let doc = doc.ok_or_else(|| "缺少 doc 参数".to_string())?;
+
+    let allowed = discover(cfg)
+        .iter()
+        .filter_map(kb_dir_for)
+        .any(|d| d.to_string_lossy() == db);
+    if !allowed {
+        return Err("db 不在已发现的知识库范围内".to_string());
+    }
+    let bin = kb_binary().ok_or_else(|| "未找到 engram-kb 二进制（知识库组件未安装）".to_string())?;
+    let v = run_kb_json(&bin, &["dump", "--db", &db, "--doc", &doc, "--json"])?;
+    serde_json::to_string(&v).map_err(|e| format!("序列化文档响应失败：{e}"))
+}
+
 /// 把 `f64` 转成合法 JSON 值：有限值原样，无穷/NaN 用 `null`（看板将 `null` 视作 ∞）。
 fn f64_json(v: f64) -> Value {
     if v.is_finite() {
@@ -417,6 +585,37 @@ fn handle(mut stream: TcpStream, cfg: &ServeConfig) -> std::io::Result<()> {
                 e.as_bytes(),
             ),
         },
+        ("GET", "/api/kb") => match build_kb_payload(cfg) {
+            Ok(json) => write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+            ),
+            Err(e) => write_response(
+                &mut stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                e.as_bytes(),
+            ),
+        },
+        ("GET", "/api/kb/doc") => {
+            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            match build_kb_doc_payload(cfg, query) {
+                Ok(json) => write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    json.as_bytes(),
+                ),
+                Err(e) => write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    e.as_bytes(),
+                ),
+            }
+        }
         (_, "/shutdown") => {
             let _ = write_response(
                 &mut stream,

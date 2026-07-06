@@ -20,7 +20,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
 use lancedb::index::Index;
-use lancedb::query::{QueryBase, QueryExecutionOptions};
+use lancedb::query::{ExecutableQuery, QueryBase, QueryExecutionOptions};
 use lancedb::{connect, Connection, DistanceType, Table};
 
 use crate::chunker::Chunk;
@@ -297,6 +297,70 @@ pub async fn count_rows(table: &Table) -> Result<usize, String> {
         .count_rows(None)
         .await
         .map_err(|e| format!("统计 chunk 数失败：{e}"))
+}
+
+/// 取某文档的全部 chunk（按 `ord` 升序），供看板 / `dump` 读原文用。
+///
+/// 纯 SQL 谓词过滤（`doc_path` 精确匹配，单引号按 SQL 规则转义），**不走向量检索、
+/// 不做重排**，故 [`Hit::score`] 恒为 `None`。LanceDB 查询不保证行序，结果在
+/// Rust 侧按 `ord` 稳定排序还原文档内顺序。
+///
+/// # Errors
+/// 查询构造或执行失败时返回中文错误说明。
+pub async fn fetch_doc_chunks(table: &Table, doc_path: &str) -> Result<Vec<Hit>, String> {
+    let escaped = doc_path.replace('\'', "''");
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .only_if(format!("doc_path = '{escaped}'"))
+        .execute()
+        .await
+        .map_err(|e| format!("查询文档 {doc_path} 的 chunk 失败：{e}"))?
+        .try_collect()
+        .await
+        .map_err(|e| format!("读取文档 {doc_path} 的 chunk 失败：{e}"))?;
+    let mut rows = parse_doc_rows(&batches);
+    rows.sort_by_key(|(ord, _)| *ord);
+    Ok(rows.into_iter().map(|(_, hit)| hit).collect())
+}
+
+/// 从查询结果批里解析 `(ord, Hit)` 列表（容错：缺列给空串 / 0，不 panic）。
+/// 与 [`parse_hits`] 的区别：额外取 `ord` 列供排序，且不解析融合分（纯过滤无该列）。
+fn parse_doc_rows(batches: &[RecordBatch]) -> Vec<(i32, Hit)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let str_col = |name: &str| -> Option<&StringArray> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        };
+        let id = str_col("id");
+        let doc_path = str_col("doc_path");
+        let breadcrumb = str_col("breadcrumb");
+        let text = str_col("text");
+        let ord_col = batch
+            .column_by_name("ord")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+        for row in 0..batch.num_rows() {
+            let get = |col: Option<&StringArray>| -> String {
+                col.map_or(String::new(), |a| {
+                    if a.is_valid(row) { a.value(row).to_string() } else { String::new() }
+                })
+            };
+            let ord = ord_col.map_or(0, |a| if a.is_valid(row) { a.value(row) } else { 0 });
+            rows.push((
+                ord,
+                Hit {
+                    id: get(id),
+                    doc_path: get(doc_path),
+                    breadcrumb: get(breadcrumb),
+                    text: get(text),
+                    score: None,
+                },
+            ));
+        }
+    }
+    rows
 }
 
 /// 从查询结果批里解析 [`Hit`] 列表（容错：缺列给空串 / None，不 panic）。

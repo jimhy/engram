@@ -1,6 +1,6 @@
 [package]
 name = "engram-kb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Engram 知识库 sidecar——本地 RAG：文档分块 + 中文嵌入 + LanceDB 混合检索"
 
@@ -47,12 +47,79 @@ tempfile = "3"
 # 注意：本机编译请用 .tmp/cargo-retry.sh——其 CARGO_PROFILE_RELEASE_LTO=off
 # 环境变量会覆盖此处 lto 配置，绕开本机 bitcode 写盘损坏（设计文档 §9.2）。
 [profile.release]
-lto = "thin"
+# 曾用 lto = "thin"，但 rustc 1.96.0 在 thin-LTO（`-C linker-plugin-lto`）下编
+# datafusion 53.1 家族稳定 ACCESS_VIOLATION 崩溃——两次实测分别崩在 datafusion-catalog
+# （opt=3）与 datafusion-sql（opt=1），共性是 linker-plugin-lto、与 opt-level 无关，
+# 故 thin-LTO 是真凶。关掉 LTO 绕开（二进制略大、热路径少一层跨 crate 内联，本地
+# RAG 小规模无感）。datafusion 家族的 opt-level=1 降级保留作双保险、无害。
+lto = false
 strip = "symbols"
 
-# 本机 Windows 实测：rustc 1.96.0 以 opt-level=3/1 编 datafusion 53.1 均稳定
-# ACCESS_VIOLATION 崩溃（详见设计文档 §9.2），单独降该包优化级别绕开。
-# datafusion 只承担查询计划，热路径在 lance 向量扫描与 ort 推理，性能无虞。
-# CI 上无此问题但保留无害（仅该包优化略低）。
+# 本机 Windows 实测：rustc 1.96.0 编 datafusion 53.1 家族（edition 2024）在
+# opt-level=3 + thin-LTO 下稳定 ACCESS_VIOLATION 崩溃（rustc 自身崩，非本 crate
+# 代码问题；详见设计文档 §9.2）。datafusion 只承担查询计划、非热路径（热路径在
+# lance 向量扫描与 ort 推理），故把整个 datafusion-* 家族降到 opt-level=1 绕开崩溃、
+# 性能无虞。
+# 注意：Cargo 的 package 覆盖不支持通配，datafusion 的每个子 crate 都是独立包名，
+# 必须逐一列全——只降 `datafusion` 主包会漏掉 datafusion-catalog 等子包而继续崩
+# （2026-07 撞过：主包已降 opt=1，仍崩在 datafusion-catalog）。CI 上无此问题但保留无害。
 [profile.release.package.datafusion]
+opt-level = 1
+[profile.release.package.datafusion-catalog]
+opt-level = 1
+[profile.release.package.datafusion-catalog-listing]
+opt-level = 1
+[profile.release.package.datafusion-common]
+opt-level = 1
+[profile.release.package.datafusion-common-runtime]
+opt-level = 1
+[profile.release.package.datafusion-datasource]
+opt-level = 1
+[profile.release.package.datafusion-datasource-arrow]
+opt-level = 1
+[profile.release.package.datafusion-datasource-csv]
+opt-level = 1
+[profile.release.package.datafusion-datasource-json]
+opt-level = 1
+[profile.release.package.datafusion-doc]
+opt-level = 1
+[profile.release.package.datafusion-execution]
+opt-level = 1
+[profile.release.package.datafusion-expr]
+opt-level = 1
+[profile.release.package.datafusion-expr-common]
+opt-level = 1
+[profile.release.package.datafusion-functions]
+opt-level = 1
+[profile.release.package.datafusion-functions-aggregate]
+opt-level = 1
+[profile.release.package.datafusion-functions-aggregate-common]
+opt-level = 1
+[profile.release.package.datafusion-functions-nested]
+opt-level = 1
+[profile.release.package.datafusion-functions-table]
+opt-level = 1
+[profile.release.package.datafusion-functions-window]
+opt-level = 1
+[profile.release.package.datafusion-functions-window-common]
+opt-level = 1
+[profile.release.package.datafusion-macros]
+opt-level = 1
+[profile.release.package.datafusion-optimizer]
+opt-level = 1
+[profile.release.package.datafusion-physical-expr]
+opt-level = 1
+[profile.release.package.datafusion-physical-expr-adapter]
+opt-level = 1
+[profile.release.package.datafusion-physical-expr-common]
+opt-level = 1
+[profile.release.package.datafusion-physical-optimizer]
+opt-level = 1
+[profile.release.package.datafusion-physical-plan]
+opt-level = 1
+[profile.release.package.datafusion-pruning]
+opt-level = 1
+[profile.release.package.datafusion-session]
+opt-level = 1
+[profile.release.package.datafusion-sql]
 opt-level = 1
