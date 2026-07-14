@@ -103,7 +103,7 @@ pub const ENGRAM_DB_FILE: &str = "engram.redb";
 /// 项目管理目录的标记文件名（位于 `.engram/` 内，仅项目管理目录才有）。
 pub const WORKSPACE_MARKER: &str = "workspace";
 
-/// 一个作用域是「具体项目」还是「项目管理目录」。
+/// 一个作用域是「具体项目」「项目管理目录」还是「无项目」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeKind {
     /// 具体项目：记忆写它的 L4 库。
@@ -111,6 +111,11 @@ pub enum ScopeKind {
     /// 项目管理目录：只存少量「管理层」记忆；具体项目应建在它的子目录里
     /// （`cwd` 正好是管理目录本身时，agent 应主动在其下建项目目录再工作）。
     Workspace,
+    /// 无项目作用域：锚点落到了 engram 运行时主目录本身（家目录 / engram 主目录，
+    /// 其 `.engram/` 与公共库同处一个目录）。此时**不锚定伪项目**——只挂公共库，
+    /// L4 项目记忆需在真实项目目录下才能写入。判定见 main.rs 的 `resolve_scope`
+    /// （作用域库所在 `.engram` 目录 == 公共库所在目录时降级为本值）。
+    None,
 }
 
 /// 从 `cwd` 向上锚定出的作用域：项目根（或管理目录）及其库路径、名字。
@@ -124,6 +129,17 @@ pub struct ProjectScope {
     pub db: PathBuf,
     /// 作用域名（`root` 的末段目录名；取不到回退 `"root"`）。
     pub name: String,
+}
+
+impl ProjectScope {
+    /// 是否为「无项目作用域」（[`ScopeKind::None`]）。
+    ///
+    /// 为真时其 `db`（`~/.engram/engram.redb`，与公共库同目录）是伪项目库，**永不挂载**、
+    /// **永不作为 L4 写入目标**；调用方据此只挂公共库、并拒绝 L4 写入。
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        self.kind == ScopeKind::None
+    }
 }
 
 /// 返回 `<dir>/.engram/engram.redb`。

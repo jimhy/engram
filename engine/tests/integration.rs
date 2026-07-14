@@ -6159,3 +6159,503 @@ fn session_start_migration_failure_does_not_block_hot_index() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+// M8. 回归锁（核心）：hot-index 的 **SessionStart** 事件必须触发自动迁移。
+//     历史 bug：自动迁移触发曾误挂在**无任何 hook 调用**的 `session-start` 子命令上，
+//     而 SessionStart hook 实际调的是 `hot-index`，导致自动迁移从未执行。修复把触发
+//     挂进 `run_hot_index`（`args.hook_event == "SessionStart"`）。本用例造 v1 公共库 +
+//     v1 项目库（带 .engram 锚点），跑 `hot-index --hook-event SessionStart` 后断言两库
+//     都升到 ENGRAM_DATA_VERSION，且 `<公共库父目录>/backups/` 下生成 `pre-migrate-*`
+//     备份目录——把这类「触发挂错子命令」的 bug 永久锁死。
+#[test]
+fn hot_index_session_start_triggers_migration_on_old_libs() {
+    let _guard = test_guard();
+    // 公共库放进**独立父目录**：迁移默认备份根为 `<公共库父目录>/backups`，独立目录使
+    // 本用例的备份不与其他迁移用例撞车（见 `dedicated_dir` 注释）。
+    let dir = dedicated_dir("hi_ss_mig");
+    let general = dir.join("general.redb");
+    // v1 公共库：灌一条通用记忆（合并集非空才会走「备份 → 清洗」路径，才能验证备份目录）。
+    {
+        let db = store::open(&general).expect("应能创建公共库");
+        store::put_many(
+            &db,
+            &[make(
+                "hi_ss_gen",
+                Level::L3,
+                None,
+                Status::Active,
+                0.5,
+                MIG_NOW - 3.0 * MIG_DAY,
+                vec![MIG_NOW - 1.0 * MIG_DAY],
+            )],
+        )
+        .expect("灌公共库应成功");
+        drop(db);
+    }
+    // v1 项目库：proj 带 `.engram/engram.redb` 锚点（从其下开会话会向上锚定到 proj），
+    // 灌一条本项目的 L4.1（project 名 = 项目根目录名，令迁移能路由回项目库）。
+    let proj = unique_workspace_root("hi_ss_proj");
+    let proj_name = last_segment(&proj);
+    let proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "hi_ss_proj_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            MIG_NOW - 3.0 * MIG_DAY,
+            vec![MIG_NOW - 1.0 * MIG_DAY],
+        )],
+    );
+    // 前置：两库都是「引入 meta 表之前」的老库版本 1。
+    assert_eq!(read_version(&general), 1, "前置：公共库应为老库版本 1");
+    assert_eq!(read_version(&proj_db), 1, "前置：项目库应为老库版本 1");
+
+    let general_s = general.to_string_lossy().to_string();
+    let proj_s = proj.to_string_lossy().to_string();
+    let now_s = (MIG_NOW as u64).to_string();
+    let out = run_hot_index_raw(&[
+        "--hook-event",
+        "SessionStart",
+        "--general-db",
+        &general_s,
+        "--workspace-root",
+        &proj_s,
+        "--now",
+        &now_s,
+    ]);
+    assert!(
+        out.status.success(),
+        "hot-index SessionStart 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 断言①：公共库与项目库的 data_version 都被迁移到 ENGRAM_DATA_VERSION（当前 = 2）。
+    let target = engram::model::ENGRAM_DATA_VERSION;
+    assert_eq!(target, 2, "当前引擎数据版本应为 2");
+    assert_eq!(
+        read_version(&general),
+        target,
+        "SessionStart 应把公共库迁移到 v{target}"
+    );
+    assert_eq!(
+        read_version(&proj_db),
+        target,
+        "SessionStart 应把项目库迁移到 v{target}"
+    );
+
+    // 断言②：`<公共库父目录>/backups/` 下生成 `pre-migrate-*` 备份目录（迁移前完整快照）。
+    let backup_root = dir.join("backups");
+    assert!(
+        backup_root.is_dir(),
+        "应在公共库父目录下生成 backups 目录：{}",
+        backup_root.display()
+    );
+    let backup_names: Vec<String> = std::fs::read_dir(&backup_root)
+        .expect("应能读 backups 目录")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        backup_names.iter().any(|n| n.starts_with("pre-migrate-")),
+        "backups 下应有 pre-migrate-* 备份子目录，实得：{backup_names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// M9. 回归锁（反面）：hot-index 的 **UserPromptSubmit** 事件绝不触发迁移。
+//     UserPromptSubmit 每条 prompt 都调 hot-index，若每次都迁移会反复备份/重写全库；
+//     自动迁移只应在 SessionStart 一次性触发。本用例对另一组 v1 库跑
+//     `hot-index --hook-event UserPromptSubmit`，断言两库仍为 v1、且**无** backups 备份
+//     目录——锁死「非 SessionStart 事件误触发迁移」的回归。
+#[test]
+fn hot_index_user_prompt_submit_does_not_trigger_migration() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("hi_ups_mig");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建公共库");
+        store::put_many(
+            &db,
+            &[make(
+                "hi_ups_gen",
+                Level::L3,
+                None,
+                Status::Active,
+                0.5,
+                MIG_NOW - 3.0 * MIG_DAY,
+                vec![MIG_NOW - 1.0 * MIG_DAY],
+            )],
+        )
+        .expect("灌公共库应成功");
+        drop(db);
+    }
+    let proj = unique_workspace_root("hi_ups_proj");
+    let proj_name = last_segment(&proj);
+    let proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "hi_ups_proj_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            MIG_NOW - 3.0 * MIG_DAY,
+            vec![MIG_NOW - 1.0 * MIG_DAY],
+        )],
+    );
+    assert_eq!(read_version(&general), 1, "前置：公共库应为老库版本 1");
+    assert_eq!(read_version(&proj_db), 1, "前置：项目库应为老库版本 1");
+
+    let general_s = general.to_string_lossy().to_string();
+    let proj_s = proj.to_string_lossy().to_string();
+    let now_s = (MIG_NOW as u64).to_string();
+    let out = run_hot_index_raw(&[
+        "--hook-event",
+        "UserPromptSubmit",
+        "--general-db",
+        &general_s,
+        "--workspace-root",
+        &proj_s,
+        "--now",
+        &now_s,
+    ]);
+    assert!(
+        out.status.success(),
+        "hot-index UserPromptSubmit 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 断言：UserPromptSubmit 不触发迁移——两库版本仍为 1、且不产生任何 backups 备份目录。
+    assert_eq!(
+        read_version(&general),
+        1,
+        "UserPromptSubmit 不应迁移公共库，版本应仍为 1"
+    );
+    assert_eq!(
+        read_version(&proj_db),
+        1,
+        "UserPromptSubmit 不应迁移项目库，版本应仍为 1"
+    );
+    assert!(
+        !dir.join("backups").exists(),
+        "UserPromptSubmit 不应产生任何备份目录（避免每条 prompt 都迁移）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// H1. 伪项目守卫（本次核心修复）：cwd 落在 engram 运行时主目录本身——即公共库
+//     `general.redb` 与项目库 `engram.redb` 并列于同一个 `.engram/` 目录——时，不锚定
+//     伪项目，视为无项目作用域：
+//       · resolve 的 kind = `none`（不把家目录当项目）；
+//       · hot-index 只挂公共库，**绝不**挂 general.redb 旁的 engram.redb（家目录各不相干
+//         话题不再污染注入）；
+//       · write L4.* 明确报「当前无项目作用域」并**非 0 退出**、不写入；
+//       · write L1-3 通用记忆仍正常落公共库。
+//     还原真实 bug：`~/.engram/engram.redb` 曾被误判成 name=<家目录名> 的伪项目库，把
+//     任何在家目录开的会话的 L4 都错误落进去。判据用规范化路径比较、不依赖 HOME 目录名。
+#[test]
+fn no_project_scope_when_anchor_is_engram_home_dir() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+
+    // 造「engram 运行时主目录」home/.engram/：并列放 general.redb + engram.redb（伪项目库）。
+    let home = unique_workspace_root("noproj_home");
+    let engram_dir = home.join(".engram");
+    std::fs::create_dir_all(&engram_dir).expect("应能创建 .engram 目录");
+    let general = engram_dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建公共库");
+        store::put_many(
+            &db,
+            &[make(
+                "np_gen",
+                Level::L3,
+                None,
+                Status::Active,
+                0.5,
+                now,
+                vec![now],
+            )],
+        )
+        .expect("灌公共库应成功");
+        drop(db);
+    }
+    // 伪项目库：与 general.redb 同目录的 engram.redb，灌一条 L4.1——若被误挂就会在热索引露出。
+    let fake = engram_dir.join("engram.redb");
+    let home_name = last_segment(&home);
+    {
+        let db = store::open(&fake).expect("应能创建伪项目库");
+        store::put_many(
+            &db,
+            &[make(
+                "np_fake",
+                Level::L4_1,
+                Some(&home_name),
+                Status::Active,
+                0.9,
+                now,
+                vec![now],
+            )],
+        )
+        .expect("灌伪项目库应成功");
+        drop(db);
+    }
+
+    let g = general.to_string_lossy().to_string();
+    let home_s = home.to_string_lossy().to_string();
+    let fake_kv = format!("{home_name}={}", fake.display());
+
+    // ① resolve --format json：kind 应为 none（不锚定伪项目）。
+    let out = run_subcommand_raw(
+        "resolve",
+        &[
+            "--project-dir",
+            &home_s,
+            "--general-db",
+            &g,
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "resolve 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("resolve --format json 应可解析");
+    assert_eq!(
+        parsed.get("kind").and_then(|v| v.as_str()),
+        Some("none"),
+        "锚点落到 engram 主目录本身时 kind 应为 none，实得：{stdout}"
+    );
+
+    // ② hot-index：只挂公共库，不挂 general.redb 旁的伪项目库，也不渲染伪项目段。
+    let hi = run_hot_index_raw(&[
+        "--general-db",
+        &g,
+        "--workspace-root",
+        &home_s,
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        hi.status.success(),
+        "hot-index 应成功，stderr={}",
+        String::from_utf8_lossy(&hi.stderr)
+    );
+    let hi_out = String::from_utf8(hi.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        hi_out.contains("cue-np_gen"),
+        "应注入公共库记忆 cue-np_gen，实得：\n{hi_out}"
+    );
+    assert!(
+        !hi_out.contains("cue-np_fake"),
+        "绝不应挂载 general.redb 旁的伪项目库（家目录话题不该注入），实得：\n{hi_out}"
+    );
+    assert!(
+        !hi_out.contains(&format!("[{home_name}]")),
+        "不应渲染伪项目段 [{home_name}]，实得：\n{hi_out}"
+    );
+
+    // ③ write L4.1 → 报「当前无项目作用域」并非 0 退出、且不写入伪项目库。
+    let w4 = run_write_raw(&[
+        "--general-db",
+        &g,
+        "--project-db",
+        &fake_kv,
+        "--project",
+        &home_name,
+        "--level",
+        "L4.1",
+        "--cue",
+        "家目录里的项目记忆",
+        "--id",
+        "np_should_fail",
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        !w4.status.success(),
+        "无项目作用域时 write L4 应失败（非 0 退出）"
+    );
+    let w4_err = String::from_utf8_lossy(&w4.stderr);
+    assert!(
+        w4_err.contains("当前无项目作用域"),
+        "错误信息应点明「当前无项目作用域」，实得：{w4_err}"
+    );
+    {
+        let fake_db = store::open(&fake).expect("应能重开伪项目库");
+        assert!(
+            store::get(&fake_db, "np_should_fail")
+                .expect("读伪项目库应成功")
+                .is_none(),
+            "write L4 被拒后不应写入伪项目库"
+        );
+        drop(fake_db);
+    }
+
+    // ④ write L3 → 通用记忆仍正常落公共库（不受无项目作用域影响）。
+    let l3_id = run_write(&[
+        "--general-db",
+        &g,
+        "--level",
+        "L3",
+        "--cue",
+        "通用记忆仍可写",
+        "--id",
+        "np_l3_ok",
+        "--now",
+        "1000000000",
+    ]);
+    assert_eq!(l3_id, "np_l3_ok", "L1-3 写入不应受无项目作用域影响");
+    {
+        let gdb = store::open(&general).expect("应能重开公共库");
+        assert!(
+            store::get(&gdb, "np_l3_ok")
+                .expect("读公共库应成功")
+                .is_some(),
+            "L3 通用记忆应已落公共库"
+        );
+        drop(gdb);
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// H2. 回归：真实项目目录（其 `.engram/` 目录 ≠ 公共库所在目录）照常锚定为具体项目——
+//     resolve kind=project、hot-index 挂其 L4、write L4 正常落项目库。守卫只拦「作用域库
+//     与公共库同目录」的伪项目，绝不误伤正常项目锚定。
+#[test]
+fn real_project_still_anchors_and_accepts_l4() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+
+    // 公共库放在独立位置（其 .engram/ 目录 ≠ 项目 .engram/ 目录）。
+    let general_path = seed_db(
+        "real_proj_g",
+        &[make(
+            "rp_gen",
+            Level::L3,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+
+    // 真实项目：proj/.engram/engram.redb 锚点，灌一条本项目 L4.1（project 名 = 项目根目录名）。
+    let proj = unique_workspace_root("real_proj");
+    let proj_name = last_segment(&proj);
+    let proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "rp_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let proj_s = proj.to_string_lossy().to_string();
+    let proj_kv = format!("{proj_name}={}", proj_db.display());
+
+    // ① resolve：kind=project、project_name=项目末段名（照常锚定，守卫不触发）。
+    let out = run_subcommand_raw(
+        "resolve",
+        &[
+            "--project-dir",
+            &proj_s,
+            "--general-db",
+            &g,
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "resolve 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("resolve --format json 应可解析");
+    assert_eq!(
+        parsed.get("kind").and_then(|v| v.as_str()),
+        Some("project"),
+        "真实项目应照常锚定为 project，实得：{stdout}"
+    );
+    assert_eq!(
+        parsed.get("project_name").and_then(|v| v.as_str()),
+        Some(proj_name.as_str()),
+        "项目名应为目录末段名，实得：{stdout}"
+    );
+
+    // ② hot-index：公共库 + 项目库 L4 都挂载。
+    let hi = run_hot_index_raw(&[
+        "--general-db",
+        &g,
+        "--workspace-root",
+        &proj_s,
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        hi.status.success(),
+        "hot-index 应成功，stderr={}",
+        String::from_utf8_lossy(&hi.stderr)
+    );
+    let hi_out = String::from_utf8(hi.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        hi_out.contains("cue-rp_gen"),
+        "应挂公共库记忆 cue-rp_gen，实得：\n{hi_out}"
+    );
+    assert!(
+        hi_out.contains("cue-rp_l4"),
+        "应挂真实项目库 L4 记忆 cue-rp_l4，实得：\n{hi_out}"
+    );
+
+    // ③ write L4.1 → 正常落项目库（守卫不触发，因项目 .engram ≠ 公共库目录）。
+    let l4_id = run_write(&[
+        "--general-db",
+        &g,
+        "--project-db",
+        &proj_kv,
+        "--project",
+        &proj_name,
+        "--level",
+        "L4.1",
+        "--cue",
+        "真实项目记忆",
+        "--id",
+        "rp_l4_new",
+        "--now",
+        "1000000000",
+    ]);
+    assert_eq!(l4_id, "rp_l4_new", "真实项目 L4 写入应成功");
+    {
+        let pdb = store::open(&proj_db).expect("应能重开项目库");
+        assert!(
+            store::get(&pdb, "rp_l4_new")
+                .expect("读项目库应成功")
+                .is_some(),
+            "L4 记忆应已落项目库"
+        );
+        drop(pdb);
+    }
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}

@@ -1179,6 +1179,27 @@ fn canonicalize_cwd(cwd: &Path) -> PathBuf {
     }
 }
 
+/// `db` 是否就是「公共库同目录下的 `engram.redb`」——即 engram 运行时主目录里那个伪项目库。
+///
+/// 判据（对应需求「作用域库所在 `.engram` 目录 == 公共库所在目录」）：把 `db` 与
+/// `<general_db 的父目录>/engram.redb` 用**规范化后的完整路径**比较。为真即说明：`db`
+/// 是 `~/.engram/general.redb` 旁并列的 `~/.engram/engram.redb`——它绝不是某个真实项目的
+/// 库，而是 engram 主目录本身被误当成了项目根。
+///
+/// 用完整路径（而非仅父目录）比较，是为了**只**命中「与 general.redb 并列的 engram.redb」，
+/// 不误伤「恰好和公共库放在同一个文件夹、但文件名不同」的真实项目库（如测试里把两个库
+/// 平铺在同一临时目录）。判据也**不依赖 HOME 目录名**，纯靠路径同一性。
+///
+/// 用 [`canonicalize_cwd`]（best-effort、失败退回原路径）规范化两侧再比较，故 `C:\Users\X`
+/// 与 `C:\Users\X\`、8.3 短名与长名、`.` 段等写法差异都能对齐；父目录取不到（极端路径）
+/// 时返回 `false`。
+fn is_home_engram_db(db: &Path, general_db: &Path) -> bool {
+    match general_db.parent() {
+        Some(dir) => canonicalize_cwd(db) == canonicalize_cwd(&dir.join(ENGRAM_DB_FILE)),
+        None => false,
+    }
+}
+
 /// 从 `cwd` 向上锚定作用域，并算出公共库路径（生产 helper，供各 hook 命令复用）。
 ///
 /// 流程：
@@ -1187,6 +1208,11 @@ fn canonicalize_cwd(cwd: &Path) -> PathBuf {
 ///    （见 [`resolve_project_scope`]）：空的 / 残留的 `.engram/` 目录**不算**锚点。
 /// 3. 公共库 `general_db` = `general_override` 若给定，否则 `<HOME>/.engram/general.redb`
 ///    （HOME 由 [`home_dir`] 用真实环境变量推导）。
+/// 4. **伪项目守卫**：若锚点落到了 engram 运行时主目录本身——即解析出的作用域库与公共库
+///    同处一个 `.engram/` 目录（`~/.engram/engram.redb` 与 `~/.engram/general.redb`
+///    并列）——把作用域降级为 [`ScopeKind::None`]（无项目）。判据用 [`same_engram_dir`]
+///    的规范化父目录比较，**不依赖 HOME 目录名**。这样家目录（或其下无更近 `.engram`
+///    锚点的子目录）开会话时，L4 项目记忆不会误落进 `~/.engram/engram.redb` 这个伪项目库。
 ///
 /// 返回 `(general_db, scope)`。本函数会探测文件系统（canonicalize、`is_file`），但不
 /// 创建任何目录、不打开任何库——建父目录、开库是调用方的职责。
@@ -1212,7 +1238,7 @@ fn resolve_scope(
     // workspace 判据：`.engram/workspace` 标记文件存在即为项目管理目录。
     let is_workspace = |d: &Path| d.join(ENGRAM_DIR).join(WORKSPACE_MARKER).is_file();
 
-    let scope = resolve_project_scope(&canonical_cwd, has_engram, is_workspace);
+    let mut scope = resolve_project_scope(&canonical_cwd, has_engram, is_workspace);
 
     let general_db = match general_override {
         Some(p) => p.to_path_buf(),
@@ -1221,6 +1247,13 @@ fn resolve_scope(
             home.join(ENGRAM_DIR).join("general.redb")
         }
     };
+
+    // 伪项目守卫：作用域库若就是 general.redb 旁并列的 engram.redb，说明锚点落到了 engram
+    // 运行时主目录本身（家目录 / engram 主目录）——它绝不是某个真实项目的库，降级为无项目
+    // 作用域（只挂公共库、拒写 L4）。判据见 [`is_home_engram_db`]，不依赖 HOME 目录名。
+    if is_home_engram_db(&scope.db, &general_db) {
+        scope.kind = ScopeKind::None;
+    }
 
     Ok((general_db, scope))
 }
@@ -1379,6 +1412,7 @@ fn scope_kind_str(kind: ScopeKind) -> &'static str {
     match kind {
         ScopeKind::Project => "project",
         ScopeKind::Workspace => "workspace",
+        ScopeKind::None => "none",
     }
 }
 
@@ -1470,7 +1504,9 @@ fn read_merged_scope(general_db: &Path, scope: &ProjectScope) -> Result<Vec<Memo
     // 作用域(项目)库：**仅当文件已存在才读，不存在则当空、绝不创建**。只读 hook
     // (hot-index / session-start) 不该在子目录里凭空建出杂散锚点把一个项目碎片化成
     // 多个——项目锚点只由 write / root 显式建立（与 run_status 的处理保持一致）。
-    if scope.db.is_file() {
+    // 无项目作用域（锚点落到 engram 主目录本身）时 `scope.db` 是伪项目库（= general.redb
+    // 旁的 engram.redb），即便文件存在也**不挂载**，只留公共库——避免家目录话题污染。
+    if !scope.is_none() && scope.db.is_file() {
         let (_sdb, mut smems) = open_and_read(&scope.db).map_err(|e| {
             format!(
                 "读取作用域库 {}（{}）失败：{e}",
@@ -2517,6 +2553,16 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         }
     };
 
+    // 3.5 SessionStart 事件：检测库数据版本落后则一次性迁移（先备份、幂等、best-effort
+    //     不阻断注入）。UserPromptSubmit 每条 prompt 都调 hot-index，故仅在 SessionStart
+    //     触发；迁移写版本标记后，预检即早退、零开销。SessionStart 只挂载「公共库 + 当前
+    //     作用域库」，故每个项目首次用新引擎开会话时自动迁移它自己的库。
+    //     （历史 bug：此触发曾误挂在无任何 hook 调用的 session-start 子命令上，导致自动
+    //     迁移从未执行——SessionStart hook 实际调的是 hot-index。）
+    if args.hook_event == "SessionStart" {
+        maybe_migrate_on_session_start(&general_db, &scope, now, args.log);
+    }
+
     // 4. 合并 公共库 + 作用域库（在状态门控之前先读出，因为状态栏小文件无论是否
     //    门控判空都要写最新的一行状态串，需要先有挂载集）。
     //
@@ -2611,7 +2657,8 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
     // 作为「该项目已识别/挂载」的可视确认（空项目否则会在热索引里完全隐身）。
     let active_projects: Vec<&str> = match scope.kind {
         ScopeKind::Project => vec![scope.name.as_str()],
-        ScopeKind::Workspace => Vec::new(),
+        // 管理目录 / 无项目作用域都不渲染任何具体项目段（无项目时连伪项目库都不挂）。
+        ScopeKind::Workspace | ScopeKind::None => Vec::new(),
     };
     // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
     let rendered = engram::render::render_budgeted(&merged, now, &active_projects, args.budget);
@@ -2883,8 +2930,11 @@ fn run_serve(args: ServeCliArgs<'_>) -> ExitCode {
     scan_roots.extend(args.scan_root.iter().cloned());
 
     // 额外库：--project-db 显式项 + 当前作用域库（覆盖不在任何管理目录下的独立项目）。
+    // 无项目作用域时不把伪项目库（家目录 engram.redb）当独立项目加入发现集。
     let mut extra_project_dbs: Vec<(String, PathBuf)> = extra_map.into_iter().collect();
-    extra_project_dbs.push((scope.name.clone(), scope.db.clone()));
+    if !scope.is_none() {
+        extra_project_dbs.push((scope.name.clone(), scope.db.clone()));
+    }
 
     let cfg = ServeConfig {
         host: args.host,
@@ -2969,7 +3019,8 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
     };
     mounted.insert(canonicalize_cwd(&general_db));
 
-    if scope.db.is_file() && mounted.insert(canonicalize_cwd(&scope.db)) {
+    // 无项目作用域时 scope.db 是伪项目库（家目录 engram.redb），跳过不挂（与 hot-index 同规矩）。
+    if !scope.is_none() && scope.db.is_file() && mounted.insert(canonicalize_cwd(&scope.db)) {
         match open_and_read(&scope.db) {
             Ok((_db, mut mems)) => merged.append(&mut mems),
             Err(e) => {
@@ -3258,7 +3309,7 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
             eprintln!("write 失败：{} 记忆必须提供 --project", args.level);
             return ExitCode::FAILURE;
         };
-        match project_dbs.get(name) {
+        let target = match project_dbs.get(name) {
             Some(path) => path.clone(),
             None => {
                 eprintln!(
@@ -3267,7 +3318,19 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
+        };
+        // 伪项目守卫（兜底）：L4 目标库若就是 general.redb 旁并列的 engram.redb，说明它其实
+        // 是 engram 主目录里的伪项目库——当前无真实项目作用域（在家目录或 engram 主目录下开
+        // 的会话）。拒绝写 L4，避免各不相干话题混进这个伪项目库；L1-3 通用记忆不受影响
+        // （走 else 分支写公共库）。
+        if is_home_engram_db(&target, args.general_db) {
+            eprintln!(
+                "write 失败：当前无项目作用域（家目录或 engram 主目录，非有效项目根），\
+                 L4 项目记忆需在真实项目目录下写入；通用记忆可写 L1-3"
+            );
+            return ExitCode::FAILURE;
         }
+        target
     } else {
         if args.project.is_some() {
             eprintln!("write 失败：{} 通用记忆不得提供 --project", args.level);
@@ -5288,7 +5351,8 @@ fn maybe_migrate_on_session_start(
     let mut min_version = g_version;
     let mut project_dbs: BTreeMap<String, PathBuf> = BTreeMap::new();
     // 作用域库：仅当已存在才纳入（不创建杂散锚点，与 read_merged_scope 同规矩）。
-    if scope.db.is_file() {
+    // 无项目作用域时 scope.db 是公共库旁的伪项目库，不纳入迁移集（避免把它当项目库对待）。
+    if !scope.is_none() && scope.db.is_file() {
         if let Ok(v) = store::open(&scope.db).and_then(|db| store::read_data_version(&db)) {
             min_version = min_version.min(v);
         }
@@ -5330,5 +5394,114 @@ fn maybe_migrate_on_session_start(
                 "session-start：迁移失败（不阻断热索引注入，下次会话重试）：{e}"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 在系统临时目录下建一个进程内唯一目录（已创建），返回其路径。
+    fn unique_dir(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dir.push(format!("engram_ut_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+        dir
+    }
+
+    // is_home_engram_db：与 general.redb 并列的 engram.redb（同一 .engram 目录）判为伪项目库。
+    #[test]
+    fn is_home_engram_db_true_for_sibling_engram_redb() {
+        let base = unique_dir("home_true");
+        let engram = base.join(".engram");
+        std::fs::create_dir_all(&engram).expect("建 .engram");
+        let general = engram.join("general.redb");
+        let scope_db = engram.join("engram.redb");
+        // 父目录存在即可比较；无需真实建库文件（只比对完整路径）。
+        assert!(
+            is_home_engram_db(&scope_db, &general),
+            "并列于 general.redb 的 engram.redb 应判为 engram 主目录伪项目库"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // is_home_engram_db：不同项目的 .engram 目录（真实项目 vs 家目录）判为不是伪项目库。
+    #[test]
+    fn is_home_engram_db_false_for_distinct_dirs() {
+        let home = unique_dir("home_false");
+        let proj = unique_dir("home_false_proj");
+        std::fs::create_dir_all(home.join(".engram")).expect("建 home/.engram");
+        std::fs::create_dir_all(proj.join(".engram")).expect("建 proj/.engram");
+        let general = home.join(".engram").join("general.redb");
+        let scope_db = proj.join(".engram").join("engram.redb");
+        assert!(
+            !is_home_engram_db(&scope_db, &general),
+            "真实项目库与家目录公共库不在同一目录，不应判为伪项目库"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // is_home_engram_db（回归）：两个库平铺在同一文件夹但项目库文件名 ≠ engram.redb 时，
+    // **不**判为伪项目库——守卫只命中「与 general.redb 并列的 engram.redb」，不误伤把
+    // general 库与项目库放在同一目录、文件名不同的合法/测试用法。
+    #[test]
+    fn is_home_engram_db_false_for_flat_siblings_diff_name() {
+        let dir = unique_dir("home_flat");
+        let general = dir.join("g.redb");
+        let target = dir.join("p.redb");
+        assert!(
+            !is_home_engram_db(&target, &general),
+            "同目录但文件名非 engram.redb 的项目库不应被判为伪项目库"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // resolve_scope 核心修复：锚点落到「公共库同目录的 engram.redb」时降级为无项目作用域。
+    #[test]
+    fn resolve_scope_home_engram_dir_is_none() {
+        let home = unique_dir("resolve_none");
+        let engram = home.join(".engram");
+        std::fs::create_dir_all(&engram).expect("建 .engram");
+        let general = engram.join("general.redb");
+        // 建出「与 general.redb 并列」的 engram.redb 锚点文件（内容无关，仅需 is_file 为真）。
+        std::fs::write(engram.join("engram.redb"), b"x").expect("写伪项目库锚点");
+
+        let (gdb, scope) = resolve_scope(&home, Some(&general)).expect("resolve_scope 应成功");
+        assert_eq!(gdb, general, "公共库应为传入的 override");
+        assert!(
+            scope.is_none(),
+            "锚点落到 engram 主目录本身应降级为无项目作用域，实得 kind={:?}",
+            scope.kind
+        );
+        assert_eq!(
+            scope_kind_str(scope.kind),
+            "none",
+            "无项目作用域的 kind 短串应为 none"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // resolve_scope 回归：真实项目目录（.engram 目录 ≠ 公共库目录）仍锚定为具体项目。
+    #[test]
+    fn resolve_scope_real_project_is_project() {
+        let general_home = unique_dir("resolve_proj_home");
+        std::fs::create_dir_all(general_home.join(".engram")).expect("建 home/.engram");
+        let general = general_home.join(".engram").join("general.redb");
+
+        let proj = unique_dir("resolve_proj");
+        std::fs::create_dir_all(proj.join(".engram")).expect("建 proj/.engram");
+        std::fs::write(proj.join(".engram").join("engram.redb"), b"x").expect("写项目锚点");
+
+        let (_gdb, scope) = resolve_scope(&proj, Some(&general)).expect("resolve_scope 应成功");
+        assert_eq!(scope.kind, ScopeKind::Project, "真实项目应锚定为 Project");
+        assert!(!scope.is_none(), "真实项目不应被判为无项目作用域");
+
+        let _ = std::fs::remove_dir_all(&general_home);
+        let _ = std::fs::remove_dir_all(&proj);
     }
 }
