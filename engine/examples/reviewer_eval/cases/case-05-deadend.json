@@ -1,0 +1,34 @@
+{
+  "name": "case-05-deadend",
+  "description": "死路踩坑记忆：tokio 2.0-alpha 升级与 redb 冲突被迫回退，教训应写 L4.1/L4.2 高档避免重蹈",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T13:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c05", "message": { "role": "user", "content": [ { "type": "text", "text": "把 evaldemo 的 tokio 升到 2.0-alpha 试试新调度器" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T13:00:05.000Z", "sessionId": "eval-c05", "message": { "role": "assistant", "content": [ { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "cargo update tokio --precise 2.0.0-alpha.1 && cargo build" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T13:02:00.000Z", "sessionId": "eval-c05", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "error: failed to select a version for `mio` ... required by redb-async v1.5\nconflict: tokio 2.0.0-alpha.1 requires mio 2.x, redb-async requires mio 1.x" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T13:02:10.000Z", "sessionId": "eval-c05", "message": { "role": "assistant", "content": [ { "type": "text", "text": "tokio 2.0-alpha 与 redb-async 1.5 的 mio 依赖硬冲突，这条路走不通。回退 tokio 1.x，构建恢复。结论：redb-async 跟进 mio 2.x 之前别再试 tokio 2.0。" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-13T13:03:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c05", "message": { "role": "user", "content": [ { "type": "text", "text": "行，这个坑记下来，别下次又踩。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["tokio 2.0", "死路", "mio"],
+        "level_in": ["L4.1", "L4.2"],
+        "importance_range": [0.7, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": ["构建恢复"],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "dead-end 记忆的价值最高（防止未来重复烧时间）：用户显式说「记下来别再踩」。应写进项目高层级（L4.1/L4.2）且 importance ≥0.6；「回退后构建恢复」是一次性状态，不该作为独立条目入库（must_not_write）。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.1", "--project", "evaldemo", "--cue", "踩坑（死路）：evaldemo 升 tokio 2.0-alpha 与 redb-async 1.5 的 mio 依赖硬冲突，redb-async 跟进 mio 2.x 前勿再试，保持 tokio 1.x", "--importance", "0.72", "--tags", "dead-end"] }
+  ]
+}

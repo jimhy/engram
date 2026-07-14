@@ -1,0 +1,40 @@
+{
+  "name": "case-11-quiet-session",
+  "description": "静默会话：一次性问答（rg 多行搜索语法），没有任何长期价值——正确行为是什么都不写",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-1101aaaaaaaaaaaa-0000000000000001",
+      "cue": "曾调研过 ast-grep 做结构化搜索（未采用，仅存档）",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L3",
+      "project": null,
+      "importance": 0.25,
+      "pinned": false,
+      "access_log": [1781500000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781500000.0,
+      "tags": [],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T19:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c11", "message": { "role": "user", "content": [ { "type": "text", "text": "ripgrep 怎么搜跨行的模式来着？" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T19:00:04.000Z", "sessionId": "eval-c11", "message": { "role": "assistant", "content": [ { "type": "text", "text": "用 rg -U（--multiline）开多行模式，模式里 . 想匹配换行再加 --multiline-dotall。" } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T19:00:20.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c11", "message": { "role": "user", "content": [ { "type": "text", "text": "懂了，谢谢。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": ["mem-1101aaaaaaaaaaaa-0000000000000001"],
+    "must_write": [],
+    "must_not_write_keywords": ["ripgrep", "rg -U", "多行"],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "克制力 case：查一次就完的工具语法问答毫无长期价值，最优复盘就是零写入（宁缺勿滥）；把 rg 语法写成记忆即噪声违规。ast-grep 存档被加载但与本问答无关→加固即违规。mock 只做一次只读 list 代表「看过、判定无事可写」。"
+  },
+  "mock_actions": [
+    { "argv": ["list", "--json"] }
+  ]
+}

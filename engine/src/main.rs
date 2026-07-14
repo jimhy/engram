@@ -41,13 +41,16 @@ use clap::{Parser, Subcommand};
 
 use engram::commands::{
     self, build_merged_memory, gc_should_delete, generate_id, home_dir, last_touch, list_visible,
-    oneline_status, parse_level, parse_project_dbs, parse_status_filter, parse_tags,
+    oneline_status_with_health, parse_level, parse_project_dbs, parse_status_filter, parse_tags,
     recall_candidates, resolve_project_scope, revived_level, tokenize_query, validate_merge_scope,
     MergeScope, ProjectScope, ScopeKind, ENGRAM_DB_FILE, ENGRAM_DIR, WORKSPACE_MARKER,
 };
 use engram::consolidate::{consolidate, Transition, TransitionKind};
-use engram::model::{Level, Memory, Pointer, Status};
-use engram::render::{load_store_entries, render, render_scoped};
+use engram::health::{self, HealthReport};
+use engram::model::{
+    EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION, MEMORY_SCHEMA_VERSION,
+};
+use engram::render::{load_store_entries, render};
 use engram::serve::{self, ServeConfig};
 use engram::session::{self, Pending};
 use engram::store::{self, StoreError};
@@ -139,9 +142,30 @@ enum Command {
         /// 显式指定 id；缺省自动生成唯一 id。
         #[arg(long)]
         id: Option<String>,
+        /// 目标库已存在同 id 记忆时允许覆盖；缺省拒绝（防静默覆盖丢数据）。
+        #[arg(long)]
+        overwrite: bool,
         /// 创建时间（unix 秒）；缺省取系统时间。
         #[arg(long)]
         now: Option<f64>,
+    },
+    /// 备份/迁移导出：把合并集逐条完整序列化为 JSON 文件（文件名=id.json），与 import 对称互逆。
+    Export {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 输出目录（不存在则创建；每条记忆一个 `<id>.json`）。
+        #[arg(long)]
+        dir: PathBuf,
+        /// 项目过滤（可选；给定则仅导出 `project == Some(name)` 的记忆）。
+        #[arg(long)]
+        project: Option<String>,
+        /// 状态过滤：active|cold|superseded|tombstone|all；缺省 all（全量备份）。
+        #[arg(long, default_value = "all")]
+        status: String,
     },
     /// 可读检视：在合并集上按 status/level/project 过滤并排序输出。
     List {
@@ -318,6 +342,10 @@ enum Command {
         /// （父目录不存在会先创建）。写日志失败被静默忽略，不影响主输出。
         #[arg(long)]
         log: Option<PathBuf>,
+        /// 渲染字符预算（0=不限）；缺省 24000 字符 ≈ 8k token，见
+        /// [`engram::render::HOT_INDEX_CHAR_BUDGET`]。
+        #[arg(long, default_value_t = engram::render::HOT_INDEX_CHAR_BUDGET)]
+        budget: usize,
     },
     /// hook 用：从 cwd 锚定作用域、create_dir_all 两父目录，以 env|json 打印 general/
     /// 作用域库路径、作用域名与 kind（project|workspace）。
@@ -347,7 +375,11 @@ enum Command {
         /// 本次用户 prompt 文本（历史信号字段，新作用域模型已不使用；仅为兼容保留接收）。
         #[arg(long)]
         prompt: Option<String>,
-        /// 状态文件路径；给定时启用状态门控（作用域根未变则输出空、不重注入）。
+        /// 状态门控基准路径；给定时启用状态门控（作用域根未变则输出空、不重注入）。
+        /// 兼容说明：本参数继续接受历史的单文件路径（如 `~/.engram/active.state`），
+        /// 但**旧单文件不再读写**——门控状态改按会话分文件存到
+        /// `<其父目录>/active-state/<session_id>.state`，避免多窗口跨项目交替时
+        /// 共享一个门控互相翻转、每条 prompt 都全量重注入。
         #[arg(long)]
         state: Option<PathBuf>,
         /// 状态栏小文件路径；给定时每次都把挂载集的一行状态串写入该文件（覆盖），
@@ -372,6 +404,10 @@ enum Command {
         /// 可选调试日志文件路径；给定时向其追加一行本次调用记录（失败静默忽略）。
         #[arg(long)]
         log: Option<PathBuf>,
+        /// 渲染字符预算（0=不限）；缺省 24000 字符 ≈ 8k token，见
+        /// [`engram::render::HOT_INDEX_CHAR_BUDGET`]。
+        #[arg(long, default_value_t = engram::render::HOT_INDEX_CHAR_BUDGET)]
+        budget: usize,
         /// 当前时间（unix 秒）；缺省取系统时间。
         #[arg(long)]
         now: Option<f64>,
@@ -426,10 +462,22 @@ enum Command {
     },
     /// hook 用（SessionStart）：扫 `work-dir` 残留 pending（上次起了复盘者却没收尾），
     /// 挑**最近一场**补跑、清掉更早的，输出复盘所需单行 JSON（`action`=`review`|`none`）。
+    ///
+    /// 另给 `--sessions-dir` + `--watermark` 时先做**孤儿会话补登**：对「登记过
+    /// （UserPromptSubmit 落的 active-sessions 登记）、无对应 pending、且 transcript
+    /// 现有行数 > 水位线」的最近一个孤儿 transcript 现场补建 pending，再按原流程领取
+    /// ——覆盖强杀/断电时 SessionEnd 未触发、连 pending 都没落下的场景（README
+    /// 「崩溃/强关可补」承诺的闭环）。补跑仍保持「只补最近一场」策略。
     CatchupScan {
         /// pending 与切片的存放目录（如 `~/.engram/pending`）。
         #[arg(long)]
         work_dir: PathBuf,
+        /// 活跃会话登记目录（如 `~/.engram/active-sessions`）；缺省不做孤儿补登。
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+        /// 水位线文件路径（孤儿判定「行数 > 水位线」用）；缺省不做孤儿补登。
+        #[arg(long)]
+        watermark: Option<PathBuf>,
     },
     /// 复盘者收尾：把水位线推进到 pending 的 `end_line`，删除该 pending 与其切片。
     ConsolidateDone {
@@ -501,6 +549,50 @@ enum Command {
         #[arg(long)]
         open: bool,
     },
+    /// 版本触发的一次性数据迁移：把老库存量记忆按新一代规则重洗。
+    ///
+    /// 严格顺序：① 备份优先（先把全库完整 JSON 导出到 `--backup-dir`，失败即中止不动库）；
+    /// ② 结构性清洗（补 `schema_version`、钳未来时间戳、`access_log` 去重排序，自动）；
+    /// ③ 重分层 + 容量（跑 consolidate，把旧尖峰升上来的层降回、超预算层挤下去，自动）；
+    /// ④ 语义性问题（importance 偏离层锚 / 悬空 `superseded_by` / 疑似重复）**只收进报告、
+    /// 绝不自动改**；⑤ 写库级 `data_version`。写库前用 `<general_db>.migrate.lock` 加库级
+    /// 迁移锁防并发，拿不到锁则跳过（下次再迁）。
+    Migrate {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个（一并迁移）。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 仅当库级 `data_version` 落后于当前 [`ENGRAM_DATA_VERSION`] 才迁移；已最新则跳过退出 0。
+        #[arg(long)]
+        if_needed: bool,
+        /// 备份输出根目录；缺省取「公共库父目录 / backups」。
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+        /// 只报告将做什么 + 语义问题，不备份、不写库。
+        #[arg(long)]
+        dry_run: bool,
+        /// 当前时间（unix 秒）；缺省取系统时间。备份目录时间戳、重分层判定均用它。
+        #[arg(long)]
+        now: Option<f64>,
+    },
+    /// 只读健康体检：报告库版本、层分布、schema 分布、坏行、超预算层、未来时间戳、
+    /// 悬空 `superseded_by`、importance 偏离层锚、疑似重复、孤儿。**绝不写库**。
+    Doctor {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 以 JSON 输出（缺省输出可读文本报告）。
+        #[arg(long)]
+        json: bool,
+        /// 当前时间（unix 秒）；缺省取系统时间（未来时间戳判定用）。
+        #[arg(long)]
+        now: Option<f64>,
+    },
 }
 
 /// 取系统当前时间的 unix 秒（f64）。
@@ -515,8 +607,16 @@ fn system_now() -> Result<f64, String> {
 }
 
 /// 解析 `now`：给定则用给定值，否则取系统时间。出错时打印并返回 `None`。
+///
+/// 对显式给定的 `--now` 做输入消毒：必须是**有限且非负**的 unix 秒——否则
+/// NaN/±inf/负数会经 `created_at` / `access_log` 写进库里，污染所有依赖时间差的
+/// 懒计算（activation / TTL / 排序），且一旦落盘极难清理。非法值直接报错退出。
 fn resolve_now(now: Option<f64>) -> Option<f64> {
     match now {
+        Some(n) if !n.is_finite() || n < 0.0 => {
+            eprintln!("--now 非法：{n}（须为有限且非负的 unix 秒）");
+            None
+        }
         Some(n) => Some(n),
         None => match system_now() {
             Ok(n) => Some(n),
@@ -526,6 +626,80 @@ fn resolve_now(now: Option<f64>) -> Option<f64> {
             }
         },
     }
+}
+
+/// 向指定 hook 日志文件**追加一行**带时间戳的记录（best-effort，全程失败静默）。
+///
+/// 供 hook 链路（hot-index 降级、review-prepare / catchup-scan / consolidate-done
+/// 的关键失败）留痕：stderr 在 hook 场景常被吞掉，hook.log 是事后可查的唯一线索。
+fn append_hook_log(log_path: &Path, now: f64, msg: &str) {
+    use std::io::Write as _;
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let ts = now.max(0.0) as u64;
+    let line = format!("{ts} {msg}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 推导 `<engram_dir>/hook.log` 路径：`engram_dir` 给定用给定值，否则回退
+/// `<HOME>/.engram/hook.log`（HOME 取不到时返回 `None`，调用方放弃写日志）。
+fn hook_log_path(engram_dir: Option<&Path>) -> Option<PathBuf> {
+    match engram_dir {
+        Some(d) => Some(d.join("hook.log")),
+        None => home_dir(real_env_lookup)
+            .ok()
+            .map(|h| h.join(ENGRAM_DIR).join("hook.log")),
+    }
+}
+
+/// 把任意字符串净化为文件名安全形式：只留 ASCII 字母数字与 `-`/`_`，其余替换为
+/// `_`；空串回退 `default`。杜绝 `/`、`..` 等穿出目录（状态栏 / 门控 / 登记 /
+/// export 文件名共用此规则）。
+fn sanitize_file_stem(raw: &str) -> String {
+    let safe: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    }
+}
+
+/// 把 `content` **原子地**写入 `path`（tmp+rename，模式同 `session::write_atomic`）。
+///
+/// 供 main.rs 侧的小状态文件（门控 state、last-review-ok、会话登记）使用：
+/// 裸 `fs::write` 截断后写，另一进程并发读会读到空/半截。
+///
+/// # Errors
+/// 建父目录、写临时文件或 rename 失败时返回中文说明的错误字符串。
+fn write_atomic_str(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
+        }
+    }
+    let tmp = path.with_extension("atomic.tmp");
+    std::fs::write(&tmp, content).map_err(|e| format!("写临时文件 {} 失败：{e}", tmp.display()))?;
+    // Windows / Unix 的 rename 对已存在目标均为原子替换。
+    std::fs::rename(&tmp, path).map_err(|e| format!("替换文件 {} 失败：{e}", path.display()))
 }
 
 /// 解析 `--project-db name=path` 原始参数；出错时打印并返回 `None`。
@@ -682,6 +856,7 @@ fn dispatch() -> ExitCode {
             pointer_detail,
             tags,
             id,
+            overwrite,
             now,
         } => run_write(WriteArgs {
             general_db: &general_db,
@@ -696,7 +871,21 @@ fn dispatch() -> ExitCode {
             pointer_detail: pointer_detail.as_deref(),
             tags: tags.as_deref(),
             id: id.as_deref(),
+            overwrite,
             now,
+        }),
+        Command::Export {
+            general_db,
+            project_db,
+            dir,
+            project,
+            status,
+        } => run_export(ExportArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            dir: &dir,
+            project: project.as_deref(),
+            status: &status,
         }),
         Command::List {
             general_db,
@@ -794,12 +983,14 @@ fn dispatch() -> ExitCode {
             now,
             emit,
             log,
+            budget,
         } => run_session_start(SessionStartArgs {
             project_dir: project_dir.as_deref(),
             general_db: general_db.as_deref(),
             now,
             emit: &emit,
             log: log.as_deref(),
+            budget,
         }),
         Command::Resolve {
             project_dir,
@@ -818,6 +1009,7 @@ fn dispatch() -> ExitCode {
             hook_event,
             from_hook_stdin,
             log,
+            budget,
             now,
         } => run_hot_index(HotIndexArgs {
             general_db: general_db.as_deref(),
@@ -831,6 +1023,7 @@ fn dispatch() -> ExitCode {
             hook_event: &hook_event,
             from_hook_stdin,
             log: log.as_deref(),
+            budget,
             now,
         }),
         Command::Status {
@@ -865,7 +1058,11 @@ fn dispatch() -> ExitCode {
             project_db: &project_db,
             project_name: &project_name,
         }),
-        Command::CatchupScan { work_dir } => run_catchup_scan(&work_dir),
+        Command::CatchupScan {
+            work_dir,
+            sessions_dir,
+            watermark,
+        } => run_catchup_scan(&work_dir, sessions_dir.as_deref(), watermark.as_deref()),
         Command::ConsolidateDone { pending, watermark } => {
             run_consolidate_done(&pending, &watermark)
         }
@@ -906,6 +1103,32 @@ fn dispatch() -> ExitCode {
             port,
             host,
             open,
+        }),
+        Command::Migrate {
+            general_db,
+            project_db,
+            if_needed,
+            backup_dir,
+            dry_run,
+            now,
+        } => run_migrate(MigrateCliArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            if_needed,
+            backup_dir: backup_dir.as_deref(),
+            dry_run,
+            now,
+        }),
+        Command::Doctor {
+            general_db,
+            project_db,
+            json,
+            now,
+        } => run_doctor(DoctorArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            json,
+            now,
         }),
     }
 }
@@ -1052,6 +1275,8 @@ struct SessionStartArgs<'a> {
     emit: &'a str,
     /// 可选调试日志文件路径（追加一行）；`None` 时不写日志。
     log: Option<&'a Path>,
+    /// 渲染字符预算（0=不限）；注入路径缺省 [`engram::render::HOT_INDEX_CHAR_BUDGET`]。
+    budget: usize,
 }
 
 /// `session-start` 的输出格式（由 `--emit` 解析而来）。
@@ -1182,6 +1407,11 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
         }
     };
 
+    // 版本触发的一次性迁移（best-effort，绝不阻断热索引注入）：在渲染热索引之前，
+    // 若库级 data_version 落后于当前引擎，尝试一次 migrate --if-needed；失败只留痕、
+    // 照常注入（下次会话重试）。只在 session-start 触发，迁移只跑一次。
+    maybe_migrate_on_session_start(&general_db, &scope, now, args.log);
+
     // 打开公共库与本作用域库，各自读出后合并（作用域库即挂载集）。
     let merged = match read_merged_scope(&general_db, &scope) {
         Ok(m) => m,
@@ -1192,9 +1422,10 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
     };
 
     // 前言（一行）+ 热索引。前言提示按指针查 ground truth、勿凭印象。
-    // 注意：text 分支须与历史输出逐字节一致（println! 前言 + print! render）。
+    // 注意：text 分支在预算内时须与历史输出逐字节一致（println! 前言 + print! render）。
+    // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
     const PREAMBLE: &str = "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」";
-    let rendered = render(&merged, now);
+    let rendered = engram::render::render_budgeted(&merged, now, &[], args.budget);
 
     let status = match emit {
         EmitFormat::Text => {
@@ -1317,10 +1548,21 @@ struct ReviewPrepareArgs<'a> {
 /// pending 标记，再打印 `{"action":"review", ...}`（含切片、pending、库路径等），供
 /// 调用脚本据以起复盘者。
 fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
+    // hook.log 与复盘产物同目录（watermark 的父目录，生产即 ~/.engram）——
+    // 关键失败除 stderr 外同步留痕（hook 场景 stderr 常被吞，事后只能靠它）。
+    let engram_dir = args.watermark.parent().map(Path::to_path_buf);
+    let log_fail = |msg: &str| {
+        if let Some(p) = hook_log_path(engram_dir.as_deref()) {
+            let ts = system_now().unwrap_or(0.0);
+            append_hook_log(&p, ts, msg);
+        }
+    };
+
     let end = match session::count_lines(args.transcript) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("review-prepare 失败：数 transcript 行数失败：{e}");
+            log_fail(&format!("review-prepare 数 transcript 行数失败：{e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1337,6 +1579,7 @@ fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
         .join(format!("{}.slice.jsonl", args.session_id));
     if let Err(e) = session::slice_lines(args.transcript, start, end, &slice_path) {
         eprintln!("review-prepare 失败：切片失败：{e}");
+        log_fail(&format!("review-prepare 切片失败：{e}"));
         return ExitCode::FAILURE;
     }
 
@@ -1357,6 +1600,7 @@ fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
     };
     if let Err(e) = session::write_pending(&pending_path, &pending) {
         eprintln!("review-prepare 失败：写 pending 失败：{e}");
+        log_fail(&format!("review-prepare 写 pending 失败：{e}"));
         return ExitCode::FAILURE;
     }
 
@@ -1388,11 +1632,42 @@ fn run_review_prepare(args: ReviewPrepareArgs<'_>) -> ExitCode {
 /// 正有人复盘，打印 `{"action":"none"}` 直接返回，**这就是挡住双复盘竞态的关口**；
 /// 领到才补跑（其余更早残留连切片、claim 一并删除——轻量策略只补最近一场）；若其
 /// 切片已不在则据 pending 区间重切，再打印 `{"action":"review", ...}`。
-fn run_catchup_scan(work_dir: &Path) -> ExitCode {
+///
+/// 给了 `sessions_dir` + `watermark` 时，扫 pending 之前先做**孤儿会话补登**
+/// （[`rebuild_orphan_pending`]）：强杀/断电场景 SessionEnd 不触发、pending 根本
+/// 没落下，靠 UserPromptSubmit 留下的活跃会话登记现场补建 pending，再按原流程领取
+/// ——补跑仍保持「只补最近一场」策略（补建的 pending 与既有残留一起按 created_at
+/// 排序取最近）。这使 README「崩溃/强关可补」的承诺覆盖到「连 pending 都没有」的场景。
+fn run_catchup_scan(
+    work_dir: &Path,
+    sessions_dir: Option<&Path>,
+    watermark: Option<&Path>,
+) -> ExitCode {
+    // 孤儿会话补登（best-effort）：失败只记 stderr + hook.log，不阻断原有补跑流程。
+    if let (Some(sdir), Some(wm_path)) = (sessions_dir, watermark) {
+        if let Err(e) = rebuild_orphan_pending(work_dir, sdir, wm_path) {
+            eprintln!("catchup-scan: 孤儿会话补登失败（继续原流程）：{e}");
+            if let Some(p) = hook_log_path(work_dir.parent()) {
+                append_hook_log(
+                    &p,
+                    system_now().unwrap_or(0.0),
+                    &format!("catchup-scan 孤儿会话补登失败：{e}"),
+                );
+            }
+        }
+    }
+
     let mut list = match session::list_pending(work_dir) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("catchup-scan 失败：扫描 pending 失败：{e}");
+            if let Some(p) = hook_log_path(work_dir.parent()) {
+                append_hook_log(
+                    &p,
+                    system_now().unwrap_or(0.0),
+                    &format!("catchup-scan 扫描 pending 失败：{e}"),
+                );
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -1438,6 +1713,13 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
             &slice_path,
         ) {
             eprintln!("catchup-scan 失败：重切增量失败：{e}");
+            if let Some(p) = hook_log_path(work_dir.parent()) {
+                append_hook_log(
+                    &p,
+                    system_now().unwrap_or(0.0),
+                    &format!("catchup-scan 重切增量失败：{e}"),
+                );
+            }
             // 补跑没起成，释放刚领的 claim，让下次会话能立即重试（不必等 TTL）。
             session::release_claim(&claim_path);
             return ExitCode::FAILURE;
@@ -1447,15 +1729,129 @@ fn run_catchup_scan(work_dir: &Path) -> ExitCode {
     print_review_json(&pending, &pending_path)
 }
 
+/// 孤儿会话补登：把「登记过、无对应 pending、且 transcript 现有行数 > 水位线」的
+/// **最近一个**孤儿 transcript 现场补建成 pending（行区间 = [水位线, 当前行数]），
+/// 供随后的原流程领取。
+///
+/// 背景：pending 只在 SessionEnd 落；强杀/断电时 SessionEnd 不触发，整场增量丢失。
+/// UserPromptSubmit 路径的 hot-index 每条 prompt 都会把
+/// `{transcript, session_id, 库路径, 时间}` 登记到 `sessions_dir`（见
+/// [`register_active_session`]），本函数据此闭环。补建成功后删除该登记文件
+/// （避免重复补建；正常收尾的会话其登记因「行数 ≤ 水位线」永远不会被选中，
+/// 由 7 天 TTL 自然清掉）。只补最近一个孤儿——与「只补最近一场」的轻量策略一致。
+///
+/// # Errors
+/// 读登记目录 / 扫 pending / 写补建 pending 失败时返回中文错误说明（调用方降级继续）。
+fn rebuild_orphan_pending(
+    work_dir: &Path,
+    sessions_dir: &Path,
+    watermark_path: &Path,
+) -> Result<(), String> {
+    // 登记目录不存在 = 无孤儿（老版本 hook 或从未有过会话），静默返回。
+    if !sessions_dir.is_dir() {
+        return Ok(());
+    }
+    // 读全部登记（坏文件静默跳过，不让一个坏登记拖垮补登）。
+    let mut regs: Vec<(PathBuf, SessionRegistration)> = Vec::new();
+    let rd = std::fs::read_dir(sessions_dir)
+        .map_err(|e| format!("读登记目录 {} 失败：{e}", sessions_dir.display()))?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(reg) = serde_json::from_slice::<SessionRegistration>(&bytes) {
+                regs.push((path, reg));
+            }
+        }
+    }
+    if regs.is_empty() {
+        return Ok(());
+    }
+
+    // 已有 pending 的 transcript 集合：登记若已有对应 pending（SessionEnd 正常落过），
+    // 不重复补建——那是原流程的事。
+    let existing: HashSet<String> = session::list_pending(work_dir)
+        .map_err(|e| format!("扫描 pending 失败：{e}"))?
+        .into_iter()
+        .map(|(_, p)| p.transcript)
+        .collect();
+    let wm = session::read_watermark(watermark_path);
+
+    // 最近优先（登记 ts 降序），找第一个满足「无对应 pending 且行数 > 水位线」的孤儿。
+    regs.sort_by(|a, b| {
+        b.1.ts
+            .partial_cmp(&a.1.ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (reg_path, reg) in &regs {
+        if existing.contains(&reg.transcript_path) {
+            continue;
+        }
+        let transcript = PathBuf::from(&reg.transcript_path);
+        let end = match session::count_lines(&transcript) {
+            Ok(n) => n,
+            Err(_) => continue, // transcript 已不可读（被清理等）：跳过该孤儿。
+        };
+        let start = wm.get(&reg.transcript_path).copied().unwrap_or(0);
+        if end <= start {
+            continue; // 无未巩固增量：不是孤儿（或已被别的路径巩固过）。
+        }
+
+        // 补建 pending（文件名前缀 = 净化后的会话 id，与 review-prepare 的产物同构；
+        // created_at 取登记时间，保证与既有残留按「最近一场」正确排序）。
+        let sid = sanitize_file_stem(&reg.session_id);
+        let slice_path = work_dir.join(format!("{sid}.slice.jsonl"));
+        let pending = Pending {
+            session_id: reg.session_id.clone(),
+            transcript: reg.transcript_path.clone(),
+            slice: slice_path.to_string_lossy().to_string(),
+            start_line: start,
+            end_line: end,
+            general_db: reg.general_db.clone(),
+            project_db: reg.project_db.clone(),
+            project_name: reg.project_name.clone(),
+            created_at: reg.ts,
+        };
+        let pending_path = work_dir.join(format!("{sid}.json"));
+        session::write_pending(&pending_path, &pending)
+            .map_err(|e| format!("写补建 pending 失败：{e}"))?;
+        // 切片交给原流程的「切片不在则重切」逻辑，这里不切（少一处重复实现）。
+        eprintln!(
+            "catchup-scan: 已为孤儿会话 {} 补建 pending（行 {}..{}）",
+            reg.session_id, start, end
+        );
+        // 删除登记，避免下次重复补建（best-effort）。
+        let _ = std::fs::remove_file(reg_path);
+        break; // 只补最近一个孤儿。
+    }
+    Ok(())
+}
+
 /// 执行 `consolidate-done`（复盘者收尾调）：推进水位线 + 删 pending、切片与 claim。
 ///
-/// 读 pending → 把 `watermark[transcript]` 抬到 `end_line`（取较大值，幂等）→ 写回 →
-/// 删 pending 与切片 → 释放 claim 锁（领单收尾闭环），最后打印 `{"action":"done", ...}`。
+/// 读 pending → 对水位线加粗粒度文件锁（`watermark.lock`，持锁毫秒级）→ 把
+/// `watermark[transcript]` 抬到 `end_line`（取较大值，幂等）→ 原子写回 → 释放锁 →
+/// 原子写 `last-review-ok` 健康标记 → 删 pending 与切片 → 释放 claim 锁（领单收尾
+/// 闭环），最后打印 `{"action":"done", ...}`。关键失败除 stderr 外同步追加 hook.log。
 fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
+    // hook.log 与复盘产物同目录（watermark 的父目录，生产即 ~/.engram）。
+    let engram_dir = watermark.parent().map(Path::to_path_buf);
+    let log_fail = |now: f64, msg: &str| {
+        if let Some(p) = hook_log_path(engram_dir.as_deref()) {
+            append_hook_log(&p, now, msg);
+        }
+    };
+    let Some(now) = resolve_now(None) else {
+        return ExitCode::FAILURE;
+    };
+
     let pending = match session::read_pending(pending_path) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("consolidate-done 失败：读 pending 失败：{e}");
+            log_fail(now, &format!("consolidate-done 读 pending 失败：{e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1464,7 +1860,8 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
     // ——升降级本是纯算法、无需 LLM 判断，故不再依赖复盘者是否记得手动跑
     // `consolidate`（confirm-use/supersede/merge 这类需语义判断的仍留给复盘者）。
     // best-effort：巩固失败只记 stderr，绝不阻断水位线推进与 pending 清理。
-    if let Some(now) = resolve_now(None) {
+    let mut transition_count = 0usize;
+    {
         let mut pmap: BTreeMap<String, PathBuf> = BTreeMap::new();
         if !pending.project_name.is_empty() && !pending.project_db.is_empty() {
             pmap.insert(
@@ -1473,12 +1870,47 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
             );
         }
         match consolidate_libs(Path::new(&pending.general_db), &pmap, now, false) {
-            Ok(ts) if !ts.is_empty() => {
-                eprintln!("consolidate-done: 确定性巩固 {} 条变迁", ts.len());
+            Ok(ts) => {
+                transition_count = ts.len();
+                if !ts.is_empty() {
+                    eprintln!("consolidate-done: 确定性巩固 {} 条变迁", ts.len());
+                }
             }
-            Ok(_) => {}
             Err(e) => eprintln!("consolidate-done: 巩固跳过（{e}）"),
         }
+    }
+
+    // 水位线读-改-写加粗粒度文件锁：并发的两个收尾者（如 SessionEnd 复盘 + 手动
+    // consolidate-done）同时读-改-写会互相丢更新。锁用 create_new claim 原语
+    // （watermark.lock），持锁毫秒级；stale 超 30 秒可夺（持有者崩溃不至长期卡死）。
+    let lock_path = watermark.with_extension("lock");
+    let mut locked = false;
+    for _ in 0..40 {
+        match session::try_claim_ttl(
+            &lock_path,
+            now,
+            std::process::id(),
+            session::WATERMARK_LOCK_TTL_SECS,
+        ) {
+            Ok(session::ClaimOutcome::Acquired) => {
+                locked = true;
+                break;
+            }
+            Ok(session::ClaimOutcome::Held) => {
+                // 对方持锁毫秒级，稍等重试（总预算约 2 秒）。
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("consolidate-done: 建 watermark 锁失败（无锁继续）：{e}");
+                break;
+            }
+        }
+    }
+    if !locked {
+        // 重试预算用尽仍拿不到锁：退化为旧行为（无锁写回）并留痕——收尾绝不能
+        // 因为锁而放弃（否则 pending 永不清、水位线永不推进）。
+        eprintln!("consolidate-done: 未取得 watermark 锁，按旧行为无锁写回（冲突概率极低）");
+        log_fail(now, "consolidate-done 未取得 watermark 锁，无锁写回");
     }
 
     let mut wm = session::read_watermark(watermark);
@@ -1486,10 +1918,33 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
     if pending.end_line > cur {
         wm.insert(pending.transcript.clone(), pending.end_line);
     }
-    if let Err(e) = session::write_watermark(watermark, &wm) {
+    let write_result = session::write_watermark(watermark, &wm);
+    if locked {
+        session::release_claim(&lock_path);
+    }
+    if let Err(e) = write_result {
         eprintln!("consolidate-done 失败：写水位线失败：{e}");
+        log_fail(now, &format!("consolidate-done 写水位线失败：{e}"));
         return ExitCode::FAILURE;
     }
+
+    // 成功收尾 → 原子写 last-review-ok 健康标记（status 的复盘健康面据此判停摆）。
+    // best-effort：健康标记是旁路，写失败只记 stderr，不影响收尾成功语义。
+    if let Some(dir) = &engram_dir {
+        let ok = serde_json::json!({
+            "ts": now,
+            "transcript": pending.transcript,
+            "start_line": pending.start_line,
+            "end_line": pending.end_line,
+            "transitions": transition_count,
+        });
+        if let Ok(content) = serde_json::to_string_pretty(&ok) {
+            if let Err(e) = write_atomic_str(&dir.join("last-review-ok"), &content) {
+                eprintln!("consolidate-done: 写 last-review-ok 失败（不影响收尾）：{e}");
+            }
+        }
+    }
+
     session::remove_pending(pending_path, Path::new(&pending.slice));
     // 释放本场的 claim 锁（与领单配对的收尾；best-effort，同 remove_pending 风格）。
     session::release_claim(&session::claim_path_for(pending_path));
@@ -1621,6 +2076,7 @@ fn run_root(project_dir: Option<&Path>, general_db: Option<&Path>) -> ExitCode {
         superseded_by: None,
         created_at: now,
         tags: vec!["workspace".to_string()],
+        schema_version: MEMORY_SCHEMA_VERSION,
     };
     let gdb = match store::open(&general_db) {
         Ok(d) => d,
@@ -1693,21 +2149,26 @@ struct HotIndexArgs<'a> {
     from_hook_stdin: bool,
     /// 可选调试日志路径。
     log: Option<&'a Path>,
+    /// 渲染字符预算（0=不限）。
+    budget: usize,
     /// 当前时间（unix 秒）；`None` 取系统时间。
     now: Option<f64>,
 }
 
 /// 从 stdin 解析出的 hook 兜底字段（缺失即为 `None`）。
 ///
-/// 新作用域模型需 hook 给的 `cwd`（用于从其向上锚定作用域）与 `session_id`
-/// （状态栏按会话分文件用，避免多窗口共用单文件互相覆盖）；历史的
-/// `transcript_path` / `prompt` 已不再参与判定，故不再解析。
+/// 新作用域模型需 hook 给的 `cwd`（用于从其向上锚定作用域）、`session_id`
+/// （状态栏 / 门控按会话分文件用，避免多窗口共用单文件互相覆盖）与
+/// `transcript_path`（活跃会话登记用，供崩溃场景的孤儿补建）；历史的
+/// `prompt` 不再参与判定，故不再解析。
 #[derive(Debug, Default)]
 struct HookStdin {
     /// hook 给的当前工作目录。
     cwd: Option<PathBuf>,
-    /// hook 给的会话 id（状态栏按会话分文件用）。
+    /// hook 给的会话 id（状态栏 / 门控按会话分文件用）。
     session_id: Option<String>,
+    /// hook 给的 transcript 路径（活跃会话登记用）。
+    transcript_path: Option<String>,
 }
 
 /// 读取整段 stdin、按 hook JSON 解析出 `cwd`。
@@ -1735,13 +2196,23 @@ fn read_hook_stdin() -> HookStdin {
         None => return HookStdin::default(),
     };
     let cwd = obj.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-    // session_id：状态栏按会话分文件用（避免多窗口共用单文件互相覆盖）；空串视作无。
+    // session_id：状态栏 / 门控按会话分文件用（避免多窗口共用单文件互相覆盖）；空串视作无。
     let session_id = obj
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    HookStdin { cwd, session_id }
+    // transcript_path：活跃会话登记用（崩溃场景孤儿补建的线索）；空串视作无。
+    let transcript_path = obj
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    HookStdin {
+        cwd,
+        session_id,
+        transcript_path,
+    }
 }
 
 /// 读状态文件里上次记录的作用域根路径（去首尾空白）。文件不存在/读失败/为空 → `None`。
@@ -1755,18 +2226,98 @@ fn read_state(path: &Path) -> Option<String> {
     }
 }
 
-/// 把本次作用域根的绝对路径字符串写回状态文件（父目录不存在先创建）。失败时返回错误说明。
+/// 把本次作用域根的绝对路径字符串**原子地**写回状态文件（tmp+rename，父目录不存在
+/// 先创建）。失败时返回错误说明。
 ///
 /// # Errors
-/// 创建父目录或写文件失败时返回带路径说明的错误字符串。
+/// 创建父目录、写临时文件或 rename 失败时返回带路径说明的错误字符串。
 fn write_state(path: &Path, scope_root: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建状态目录 {} 失败：{e}", parent.display()))?;
+    write_atomic_str(path, scope_root)
+}
+
+/// 由 `--state` 基准路径 + 会话 id 推导**按会话分文件**的门控状态路径：
+/// `<base 父目录>/active-state/<净化后 session_id>.state`。
+///
+/// 背景：hooks.json 的 UserPromptSubmit 传全局单文件 `--state ~/.engram/active.state`，
+/// 两个窗口跨项目交替时 scope.root 在单文件里反复翻转、门控失效、每条 prompt 都全量
+/// 重注入。改为按会话分文件后各窗口互不干扰；`--state` 原路径仅作定位基准保留兼容，
+/// 旧单文件不再读写。无 session_id（如手动调试）时回退 `default.state`。
+fn session_state_path(state_base: &Path, session_id: Option<&str>) -> PathBuf {
+    let dir = state_base
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let sid = sanitize_file_stem(session_id.unwrap_or("default"));
+    dir.join("active-state").join(format!("{sid}.state"))
+}
+
+/// 一条活跃会话登记（`~/.engram/active-sessions/<sid>.json`），UserPromptSubmit
+/// 路径的 hot-index 每条 prompt 原子刷写。
+///
+/// 用途（崩溃场景补漏）：pending 只在 SessionEnd 落，强杀/断电时 SessionEnd 不触发、
+/// 整场增量丢失。有了登记，下次 SessionStart 的 catchup-scan 能据
+/// `transcript_path` + 水位线现场补建 pending（见 `rebuild_orphan_pending`）。
+/// 库路径与项目名一并登记，补建的 pending 才能透传给复盘者。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionRegistration {
+    /// 会话 id（登记文件名与补建 pending 的文件名前缀）。
+    session_id: String,
+    /// transcript（JSONL）路径——孤儿判定与补切的依据。
+    transcript_path: String,
+    /// 最近一次刷写时间（unix 秒）；catchup 挑「最近一个孤儿」用。
+    ts: f64,
+    /// 公共库路径（透传给补建的 pending）。
+    general_db: String,
+    /// 作用域（项目）库路径（透传给补建的 pending）。
+    project_db: String,
+    /// 作用域（项目）名（透传给补建的 pending）。
+    project_name: String,
+}
+
+/// 登记目录 / 门控目录里旧文件的保留窗口（秒）：7 天，与状态栏会话文件一致。
+const ACTIVE_FILE_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// 删 `dir` 内 mtime 早于「现在 − `ttl_secs`」且扩展名为 `ext` 的文件
+/// （best-effort，全程静默）。[`cleanup_stale_status`] 的通用化版本。
+fn cleanup_stale_files(dir: &Path, ext: &str, ttl_secs: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = modified.elapsed() else {
+            continue;
+        };
+        if age.as_secs() > ttl_secs {
+            let _ = std::fs::remove_file(&path);
         }
     }
-    std::fs::write(path, scope_root).map_err(|e| format!("写状态文件 {} 失败：{e}", path.display()))
+}
+
+/// 把本会话登记到 `<state_base 父目录>/active-sessions/<sid>.json`（原子写，
+/// best-effort：登记是崩溃兜底旁路，任何失败都静默、绝不影响注入主流程）。
+/// 顺手按 7 天 TTL 清理目录内过期登记。
+fn register_active_session(state_base: &Path, reg: &SessionRegistration) {
+    let dir = state_base
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("active-sessions");
+    let sid = sanitize_file_stem(&reg.session_id);
+    let Ok(content) = serde_json::to_string_pretty(reg) else {
+        return;
+    };
+    let _ = write_atomic_str(&dir.join(format!("{sid}.json")), &content);
+    cleanup_stale_files(&dir, "json", ACTIVE_FILE_TTL_SECS);
 }
 
 /// 向 `hot-index` 的调试日志**追加一行**（best-effort，失败静默忽略）。
@@ -1792,6 +2343,93 @@ fn append_hot_index_log(log_path: &Path, now: f64, hook_event: &str, scope: &Pro
         .open(log_path)
     {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// hot-index 打库失败时的**降级注入**：stderr 报错、hook.log 留痕，stdout 按
+/// emit 格式输出一段最小 additionalContext（格式与成功路径一致），exit 0。
+///
+/// 设计取舍：hook 失败时它的 stderr 几乎没人看，若只报错退出，该会话就是
+/// 「零记忆注入 + 模型全然不知」——模型会自信地凭空行事。降级注入让模型至少
+/// 知道「记忆缺席」这一事实并能提示用户自查；exit 0 是 hook 语义（降级但不装死）。
+fn degrade_hot_index_unavailable(
+    err: &str,
+    emit: EmitFormat,
+    hook_event: &str,
+    log: Option<&Path>,
+    now: f64,
+) -> ExitCode {
+    // stderr 照旧完整报错（供手动调试时看全文）。
+    eprintln!("hot-index 失败（降级注入提示后 exit 0）：{err}");
+
+    // 原因摘要：截到 200 字符以内，避免把冗长底层错误整段塞进模型上下文。
+    let summary: String = err.chars().take(200).collect();
+    let context = format!(
+        "⚠ engram 记忆库暂不可用（{summary}），本会话记忆缺席；可稍后用 /engram:status 检查"
+    );
+
+    // 失败事件追加 hook.log（--log 给定用给定路径，否则回退 ~/.engram/hook.log）。
+    let log_path = match log {
+        Some(p) => Some(p.to_path_buf()),
+        None => hook_log_path(None),
+    };
+    if let Some(p) = log_path {
+        append_hook_log(&p, now, &format!("hot-index 打库失败降级：{err}"));
+    }
+
+    match emit {
+        EmitFormat::Text => {
+            println!("{context}");
+            ExitCode::SUCCESS
+        }
+        EmitFormat::Json => match build_hot_index_json(hook_event, &context) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                // 连包 JSON 都失败（理论不可达）：只能放弃注入，但仍按降级语义 exit 0。
+                eprintln!("hot-index 降级注入失败：{e}");
+                ExitCode::SUCCESS
+            }
+        },
+    }
+}
+
+/// 复盘健康快照（`gather_review_health` 的产物）。
+struct ReviewHealth {
+    /// pending 目录里的残留标记数（`*.json`）。
+    pending_count: usize,
+    /// 上次成功巩固（last-review-ok）的时间戳（unix 秒）；读不到为 `None`。
+    last_ok_ts: Option<f64>,
+    /// 疑似停摆判定（见 [`engram::commands::reviewer_stalled`]）。
+    stalled: bool,
+}
+
+/// 从 `<engram_dir>`（即 `~/.engram`，与公共库同目录）收集复盘健康信号：
+/// `pending/` 残留数 + `last-review-ok` 时间戳 → 停摆判定。全程容错，
+/// 读不到一律按「无」处理（不让健康检查本身把 status 弄挂）。
+fn gather_review_health(engram_dir: &Path, now: f64) -> ReviewHealth {
+    // pending 残留数：数 pending/ 下的 *.json 标记文件（不解析内容，坏文件也算残留）。
+    let pending_count = std::fs::read_dir(engram_dir.join("pending"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    // last-review-ok：consolidate-done 成功收尾时原子写下的 JSON（取其 ts 字段）。
+    let last_ok_ts = std::fs::read_to_string(engram_dir.join("last-review-ok"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("ts").and_then(serde_json::Value::as_f64));
+
+    let stalled = engram::commands::reviewer_stalled(pending_count, last_ok_ts, now);
+    ReviewHealth {
+        pending_count,
+        last_ok_ts,
+        stalled,
     }
 }
 
@@ -1830,9 +2468,9 @@ fn build_hot_index_json(hook_event: &str, context: &str) -> Result<String, Strin
 /// 注意：`--transcript` / `--prompt`（及 stdin 的同名字段）在新作用域模型下不再参与
 /// 判定，仅为兼容历史 hook 调用契约而保留接收，本函数不读取它们。
 fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
-    // 历史 hook 调用仍可能传 --transcript / --prompt；新模型不再用它们做作用域判定，
-    // 显式忽略以表意图、避免「字段从未读取」的告警。
-    let _ = (args.transcript, args.prompt);
+    // 历史 hook 调用仍可能传 --prompt；新模型不再用它做任何判定，显式忽略以表意图。
+    // --transcript 仍接收：作活跃会话登记的 transcript 兜底（stdin 缺该字段时）。
+    let _ = args.prompt;
 
     // 输出格式复用 session-start 的解析。
     let emit = match parse_emit_format(args.emit) {
@@ -1881,18 +2519,32 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
 
     // 4. 合并 公共库 + 作用域库（在状态门控之前先读出，因为状态栏小文件无论是否
     //    门控判空都要写最新的一行状态串，需要先有挂载集）。
+    //
+    //    打库失败**降级而非装死**：此前只 eprintln + 非 0 退出——该会话零记忆注入
+    //    且模型上下文里没有任何信号（hook 的 stderr 用户通常看不到）。改为：stderr
+    //    照旧报错、hook.log 留痕，但 stdout 按 emit 格式输出一段最小提示注入，让
+    //    模型知道「记忆缺席」这一事实，并 exit 0（hook 语义：降级但不失败）。
     let merged = match read_merged_scope(&general_db, &scope) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("hot-index 失败：{e}");
-            return ExitCode::FAILURE;
+            return degrade_hot_index_unavailable(&e, emit, args.hook_event, args.log, now);
         }
     };
+
+    // 复盘健康：pending 残留 + last-review-ok 距今判定「疑似停摆」，停摆时状态栏
+    // 串尾加 ⚠reviewer（复盘产物与公共库同在 <general_db 父目录>，即 ~/.engram）。
+    let stalled = general_db
+        .parent()
+        .map(|dir| {
+            let h = gather_review_health(dir, now);
+            h.stalled
+        })
+        .unwrap_or(false);
 
     // 5. 状态栏小文件（best-effort）：无论后面状态门控是否判空、是否注入，都先把状态栏
     //    刷成最新；写失败静默忽略。优先按会话分文件（--status-dir/<session_id>.txt），让每个
     //    窗口只读自己会话的状态、不被别的窗口的 hook 覆盖；否则回退单文件（--status-file）。
-    let status_line = oneline_status(&merged, now);
+    let status_line = oneline_status_with_health(&merged, now, stalled);
     if let Some(dir) = args.status_dir {
         let sid = hook.session_id.as_deref().unwrap_or("default");
         write_session_status_silent(dir, sid, &status_line);
@@ -1900,11 +2552,39 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         write_status_file_silent(status_path, &status_line);
     }
 
+    // 5b. 活跃会话登记（仅带 --state 的 UserPromptSubmit 路径；best-effort）：
+    //     把 {transcript, session_id, 时间, 库路径} 原子写 active-sessions/<sid>.json，
+    //     强杀/断电时 SessionEnd 不触发也能靠它在下次启动补建 pending（崩溃补漏闭环）。
+    if let Some(state_base) = args.state {
+        let transcript = hook
+            .transcript_path
+            .clone()
+            .or_else(|| args.transcript.map(|p| p.to_string_lossy().to_string()));
+        if let Some(transcript) = transcript {
+            register_active_session(
+                state_base,
+                &SessionRegistration {
+                    session_id: hook
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                    transcript_path: transcript,
+                    ts: now,
+                    general_db: general_db.to_string_lossy().to_string(),
+                    project_db: scope.db.to_string_lossy().to_string(),
+                    project_name: scope.name.clone(),
+                },
+            );
+        }
+    }
+
     // 6. 状态门控（仅当 --state 给出）：与上次 scope.root 相同则输出空、exit 0。
-    //    state 文件存上次作用域根的绝对路径字符串。
+    //    门控状态按会话分文件存于 <state 父目录>/active-state/<sid>.state（见
+    //    [`session_state_path`]）；--state 原路径仅作定位基准，旧单文件不再读写。
     let scope_root_str = scope.root.to_string_lossy().to_string();
-    if let Some(state_path) = args.state {
-        let last = read_state(state_path);
+    if let Some(state_base) = args.state {
+        let state_path = session_state_path(state_base, hook.session_id.as_deref());
+        let last = read_state(&state_path);
         let unchanged = last.as_deref() == Some(scope_root_str.as_str());
         if unchanged {
             // 不打印任何东西（让 hook 不注入）；状态栏文件已在上一步写过、仍记日志（best-effort）。
@@ -1913,10 +2593,14 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
-        // 有变化：把本次 scope.root 绝对路径写回状态文件后继续渲染。
-        if let Err(e) = write_state(state_path, &scope_root_str) {
+        // 有变化：把本次 scope.root 绝对路径写回状态文件后继续渲染，
+        // 并按 7 天 TTL 顺手清理门控目录里过期的旧会话状态。
+        if let Err(e) = write_state(&state_path, &scope_root_str) {
             eprintln!("hot-index 失败：{e}");
             return ExitCode::FAILURE;
+        }
+        if let Some(dir) = state_path.parent() {
+            cleanup_stale_files(dir, "state", ACTIVE_FILE_TTL_SECS);
         }
     }
 
@@ -1929,7 +2613,8 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         ScopeKind::Project => vec![scope.name.as_str()],
         ScopeKind::Workspace => Vec::new(),
     };
-    let rendered = render_scoped(&merged, now, &active_projects);
+    // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
+    let rendered = engram::render::render_budgeted(&merged, now, &active_projects, args.budget);
     let is_workspace = scope.kind == ScopeKind::Workspace;
 
     // 8. 输出。
@@ -2005,18 +2690,8 @@ const STATUS_SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
 /// - `session_id`：会话 id；非文件名安全字符会被替换为 `_`，空则记为 `default`。
 /// - `content`：要写入的一行状态串（[`oneline_status`] 的产物）。
 fn write_session_status_silent(dir: &Path, session_id: &str, content: &str) {
-    // 文件名净化：只留 ASCII 字母数字与 `-`/`_`，其余替换为 `_`，杜绝 `/`、`..` 穿出目录。
-    let safe: String = session_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let safe = if safe.is_empty() { "default" } else { safe.as_str() };
+    // 文件名净化（共用 [`sanitize_file_stem`]）：杜绝 `/`、`..` 穿出目录。
+    let safe = sanitize_file_stem(session_id);
     // 目录不存在先建；失败则放弃（不报错、不影响主输出）。
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -2029,22 +2704,9 @@ fn write_session_status_silent(dir: &Path, session_id: &str, content: &str) {
 ///
 /// 用文件 mtime 的 [`std::fs::Metadata::modified`] + `elapsed()` 判龄，避免与外部逻辑时钟耦合；
 /// 读目录 / 取元数据 / 删文件任一步失败或时钟异常都跳过（保守不删），绝不上抛。
+/// 通用内核见 [`cleanup_stale_files`]（门控 / 登记目录复用同一模式）。
 fn cleanup_stale_status(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        let Ok(age) = modified.elapsed() else { continue };
-        if age.as_secs() > STATUS_SESSION_TTL_SECS {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    cleanup_stale_files(dir, "txt", STATUS_SESSION_TTL_SECS);
 }
 
 /// `status` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
@@ -2337,17 +2999,55 @@ fn run_status(args: StatusArgs<'_>) -> ExitCode {
         }
     }
 
+    // 复盘健康：复盘产物（pending / last-review-ok）与公共库同在 <general_db 父目录>
+    // （生产即 ~/.engram；测试传临时目录时随之隔离，保持可测）。
+    let health = general_db
+        .parent()
+        .map(|dir| gather_review_health(dir, now));
+
     match format {
         StatusFormat::Oneline => {
-            // 一行串，println! 自带一个换行（无多余空行）。
-            println!("{}", oneline_status(&merged, now));
+            // 一行串，println! 自带一个换行（无多余空行）；疑似停摆时串尾加 ⚠reviewer。
+            let stalled = health.as_ref().map(|h| h.stalled).unwrap_or(false);
+            println!("{}", oneline_status_with_health(&merged, now, stalled));
         }
         StatusFormat::Full => {
             // render_status_full 末尾已自带换行，用 print! 避免多一个空行。
             print!("{}", render_status_full(&merged, now));
+            if let Some(h) = &health {
+                print!("{}", render_review_health(h, now));
+            }
         }
     }
     ExitCode::SUCCESS
+}
+
+/// 渲染 `status --format full` 的复盘健康段（多行，自带末尾换行）。
+///
+/// 内容：上次成功巩固时间/距今、pending 目录残留数；疑似停摆（存在 pending 且
+/// last-review-ok 距今 > 48h）时额外输出一行原因与自查指引。
+fn render_review_health(h: &ReviewHealth, now: f64) -> String {
+    let mut buf = String::new();
+    let last = match h.last_ok_ts {
+        Some(ts) => {
+            let hours = ((now - ts) / 3600.0).max(0.0);
+            format!("{ts:.0}（距今 {hours:.1} 小时）")
+        }
+        None => "（从未记录）".to_string(),
+    };
+    buf.push_str(&format!(
+        "复盘健康：上次成功巩固 {last}；pending 残留 {} 条\n",
+        h.pending_count
+    ));
+    if h.stalled {
+        buf.push_str(
+            "⚠ 疑似停摆：存在 pending 残留且上次成功巩固距今超 48 小时。\
+             自查：① 看 ~/.engram/hook.log 里 review/catchup 的失败记录；\
+             ② 确认 SessionEnd 复盘者能启动（ENGRAM_REVIEWER_CLI 指向的 CLI 可用）；\
+             ③ 手动跑 engram catchup-scan --work-dir ~/.engram/pending 补跑最近一场。\n",
+        );
+    }
+    buf
 }
 
 /// 执行 `render` 子命令：读公共库 + 所有项目库 → 合并 → 渲染 → 打印。
@@ -2484,6 +3184,25 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// cue 长度源头治理的警告阈值（字符数）。
+///
+/// cue 应是一句话检索线索；超过此长度大概率是把细节正文塞进了 cue——超长 cue
+/// 会挤占该层字符预算（见 `TierParams::char_budget` 的条数+预算双约束），把
+/// 同层其它记忆提前挤下去。仅警告、不拒绝：由写入方自行裁决。
+const CUE_WARN_CHARS: usize = 240;
+
+/// 若 cue 超长（字符数 > [`CUE_WARN_CHARS`]）则向 stderr 打警告（不拒绝）。
+///
+/// write（含 --overwrite）/ merge / graduate 等所有产生新 cue 的路径共用。
+fn warn_long_cue(cue: &str) {
+    let n = cue.chars().count();
+    if n > CUE_WARN_CHARS {
+        eprintln!(
+            "警告：cue 应是一句话检索线索（当前 {n} 字符），细节请放指针/detail——超长 cue 会挤占该层字符预算"
+        );
+    }
+}
+
 /// `write` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
 struct WriteArgs<'a> {
     general_db: &'a Path,
@@ -2498,6 +3217,7 @@ struct WriteArgs<'a> {
     pointer_detail: Option<&'a str>,
     tags: Option<&'a str>,
     id: Option<&'a str>,
+    overwrite: bool,
     now: Option<f64>,
 }
 
@@ -2505,6 +3225,10 @@ struct WriteArgs<'a> {
 ///
 /// 校验：importance ∈ [0,1]；L4.x 必须给 `--project NAME` 且 NAME 在项目库映射中；
 /// L1-3 不得给 `--project`。任一校验失败即非 0 退出且不写入。
+///
+/// 防覆盖：目标库已存在同 id 记忆时**默认拒绝**（store::put 是 upsert，静默覆盖
+/// 等于无痕丢旧记忆），提示改用 `--overwrite` 显式确认（对齐 graduate 的
+/// 新 id 冲突拦截）。只查目标库：跨库同 id 不会互相覆盖，不在拦截范围。
 fn run_write(args: WriteArgs<'_>) -> ExitCode {
     // 解析层级。
     let level = match parse_level(args.level) {
@@ -2581,6 +3305,7 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
         superseded_by: None,
         created_at: now,
         tags: parse_tags(args.tags),
+        schema_version: MEMORY_SCHEMA_VERSION,
     };
 
     let db = match store::open(&target) {
@@ -2590,10 +3315,25 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // 防覆盖拦截：同 id 已存在且未给 --overwrite → 拒绝（不写入）。
+    match store::get(&db, &id) {
+        Ok(Some(_)) if !args.overwrite => {
+            eprintln!("write 失败：id {id} 在目标库已存在；如确要覆盖旧记忆请加 --overwrite");
+            return ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("write 失败：检查 id 冲突时读库失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    }
     if let Err(e) = store::put(&db, &memory) {
         eprintln!("写入记忆失败：{e}");
         return ExitCode::FAILURE;
     }
+
+    // cue 长度源头治理：超长仅警告（不拒绝），覆盖普通写入与 --overwrite 路径。
+    warn_long_cue(args.cue);
 
     println!("{id}");
     ExitCode::SUCCESS
@@ -2811,7 +3551,11 @@ fn run_consolidate(
         println!(
             "== consolidate (now={now}) == 共 {} 条变迁{}",
             transitions.len(),
-            if dry_run { "（dry-run，不写回）" } else { "" }
+            if dry_run {
+                "（dry-run，不写回）"
+            } else {
+                ""
+            }
         );
         for t in &transitions {
             print_transition(t);
@@ -2915,6 +3659,10 @@ fn run_import(general_db: &Path, project_db_raw: &[String], json_dir: &Path) -> 
     let Some(project_dbs) = resolve_project_dbs(project_db_raw) else {
         return ExitCode::FAILURE;
     };
+    // 取当前时间：未来时间戳消毒（跨机拷库 / 时钟回拨）用。
+    let Some(now) = resolve_now(None) else {
+        return ExitCode::FAILURE;
+    };
 
     let entries = match load_store_entries(json_dir) {
         Ok(e) => e,
@@ -2928,7 +3676,16 @@ fn run_import(general_db: &Path, project_db_raw: &[String], json_dir: &Path) -> 
     let mut general_mems: Vec<Memory> = Vec::new();
     let mut project_mems: BTreeMap<String, Vec<Memory>> = BTreeMap::new();
     for entry in entries {
-        let m = entry.memory;
+        let mut m = entry.memory;
+        // 时间输入消毒：created_at / access_log 里超过 now+60s 的未来时间戳一律
+        // 钳到 now（60s 容忍正常时钟偏差）。未来时间戳会让 Δt 为负、activation
+        // 计算失真，且在源头（另一台机器的时钟）已不可考，钳制是最保守的修复。
+        if sanitize_future_times(&mut m, now) {
+            eprintln!(
+                "import: 记忆 {} 含超过 now+60s 的未来时间戳，已钳制到当前时间（跨机拷库/时钟回拨消毒）",
+                m.id
+            );
+        }
         if commands::is_l4(m.level) {
             // L4 必须有所属项目，且该项目在映射中。
             match &m.project {
@@ -2996,6 +3753,116 @@ fn run_import(general_db: &Path, project_db_raw: &[String], json_dir: &Path) -> 
         project_mems.len(),
     );
     ExitCode::SUCCESS
+}
+
+/// `export` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
+struct ExportArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    dir: &'a Path,
+    project: Option<&'a str>,
+    status: &'a str,
+}
+
+/// 把一批记忆逐条完整序列化为 `<dir>/<净化id>.json`（`export` 与 `migrate` 备份的
+/// 共用落盘逻辑）。目录不存在则创建；同名文件覆盖。返回成功写出的条数。
+///
+/// 文件名取净化后的 id（[`sanitize_file_stem`]，防异常 id 穿出目录），与 `import`
+/// 对称互逆（一文件一记忆、含全部字段与 `schema_version`）。
+///
+/// # Errors
+/// 创建目录、序列化任一记忆或写文件失败时返回中文说明的错误字符串。
+fn write_memories_as_json(dir: &Path, mems: &[&Memory]) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录 {} 失败：{e}", dir.display()))?;
+    let mut written = 0usize;
+    for m in mems {
+        let json = serde_json::to_string_pretty(m)
+            .map_err(|e| format!("序列化记忆 {} 失败：{e}", m.id))?;
+        let file = dir.join(format!("{}.json", sanitize_file_stem(&m.id)));
+        std::fs::write(&file, json).map_err(|e| format!("写文件 {} 失败：{e}", file.display()))?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// 执行 `export` 子命令：合并集过滤后逐条完整序列化为 `<dir>/<id>.json`。
+///
+/// 与 `import` 对称互逆（import 扫目录 `*.json`、一文件一记忆），是备份/迁移/审查
+/// 的官方路径：JSON 含 Memory 全部字段与 `schema_version`，export → import 往返
+/// 后记忆内容逐字段一致。文件名取净化后的 id（[`sanitize_file_stem`]，防异常 id
+/// 穿出目录）；输出目录不存在则创建，同名文件覆盖（重复导出即刷新备份）。
+///
+/// 过滤：`--project` 仅导出该项目的记忆；`--status` 支持
+/// active|cold|superseded|tombstone|all（缺省 all，全量备份）。
+fn run_export(args: ExportArgs<'_>) -> ExitCode {
+    let status_filter = match parse_status_filter(args.status) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("export 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let merged = match read_merged(args.general_db, &project_dbs) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("export 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 过滤（状态 + 项目）后取引用集，交给共用落盘逻辑写出。
+    let selected: Vec<&Memory> = merged
+        .iter()
+        .filter(|m| match status_filter {
+            commands::StatusFilter::All => true,
+            commands::StatusFilter::Only(s) => m.status == s,
+        })
+        .filter(|m| match args.project {
+            Some(p) => m.project.as_deref() == Some(p),
+            None => true,
+        })
+        .collect();
+
+    let exported = match write_memories_as_json(args.dir, &selected) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("export 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("export: 已导出 {exported} 条记忆到 {}", args.dir.display());
+    ExitCode::SUCCESS
+}
+
+/// 对一条记忆的时间字段做未来时间戳消毒：`created_at` 与 `access_log` 里超过
+/// `now + 60s` 的值钳到 `now`。返回是否发生过钳制（供调用方打警告）。
+///
+/// 钳制后 `access_log` 重新升序排序，维持 [`Memory::access_log`]「升序」不变量
+/// （钳制可能打乱原有顺序）。
+fn sanitize_future_times(m: &mut Memory, now: f64) -> bool {
+    // 与 doctor 体检的未来时间戳判定同阈（[`health::FUTURE_SKEW_SECS`] = 60s），
+    // 保证「体检报的未来时间戳数」与「迁移/import 会钳制的条数」判据一致。
+    let limit = now + health::FUTURE_SKEW_SECS;
+    let mut touched = false;
+    if m.created_at > limit {
+        m.created_at = now;
+        touched = true;
+    }
+    for t in &mut m.access_log {
+        if *t > limit {
+            *t = now;
+            touched = true;
+        }
+    }
+    if touched {
+        m.access_log
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    touched
 }
 
 /// 把逗号分隔的 id 列表解析为去空白、去空项的 `Vec<String>`（保持给定顺序、去重）。
@@ -3380,6 +4247,9 @@ fn run_graduate(args: GraduateArgs<'_>) -> ExitCode {
         }
     }
 
+    // cue 长度源头治理：对毕业后新通用记忆实际采用的 cue（--cue 覆盖或沿用源 cue）警告。
+    warn_long_cue(&graduated.cue);
+
     println!(
         "graduate: {} ({:?}) → 毕业为通用记忆 {new_id} ({:?})；原记忆已转 superseded 留作已上浮指针",
         args.id, src.level, graduated.level
@@ -3534,6 +4404,9 @@ fn run_merge(args: MergeArgs<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // cue 长度源头治理：合并生成的新 cue 同样受源头警告约束。
+    warn_long_cue(args.cue);
+
     println!("merge: 新记忆 {new_id} 合并了 {merged_count} 条源（源已转 Tombstone）");
     ExitCode::SUCCESS
 }
@@ -3656,4 +4529,806 @@ fn run_gc(args: GcArgs<'_>) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+// ============================================================================
+// migrate：版本触发的一次性数据迁移（结构自动洗 + 语义只标记）
+// ============================================================================
+
+/// 迁移的运行选项（由 CLI 参数解析而来）。
+struct MigrateOptions {
+    /// 仅当库级 `data_version` 落后才迁移。
+    if_needed: bool,
+    /// 只报告、不备份不写库。
+    dry_run: bool,
+    /// 备份输出根目录覆盖（缺省取「公共库父目录 / backups」）。
+    backup_dir: Option<PathBuf>,
+}
+
+/// 一次迁移（或 dry-run 预演）的结果报告。
+struct MigrationReport {
+    /// 迁移前的库级数据版本（各挂载库取最小值）。
+    from_version: u32,
+    /// 迁移目标版本（= [`ENGRAM_DATA_VERSION`]）。
+    to_version: u32,
+    /// 迁移涉及的记忆总数。
+    total: usize,
+    /// 结构性清洗中被修正的记忆条数（schema_version / 未来时间戳 / access_log）。
+    structural_changed: usize,
+    /// 重分层 + 容量步（consolidate）产生的变迁条数。
+    transitions: usize,
+    /// 实际写出的备份目录（dry-run 为 `None`）。
+    backup_dir: Option<PathBuf>,
+    /// 迁移后（dry-run 为预演后）的健康扫描——语义性问题取自此。
+    health: HealthReport,
+}
+
+/// 迁移的三种归宿。
+enum MigrationOutcome {
+    /// 跳过（已最新 / 迁移锁被他人持有），附带原因说明。
+    Skipped(String),
+    /// dry-run 预演（未写库），附带预演报告。
+    DryRun(MigrationReport),
+    /// 真迁移完成，附带迁移报告。
+    Migrated(MigrationReport),
+}
+
+/// 库级迁移锁文件路径：`<general_db>.migrate.lock`。
+///
+/// 用 [`session::try_claim`] 的 `create_new` OS 级原子语义防两个会话同时迁移同一批库；
+/// 与 watermark.lock / 复盘 claim 复用**同一套**领单原语（见
+/// [`session::try_claim_ttl`]），陈旧阈值取 [`session::CLAIM_TTL_SECS`]。
+fn migrate_lock_path(general_db: &Path) -> PathBuf {
+    general_db.with_extension("migrate.lock")
+}
+
+/// 推导本次迁移的备份子目录：`<root>/pre-migrate-v<from>-to-v<to>-<时间戳>`。
+///
+/// `root` 取 `override_dir`，否则「公共库父目录 / backups」；时间戳用引擎 `now`
+/// （[`resolve_now`] 生成）取整数秒。
+fn resolve_backup_dir(
+    general_db: &Path,
+    override_dir: Option<&Path>,
+    from: u32,
+    to: u32,
+    now: f64,
+) -> PathBuf {
+    let root = match override_dir {
+        Some(d) => d.to_path_buf(),
+        None => general_db
+            .parent()
+            .map(|p| p.join("backups"))
+            .unwrap_or_else(|| PathBuf::from("backups")),
+    };
+    let ts = now.max(0.0) as u64;
+    root.join(format!("pre-migrate-v{from}-to-v{to}-{ts}"))
+}
+
+/// 对一条记忆做**结构性清洗**（迁移步②）：补 `schema_version`、钳未来时间戳、
+/// `access_log` 去重并升序排序。返回是否发生过任何改动。
+///
+/// **严格只碰结构性字段**——绝不读写 `importance` / `status` / `superseded_by`
+/// （那些是语义性问题，只能进报告，不在本函数）。这是「语义只标记零泄漏进结构路径」
+/// 的关键一环：本函数在编译期就没有触碰语义字段的任何语句。
+fn structural_clean(m: &mut Memory, now: f64) -> bool {
+    let mut touched = false;
+    // 补 schema_version：显式为 0 的旧行 → 当前 schema 版本（缺字段的旧行反序列化
+    // 时已按 1 补齐，写回时自然持久化该字段）。
+    if m.schema_version == 0 {
+        m.schema_version = MEMORY_SCHEMA_VERSION;
+        touched = true;
+    }
+    // 未来时间戳钳制（复用 import 的 clamp：created_at / access_log > now+60s → now，
+    // 并重排升序）。
+    if sanitize_future_times(m, now) {
+        touched = true;
+    }
+    // access_log 去重 + 升序（clamp 可能引入重复 / 打乱顺序）。
+    let before = m.access_log.len();
+    m.access_log
+        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    m.access_log.dedup();
+    if m.access_log.len() != before {
+        touched = true;
+    }
+    touched
+}
+
+/// 对整批记忆逐条做结构性清洗，返回被修正的条数。
+fn clean_all(mems: &mut [Memory], now: f64) -> usize {
+    let mut changed = 0usize;
+    for m in mems.iter_mut() {
+        if structural_clean(m, now) {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 只读打开公共库 + 各项目库，读出各库版本的最小值与合并记忆集（不保留句柄）。
+///
+/// 供迁移的 dry-run 路径用（只读、不写、不加锁）。
+///
+/// # Errors
+/// 任一库打开或读取失败时返回带库类别说明的错误字符串。
+fn read_min_version_and_merged(
+    general_db: &Path,
+    project_dbs: &BTreeMap<String, PathBuf>,
+) -> Result<(u32, Vec<Memory>), String> {
+    let gdb = store::open(general_db)
+        .map_err(|e| format!("打开公共库 {} 失败：{e}", general_db.display()))?;
+    let mut min_version =
+        store::read_data_version(&gdb).map_err(|e| format!("读取公共库版本失败：{e}"))?;
+    let mut merged = store::all(&gdb).map_err(|e| format!("读取公共库失败：{e}"))?;
+    for (name, path) in project_dbs {
+        let db = store::open(path)
+            .map_err(|e| format!("打开项目库 {name}（{}）失败：{e}", path.display()))?;
+        let v = store::read_data_version(&db)
+            .map_err(|e| format!("读取项目库 {name} 版本失败：{e}"))?;
+        min_version = min_version.min(v);
+        let mut pmems = store::all(&db).map_err(|e| format!("读取项目库 {name} 失败：{e}"))?;
+        merged.append(&mut pmems);
+    }
+    Ok((min_version, merged))
+}
+
+/// 把迁移后的合并集**按层级 + 项目路由**写回各库（L1-3 → 公共库，L4 → 对应项目库）。
+///
+/// consolidate 只在同一条轨道内移动层级（通用 L1↔L2↔L3、项目 L4.1↔L4.2↔L4.3），
+/// 不跨轨道，故记忆的归属库稳定：从公共库读来的通用记忆写回公共库、从项目库读来的
+/// L4 写回原项目库，不会串库。project 不在映射中的 L4 记忆记 stderr 并跳过写回（不删）。
+///
+/// # Errors
+/// 任一库写回失败时返回错误说明。
+fn write_back_merged(
+    gdb: &Database,
+    pdbs: &BTreeMap<String, Database>,
+    merged: Vec<Memory>,
+) -> Result<(), String> {
+    let mut general_bucket: Vec<Memory> = Vec::new();
+    let mut project_buckets: BTreeMap<String, Vec<Memory>> = BTreeMap::new();
+    let mut unrouted = 0usize;
+    for m in merged {
+        if commands::is_l4(m.level) {
+            match &m.project {
+                Some(name) if pdbs.contains_key(name) => {
+                    project_buckets.entry(name.clone()).or_default().push(m);
+                }
+                _ => unrouted += 1,
+            }
+        } else {
+            general_bucket.push(m);
+        }
+    }
+    if !general_bucket.is_empty() {
+        store::put_many(gdb, &general_bucket).map_err(|e| format!("写回公共库失败：{e}"))?;
+    }
+    for (name, bucket) in &project_buckets {
+        let db = pdbs
+            .get(name)
+            .ok_or_else(|| format!("内部错误：项目 {name} 无对应库句柄"))?;
+        store::put_many(db, bucket).map_err(|e| format!("写回项目库 {name} 失败：{e}"))?;
+    }
+    if unrouted > 0 {
+        eprintln!(
+            "migrate: 警告：{unrouted} 条 L4 记忆的所属项目不在 --project-db 映射中，已跳过其写回（未删除）"
+        );
+    }
+    Ok(())
+}
+
+/// 迁移的**持锁临界区**：已持有迁移锁，执行备份 → 清洗 → 重分层 → 语义扫描 → 写回 →
+/// 写版本。调用方（[`migrate_libs`]）负责在本函数返回后释放锁。
+///
+/// # Errors
+/// 备份失败（迁移中止、不动库）、任一库读写失败时返回错误说明。
+fn migrate_locked(
+    general_db: &Path,
+    project_dbs: &BTreeMap<String, PathBuf>,
+    now: f64,
+    opts: &MigrateOptions,
+    to_version: u32,
+) -> Result<MigrationOutcome, String> {
+    // 打开公共库 + 各项目库，保留句柄用于写回；读版本最小值与合并集。
+    let gdb = store::open(general_db)
+        .map_err(|e| format!("打开公共库 {} 失败：{e}", general_db.display()))?;
+    let mut min_version =
+        store::read_data_version(&gdb).map_err(|e| format!("读取公共库版本失败：{e}"))?;
+    let mut merged = store::all(&gdb).map_err(|e| format!("读取公共库失败：{e}"))?;
+    let mut pdbs: BTreeMap<String, Database> = BTreeMap::new();
+    for (name, path) in project_dbs {
+        let db = store::open(path)
+            .map_err(|e| format!("打开项目库 {name}（{}）失败：{e}", path.display()))?;
+        let v = store::read_data_version(&db)
+            .map_err(|e| format!("读取项目库 {name} 版本失败：{e}"))?;
+        min_version = min_version.min(v);
+        let mut pmems = store::all(&db).map_err(|e| format!("读取项目库 {name} 失败：{e}"))?;
+        merged.append(&mut pmems);
+        pdbs.insert(name.clone(), db);
+    }
+    let from_version = min_version;
+
+    // 持锁后再确认一次：--if-needed 且已最新则不动库（防在等锁期间别人已迁完）。
+    if opts.if_needed && from_version >= to_version {
+        return Ok(MigrationOutcome::Skipped(format!(
+            "已是最新（data_version={from_version} ≥ {to_version}），跳过"
+        )));
+    }
+
+    // 空库：没有任何按旧规则分布的数据，无需备份/清洗/重分层——直接把版本标记为最新
+    // 即可（幂等自愈：全新库首次 session-start 会走到这里被静默标记，之后不再触发）。
+    if merged.is_empty() {
+        store::write_data_version(&gdb, to_version)
+            .map_err(|e| format!("写公共库 data_version 失败：{e}"))?;
+        for (name, db) in &pdbs {
+            store::write_data_version(db, to_version)
+                .map_err(|e| format!("写项目库 {name} data_version 失败：{e}"))?;
+        }
+        return Ok(MigrationOutcome::Skipped(format!(
+            "库为空，已标记为 v{to_version}，无需迁移"
+        )));
+    }
+
+    // ① 备份优先：把**原始**合并集（清洗前）完整导出。失败即中止，绝不动库。
+    let backup_dir = resolve_backup_dir(
+        general_db,
+        opts.backup_dir.as_deref(),
+        from_version,
+        to_version,
+        now,
+    );
+    let refs: Vec<&Memory> = merged.iter().collect();
+    write_memories_as_json(&backup_dir, &refs)
+        .map_err(|e| format!("备份失败（迁移已中止，未改动任何库）：{e}"))?;
+
+    // ② 结构性清洗（自动）。
+    let structural_changed = clean_all(&mut merged, now);
+
+    // ③ 重分层 + 容量（自动）：默认 EngramConfig，按虚拟视界重评层级、按字符预算 +
+    //    条数双约束执行容量——旧尖峰升上来的层降回、超预算层挤下去（可能转 Cold，
+    //    属结构性容量执行，允许）。
+    let transitions = consolidate(&mut merged, now).len();
+
+    // ④ 语义性问题：**只扫描收进报告，绝不自动改**（health::scan 取不可变借用）。
+    let health = health::scan(&merged, &EngramConfig::default(), now);
+
+    // 写回（按层级 + 项目路由）。
+    let total = merged.len();
+    write_back_merged(&gdb, &pdbs, merged)?;
+
+    // ⑤ 写库级 data_version（公共库 + 各项目库都标记为最新）。
+    store::write_data_version(&gdb, to_version)
+        .map_err(|e| format!("写公共库 data_version 失败：{e}"))?;
+    for (name, db) in &pdbs {
+        store::write_data_version(db, to_version)
+            .map_err(|e| format!("写项目库 {name} data_version 失败：{e}"))?;
+    }
+
+    Ok(MigrationOutcome::Migrated(MigrationReport {
+        from_version,
+        to_version,
+        total,
+        structural_changed,
+        transitions,
+        backup_dir: Some(backup_dir),
+        health,
+    }))
+}
+
+/// 迁移的执行核（[`run_migrate`] 与 session-start 自动触发共用）。
+///
+/// dry-run 只读预演、不加锁；实迁移先抢库级迁移锁（拿不到即 [`MigrationOutcome::Skipped`]，
+/// 下次再迁），持锁执行 [`migrate_locked`] 后无论成败都释放锁。
+///
+/// # Errors
+/// 备份失败或库读写失败时返回错误说明（dry-run 只读失败同理）。
+fn migrate_libs(
+    general_db: &Path,
+    project_dbs: &BTreeMap<String, PathBuf>,
+    now: f64,
+    opts: &MigrateOptions,
+) -> Result<MigrationOutcome, String> {
+    let to_version = ENGRAM_DATA_VERSION;
+
+    // dry-run：只读、不加锁、不写、不备份，只算「将做什么 + 语义问题」。
+    if opts.dry_run {
+        let (from_version, merged) = read_min_version_and_merged(general_db, project_dbs)?;
+        if opts.if_needed && from_version >= to_version {
+            return Ok(MigrationOutcome::Skipped(format!(
+                "已是最新（data_version={from_version} ≥ {to_version}），跳过"
+            )));
+        }
+        let mut work = merged;
+        let structural_changed = clean_all(&mut work, now);
+        let transitions = consolidate(&mut work, now).len();
+        let health = health::scan(&work, &EngramConfig::default(), now);
+        return Ok(MigrationOutcome::DryRun(MigrationReport {
+            from_version,
+            to_version,
+            total: work.len(),
+            structural_changed,
+            transitions,
+            backup_dir: None,
+            health,
+        }));
+    }
+
+    // 实迁移：抢库级迁移锁（拿不到即跳过，下次再迁——绝不阻塞等待）。
+    let lock_path = migrate_lock_path(general_db);
+    match session::try_claim(&lock_path, now, std::process::id()) {
+        Ok(session::ClaimOutcome::Acquired) => {}
+        Ok(session::ClaimOutcome::Held) => {
+            return Ok(MigrationOutcome::Skipped(
+                "另一进程正在迁移（迁移锁被持有），本次跳过".to_string(),
+            ));
+        }
+        Err(e) => return Err(format!("获取迁移锁失败：{e}")),
+    }
+    // 持锁执行，无论成败都释放锁（与领单收尾配对）。
+    let result = migrate_locked(general_db, project_dbs, now, opts, to_version);
+    session::release_claim(&lock_path);
+    result
+}
+
+/// `migrate` 命令的全部参数（聚成结构体，规避过多形参）。
+struct MigrateCliArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    if_needed: bool,
+    backup_dir: Option<&'a Path>,
+    dry_run: bool,
+    now: Option<f64>,
+}
+
+/// 执行 `migrate` 子命令。
+fn run_migrate(args: MigrateCliArgs<'_>) -> ExitCode {
+    let Some(now) = resolve_now(args.now) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let opts = MigrateOptions {
+        if_needed: args.if_needed,
+        dry_run: args.dry_run,
+        backup_dir: args.backup_dir.map(Path::to_path_buf),
+    };
+    match migrate_libs(args.general_db, &project_dbs, now, &opts) {
+        Ok(MigrationOutcome::Skipped(reason)) => {
+            println!("migrate: {reason}");
+            ExitCode::SUCCESS
+        }
+        Ok(MigrationOutcome::DryRun(rep)) => {
+            print_migration_report(&rep, true);
+            ExitCode::SUCCESS
+        }
+        Ok(MigrationOutcome::Migrated(rep)) => {
+            print_migration_report(&rep, false);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("migrate 失败：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 打印迁移（或 dry-run 预演）报告到 stdout。
+fn print_migration_report(rep: &MigrationReport, dry_run: bool) {
+    if dry_run {
+        println!("== migrate --dry-run（只报告，不备份、不写库）==");
+    } else {
+        println!("== migrate 完成 ==");
+    }
+    println!(
+        "  data_version: v{} → v{}",
+        rep.from_version, rep.to_version
+    );
+    println!("  记忆总数: {}", rep.total);
+    println!(
+        "  结构性清洗: {} 条被修正（schema_version / 未来时间戳 / access_log 去重排序）",
+        rep.structural_changed
+    );
+    println!("  重分层+容量: consolidate 产生 {} 条变迁", rep.transitions);
+    if let Some(dir) = &rep.backup_dir {
+        println!("  备份目录: {}", dir.display());
+    }
+    print_semantic_issues(&rep.health);
+}
+
+/// 打印语义性问题清单（迁移只标记、绝不自动改的三类）。
+fn print_semantic_issues(h: &HealthReport) {
+    if !h.has_semantic_issues() {
+        println!("  语义性问题: 无");
+        return;
+    }
+    println!("  语义性问题（仅标记，未修改任何 importance/status，也未删除任何记忆）:");
+    for o in &h.off_anchor_importance {
+        println!(
+            "    [层锚偏离] {} 在 {} importance={:.2} 不在层锚区间 [{:.2},{:.2}]",
+            o.id,
+            level_repr(o.level),
+            o.importance,
+            o.band_lo,
+            o.band_hi
+        );
+    }
+    for d in &h.dangling_superseded {
+        println!(
+            "    [悬空指针] {} 的 superseded_by 指向库中不存在的 {}",
+            d.id, d.target
+        );
+    }
+    for g in &h.duplicate_cues {
+        println!(
+            "    [疑似重复] cue「{}」共 {} 条：{}",
+            g.cue,
+            g.ids.len(),
+            g.ids.join(", ")
+        );
+    }
+}
+
+// ============================================================================
+// doctor：只读健康体检
+// ============================================================================
+
+/// `doctor` 命令的全部参数（聚成结构体）。
+struct DoctorArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    json: bool,
+    now: Option<f64>,
+}
+
+/// 执行 `doctor` 子命令：只读打开各库，产出健康报告（文本或 JSON）。**绝不写库**
+/// （不 put/remove、不写 data_version、不触发迁移）。
+fn run_doctor(args: DoctorArgs<'_>) -> ExitCode {
+    let Some(now) = resolve_now(args.now) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+
+    // 公共库：读版本、原始行数、已解析记忆。
+    let gdb = match store::open(args.general_db) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "doctor 失败：打开公共库 {} 失败：{e}",
+                args.general_db.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut versions: Vec<(String, u32)> = Vec::new();
+    let mut bad_rows = 0usize;
+    let mut merged: Vec<Memory> = Vec::new();
+    match (
+        store::read_data_version(&gdb),
+        store::raw_len(&gdb),
+        store::all(&gdb),
+    ) {
+        (Ok(v), Ok(raw), Ok(mut mems)) => {
+            versions.push((health::GENERAL_SCOPE_LABEL.to_string(), v));
+            bad_rows += (raw as usize).saturating_sub(mems.len());
+            merged.append(&mut mems);
+        }
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            eprintln!("doctor 失败：读取公共库出错：{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // 各项目库同理。
+    for (name, path) in &project_dbs {
+        let db = match store::open(path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "doctor 失败：打开项目库 {name}（{}）失败：{e}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        match (
+            store::read_data_version(&db),
+            store::raw_len(&db),
+            store::all(&db),
+        ) {
+            (Ok(v), Ok(raw), Ok(mut mems)) => {
+                versions.push((name.clone(), v));
+                bad_rows += (raw as usize).saturating_sub(mems.len());
+                merged.append(&mut mems);
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                eprintln!("doctor 失败：读取项目库 {name} 出错：{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mut report = health::scan(&merged, &EngramConfig::default(), now);
+    report.bad_rows = bad_rows;
+    let min_version = versions
+        .iter()
+        .map(|(_, v)| *v)
+        .min()
+        .unwrap_or(ENGRAM_DATA_VERSION);
+    let needs_migration = min_version < ENGRAM_DATA_VERSION;
+
+    if args.json {
+        print_doctor_json(&versions, needs_migration, &report, now);
+    } else {
+        print_doctor_text(&versions, needs_migration, &report, now);
+    }
+    ExitCode::SUCCESS
+}
+
+/// 打印 doctor 的可读文本报告。
+fn print_doctor_text(
+    versions: &[(String, u32)],
+    needs_migration: bool,
+    h: &HealthReport,
+    now: f64,
+) {
+    println!("== Engram doctor (now={now}) ==");
+    println!("库数据版本（当前引擎数据版本 v{ENGRAM_DATA_VERSION}）:");
+    for (scope, v) in versions {
+        let tag = if *v < ENGRAM_DATA_VERSION {
+            format!("需迁移 → v{ENGRAM_DATA_VERSION}")
+        } else {
+            "最新".to_string()
+        };
+        println!("  {scope}: v{v}  [{tag}]");
+    }
+    println!("需迁移: {}", if needs_migration { "是" } else { "否" });
+    println!("记忆总数: {}（无法解析的坏行 {}）", h.total, h.bad_rows);
+
+    // 各层分布。
+    let dist: Vec<String> = h
+        .level_counts
+        .iter()
+        .map(|(lvl, c)| format!("{}={c}", level_repr(*lvl)))
+        .collect();
+    println!("各层分布: {}", dist.join(" "));
+
+    // schema_version 分布。
+    let sv: Vec<String> = h
+        .schema_versions
+        .iter()
+        .map(|(v, c)| format!("{v}={c}"))
+        .collect();
+    println!(
+        "schema_version 分布: {}",
+        if sv.is_empty() {
+            "（空）".to_string()
+        } else {
+            sv.join(" ")
+        }
+    );
+
+    // 超预算层。
+    if h.over_budget_layers.is_empty() {
+        println!("超字符预算的层: 无");
+    } else {
+        println!("超字符预算的层:");
+        for o in &h.over_budget_layers {
+            println!(
+                "  {} {} 常驻 {} 字符 > 预算 {}（{} 条）",
+                o.scope,
+                level_repr(o.level),
+                o.used,
+                o.budget,
+                o.count
+            );
+        }
+    }
+
+    println!(
+        "未来时间戳: {} 条{}",
+        h.future_timestamps.len(),
+        fmt_id_tail(&h.future_timestamps)
+    );
+
+    if h.dangling_superseded.is_empty() {
+        println!("悬空 superseded_by: 0 条");
+    } else {
+        println!("悬空 superseded_by: {} 条", h.dangling_superseded.len());
+        for d in &h.dangling_superseded {
+            println!("  {} → 不存在的 {}", d.id, d.target);
+        }
+    }
+
+    if h.off_anchor_importance.is_empty() {
+        println!("importance 偏离层锚: 0 条");
+    } else {
+        println!("importance 偏离层锚: {} 条", h.off_anchor_importance.len());
+        for o in &h.off_anchor_importance {
+            println!(
+                "  {} 在 {} importance={:.2} 不在 [{:.2},{:.2}]",
+                o.id,
+                level_repr(o.level),
+                o.importance,
+                o.band_lo,
+                o.band_hi
+            );
+        }
+    }
+
+    if h.duplicate_cues.is_empty() {
+        println!("疑似重复: 0 组");
+    } else {
+        println!("疑似重复: {} 组", h.duplicate_cues.len());
+        for g in &h.duplicate_cues {
+            println!("  cue「{}」: {}", g.cue, g.ids.join(", "));
+        }
+    }
+
+    println!(
+        "孤儿（Superseded 无后继指针）: {} 条{}",
+        h.orphans.len(),
+        fmt_id_tail(&h.orphans)
+    );
+}
+
+/// 把一小串 id 格式化成「（id1, id2, ...）」尾巴，空则返回空串。
+fn fmt_id_tail(ids: &[String]) -> String {
+    if ids.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", ids.join(", "))
+    }
+}
+
+/// 打印 doctor 的 JSON 报告（单行对象），用 [`serde_json`] 保证转义正确。
+fn print_doctor_json(
+    versions: &[(String, u32)],
+    needs_migration: bool,
+    h: &HealthReport,
+    now: f64,
+) {
+    let version_objs: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|(scope, v)| {
+            serde_json::json!({
+                "scope": scope,
+                "data_version": v,
+                "needs_migration": *v < ENGRAM_DATA_VERSION,
+            })
+        })
+        .collect();
+    let level_dist: Vec<serde_json::Value> = h
+        .level_counts
+        .iter()
+        .map(|(lvl, c)| serde_json::json!({ "level": level_repr(*lvl), "count": c }))
+        .collect();
+    let schema_dist: Vec<serde_json::Value> = h
+        .schema_versions
+        .iter()
+        .map(|(v, c)| serde_json::json!({ "schema_version": v, "count": c }))
+        .collect();
+    let over_budget: Vec<serde_json::Value> = h
+        .over_budget_layers
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "scope": o.scope,
+                "level": level_repr(o.level),
+                "used": o.used,
+                "budget": o.budget,
+                "count": o.count,
+            })
+        })
+        .collect();
+    let dangling: Vec<serde_json::Value> = h
+        .dangling_superseded
+        .iter()
+        .map(|d| serde_json::json!({ "id": d.id, "target": d.target }))
+        .collect();
+    let off_anchor: Vec<serde_json::Value> = h
+        .off_anchor_importance
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "id": o.id,
+                "level": level_repr(o.level),
+                "importance": o.importance,
+                "band": [o.band_lo, o.band_hi],
+            })
+        })
+        .collect();
+    let duplicates: Vec<serde_json::Value> = h
+        .duplicate_cues
+        .iter()
+        .map(|g| serde_json::json!({ "cue": g.cue, "ids": g.ids }))
+        .collect();
+
+    let obj = serde_json::json!({
+        "now": now,
+        "engine_data_version": ENGRAM_DATA_VERSION,
+        "needs_migration": needs_migration,
+        "libraries": version_objs,
+        "total": h.total,
+        "bad_rows": h.bad_rows,
+        "level_distribution": level_dist,
+        "schema_version_distribution": schema_dist,
+        "over_budget_layers": over_budget,
+        "future_timestamps": h.future_timestamps,
+        "dangling_superseded": dangling,
+        "off_anchor_importance": off_anchor,
+        "duplicate_cues": duplicates,
+        "orphans": h.orphans,
+    });
+    match serde_json::to_string(&obj) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("doctor: 序列化 JSON 失败：{e}"),
+    }
+}
+
+/// SessionStart 自动触发迁移（best-effort，绝不阻断热索引注入）。
+///
+/// 先廉价预检公共库（及存在的作用域库）的 `data_version`：任一落后于
+/// [`ENGRAM_DATA_VERSION`] 才尝试 `migrate --if-needed`。迁移失败只 `eprintln` +
+/// 追加 hook.log，**不上抛、不影响调用方**（下次会话重试）；成功则记一行
+/// 「已迁移 v<from>→v<to>，备份于 <path>」。只在 session-start 调用，迁移只跑一次
+/// （版本标记后 --if-needed 自然跳过）。
+fn maybe_migrate_on_session_start(
+    general_db: &Path,
+    scope: &ProjectScope,
+    now: f64,
+    log: Option<&Path>,
+) {
+    // 预检公共库版本；读失败（库损坏等）就放弃迁移，绝不阻断注入。
+    let g_version = match store::open(general_db).and_then(|db| store::read_data_version(&db)) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mut min_version = g_version;
+    let mut project_dbs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // 作用域库：仅当已存在才纳入（不创建杂散锚点，与 read_merged_scope 同规矩）。
+    if scope.db.is_file() {
+        if let Ok(v) = store::open(&scope.db).and_then(|db| store::read_data_version(&db)) {
+            min_version = min_version.min(v);
+        }
+        project_dbs.insert(scope.name.clone(), scope.db.clone());
+    }
+    if min_version >= ENGRAM_DATA_VERSION {
+        return; // 已最新，不触发（新库不迁移）。
+    }
+
+    let opts = MigrateOptions {
+        if_needed: true,
+        dry_run: false,
+        backup_dir: None,
+    };
+    let log_line = |msg: &str| {
+        eprintln!("{msg}");
+        if let Some(p) = hook_log_path(general_db.parent()) {
+            append_hook_log(&p, now, msg);
+        } else if let Some(p) = log {
+            append_hook_log(p, now, msg);
+        }
+    };
+    match migrate_libs(general_db, &project_dbs, now, &opts) {
+        Ok(MigrationOutcome::Migrated(rep)) => {
+            let backup = rep
+                .backup_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            log_line(&format!(
+                "session-start：已迁移 v{}→v{}，备份于 {}",
+                rep.from_version, rep.to_version, backup
+            ));
+        }
+        // 已最新 / 锁被持有 / dry-run：静默（预检已过滤大多数「已最新」）。
+        Ok(MigrationOutcome::Skipped(_)) | Ok(MigrationOutcome::DryRun(_)) => {}
+        Err(e) => {
+            log_line(&format!(
+                "session-start：迁移失败（不阻断热索引注入，下次会话重试）：{e}"
+            ));
+        }
+    }
 }

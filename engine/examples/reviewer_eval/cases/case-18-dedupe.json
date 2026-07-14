@@ -1,0 +1,42 @@
+{
+  "name": "case-18-dedupe",
+  "description": "查重闸门：会话自然重新得出一条库里已有的结论，复盘者应加固既有条目、绝不并排再写一份副本",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-18c1aaaaaaaaaaaa-0000000000000001",
+      "cue": "evaldemo 约定：所有时间戳统一用 UTC 存储，展示层再按用户时区转换",
+      "pointer": { "kind": "file", "reference": "src/time.rs:1", "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.65,
+      "pinned": false,
+      "access_log": [1781200000.0, 1782200000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781200000.0,
+      "tags": ["convention"],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-14T11:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c18", "message": { "role": "user", "content": [ { "type": "text", "text": "有用户报告订单时间显示差了 8 小时，查一下时区处理。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-14T11:00:07.000Z", "sessionId": "eval-c18", "message": { "role": "assistant", "content": [ { "type": "text", "text": "项目已有约定：时间戳统一 UTC 存储、展示层再转本地时区——我按这条约定查，问题多半出在展示层没转时区。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "grep -rn 'Utc::now\\|naive_utc' src/" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-14T11:01:00.000Z", "sessionId": "eval-c18", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "src/order.rs:88: let ts = Utc::now();\nsrc/view.rs:42: ts.naive_utc()  // 直接当本地显示，没按用户时区转" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-14T11:02:00.000Z", "sessionId": "eval-c18", "message": { "role": "assistant", "content": [ { "type": "text", "text": "定位到了：存储确实是 UTC（符合既有约定），bug 在 view.rs:42 展示时漏了时区转换。修正为按用户时区转换。结论跟项目那条老约定一致：时间戳统一 UTC 存储、展示层转本地。" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-14T11:03:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c18", "message": { "role": "user", "content": [ { "type": "text", "text": "好，收工。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": ["mem-18c1aaaaaaaaaaaa-0000000000000001"],
+    "confirm_use_forbidden": [],
+    "must_write": [],
+    "must_not_write_keywords": ["UTC 存储", "时间戳统一 UTC", "统一用 UTC"],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "查重闸门 case：会话把一条库里已有的结论（时间戳统一 UTC 存储）又自然推导了一遍。合规复盘者过 ①查重闸门——命中同一事实时改走加固、禁止并排再写一份：既有约定仍成立 → confirm_use 它；若另写一条含『UTC 存储』的新条目即副本膨胀，触 must_not_write 噪声违规判 fail。view.rs:42 的漏转时区 bug 是一次性、可 grep 的实现细节，不入库（must_write 为空）。mock 只加固既有条目、零新写入。"
+  },
+  "mock_actions": [
+    { "argv": ["confirm-use", "--ids", "mem-18c1aaaaaaaaaaaa-0000000000000001"] }
+  ]
+}

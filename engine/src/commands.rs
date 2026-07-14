@@ -27,7 +27,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::activation::effective;
-use crate::model::{Level, Memory, Pointer, Status};
+use crate::model::{Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
 
 /// 判断一个层级是否属于 L4 轨道（项目记忆）。
 ///
@@ -667,6 +667,8 @@ pub fn build_merged_memory(
         superseded_by: None,
         created_at: merge_created_at(sources, now),
         tags: merge_tags(sources),
+        // 合并产物是新写入的记忆，按当前格式版本落盘。
+        schema_version: MEMORY_SCHEMA_VERSION,
     }
 }
 
@@ -754,6 +756,8 @@ pub fn build_graduated_memory(
         superseded_by: None,
         created_at: src.created_at,
         tags,
+        // 毕业产物是新写入的记忆，按当前格式版本落盘。
+        schema_version: MEMORY_SCHEMA_VERSION,
     }
 }
 
@@ -883,6 +887,45 @@ pub fn oneline_status(memories: &[Memory], now: f64) -> String {
     // BTreeMap 遍历即按项目名升序，逐个项目追加一段。
     for (name, count) in &projects {
         out.push_str(&format!(" | {name}:{count}"));
+    }
+    out
+}
+
+/// 复盘者「疑似停摆」判定阈值（秒）：48 小时。
+///
+/// 存在 pending 残留、且上次成功巩固（last-review-ok）距今超过此值，说明
+/// SessionEnd/SessionStart 的复盘闭环大概率断了（复盘者起不来 / 反复失败），
+/// 需要在状态栏与 status 概况里显式亮警——否则停摆是完全无声的，记忆只进不出。
+pub const REVIEWER_STALL_SECS: f64 = 48.0 * 3600.0;
+
+/// 判定复盘者是否疑似停摆（纯逻辑，可单测）。
+///
+/// 规则：`pending_count > 0`（有待巩固残留）**且**上次成功巩固距今超过
+/// [`REVIEWER_STALL_SECS`]（`last_ok_ts` 为 `None` 视作「从未成功」，同样满足）。
+/// 无 pending 时永不判停摆——没有积压就谈不上停摆。
+///
+/// # 参数
+/// - `pending_count`：pending 目录里的残留标记数。
+/// - `last_ok_ts`：上次成功巩固的 unix 秒（读不到 last-review-ok 时为 `None`）。
+/// - `now`：当前时间（unix 秒）。
+pub fn reviewer_stalled(pending_count: usize, last_ok_ts: Option<f64>, now: f64) -> bool {
+    if pending_count == 0 {
+        return false;
+    }
+    match last_ok_ts {
+        None => true,
+        Some(ts) => now - ts > REVIEWER_STALL_SECS,
+    }
+}
+
+/// 同 [`oneline_status`]，但可在串尾附加复盘健康标记。
+///
+/// `stalled` 为真（见 [`reviewer_stalled`]）时在状态栏串末尾追加 ` ⚠reviewer`，
+/// 让「复盘者停摆」在状态栏可见；为假时输出与 [`oneline_status`] 逐字节一致。
+pub fn oneline_status_with_health(memories: &[Memory], now: f64, stalled: bool) -> String {
+    let mut out = oneline_status(memories, now);
+    if stalled {
+        out.push_str(" ⚠reviewer");
     }
     out
 }
@@ -1057,6 +1100,7 @@ mod tests {
             superseded_by: None,
             created_at: 1_000_000_000.0,
             tags: vec![],
+            schema_version: MEMORY_SCHEMA_VERSION,
         }
     }
 
@@ -1326,6 +1370,7 @@ mod tests {
             superseded_by: None,
             created_at: spec.created_at,
             tags: spec.tags.into_iter().map(|s| s.to_string()).collect(),
+            schema_version: MEMORY_SCHEMA_VERSION,
         }
     }
 
@@ -1350,6 +1395,42 @@ mod tests {
             access_log,
             tags: vec![],
         })
+    }
+
+    // --- 复盘健康：停摆判定与状态栏标记 ---
+    #[test]
+    fn reviewer_stalled_requires_pending_and_stale_ok() {
+        let now = 1_000_000_000.0;
+        // 无 pending：无论 last-ok 多旧都不算停摆。
+        assert!(!reviewer_stalled(0, None, now));
+        assert!(!reviewer_stalled(0, Some(now - 10.0 * 86400.0), now));
+        // 有 pending + 从未成功：停摆。
+        assert!(reviewer_stalled(1, None, now));
+        // 有 pending + last-ok 在 48h 内：正常（复盘者还活着）。
+        assert!(!reviewer_stalled(2, Some(now - 3600.0), now));
+        // 有 pending + last-ok 超 48h：停摆。
+        assert!(reviewer_stalled(
+            2,
+            Some(now - REVIEWER_STALL_SECS - 1.0),
+            now
+        ));
+    }
+
+    #[test]
+    fn oneline_status_health_appends_marker_only_when_stalled() {
+        let now = 1_000_000_000.0;
+        let mems = vec![mem("a", Level::L1, None, Status::Active, "甲")];
+        let base = oneline_status(&mems, now);
+        assert_eq!(
+            oneline_status_with_health(&mems, now, false),
+            base,
+            "未停摆时应与 oneline_status 逐字节一致"
+        );
+        assert_eq!(
+            oneline_status_with_health(&mems, now, true),
+            format!("{base} ⚠reviewer"),
+            "停摆时应追加 ⚠reviewer 标记"
+        );
     }
 
     // --- confirm-use 复活层 ---
@@ -1691,6 +1772,7 @@ mod tests {
             superseded_by: None,
             created_at: 50.0,
             tags: vec!["arch".to_string()],
+            schema_version: MEMORY_SCHEMA_VERSION,
         };
         // 默认映射 L4.2→L2；cue/importance 未覆盖时沿用源。
         let to = graduate_target_level(src.level, None).unwrap();

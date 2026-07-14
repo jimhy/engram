@@ -1,0 +1,34 @@
+{
+  "name": "case-06-noise-suppression",
+  "description": "噪声抑制：会话充满里程碑式吹嘘，只有「Windows CI 必须 --test-threads=1」这一条实质结论该入库",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T14:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c06", "message": { "role": "user", "content": [ { "type": "text", "text": "CI 在 Windows runner 上老是随机挂，查一下" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T14:00:07.000Z", "sessionId": "eval-c06", "message": { "role": "assistant", "content": [ { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "gh run view 4211 --log-failed" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T14:01:00.000Z", "sessionId": "eval-c06", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "error: could not lock data.redb: The process cannot access the file because it is being used by another process. (os error 32)" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T14:02:00.000Z", "sessionId": "eval-c06", "message": { "role": "assistant", "content": [ { "type": "text", "text": "根因找到：Windows 上多个测试进程并发抢同一 redb 文件锁。给 Windows CI 加 --test-threads=1 串行跑。改完连跑三次全绿——全部 42 个测试通过！这可是个里程碑达成的时刻，v0.9 稳了，已发布 nightly tag！" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-13T14:03:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c06", "message": { "role": "user", "content": [ { "type": "text", "text": "好，收工。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["test-threads", "文件锁", "串行"],
+        "level_in": ["L4.2"],
+        "importance_range": [0.55, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": ["里程碑达成", "已发布", "全部 42 个测试通过", "稳了"],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "反吹嘘 case：assistant 输出里大量情绪化/一次性状态（里程碑、已发布、42 个测试全过）都是过眼云烟，写进库即噪声违规；真正有复用价值的只有「Windows CI 因 redb 文件锁必须 --test-threads=1」这条工程约束。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.2", "--project", "evaldemo", "--cue", "evaldemo Windows CI 必须 --test-threads=1 串行跑：多测试进程并发抢 redb 文件锁会随机挂（os error 32）", "--importance", "0.65", "--pointer-kind", "file", "--pointer-ref", ".github/workflows/ci.yml:24"] }
+  ]
+}

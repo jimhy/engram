@@ -1,0 +1,32 @@
+{
+  "name": "case-02-explicit-remember",
+  "description": "用户显式「记住」指令：跨项目的 API 超时约定应写 L2 通用记忆（空库启动，检验零预置路径）",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T10:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c02", "message": { "role": "user", "content": [ { "type": "text", "text": "记住：我们所有服务的 API 超时上限统一 30 秒，以后不管哪个项目写代码都按这个来。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T10:00:05.000Z", "sessionId": "eval-c02", "message": { "role": "assistant", "content": [ { "type": "text", "text": "记下了：全服务 API 超时上限统一 30 秒，作为跨项目长期约定遵守。" } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T10:00:30.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c02", "message": { "role": "user", "content": [ { "type": "text", "text": "好，先这样。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["超时", "30 秒", "30s"],
+        "level_in": ["L2"],
+        "importance_range": [0.6, 0.8],
+        "pointer_required": false,
+        "scope": "general"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "最基础的显式记忆指令：用户说「记住 + 以后都按这个来」→ 必须写；「所有服务、不管哪个项目」→ 作用域必须是 general（写进项目库即分流错误判漏）；明确长期约定 → L2、importance 0.6-0.9。同时覆盖 preexisting 为空的空库沙箱路径。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L2", "--cue", "长期约定：所有服务 API 超时上限统一 30 秒（用户显式要求跨项目遵守）", "--importance", "0.7", "--tags", "preference"] }
+  ]
+}

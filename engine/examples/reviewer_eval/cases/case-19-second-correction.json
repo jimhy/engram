@@ -1,0 +1,51 @@
+{
+  "name": "case-19-second-correction",
+  "description": "二次纠正 salience：同一件事被用户第二次纠正（既重要又老记不住）→ 升档写高 importance，旧的低档纠正记忆被 supersede",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-19c1aaaaaaaaaaaa-0000000000000001",
+      "cue": "用户纠正过：evaldemo 的 commit message 用现在时祈使句（Add x），别用过去式（Added x）",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.55,
+      "pinned": false,
+      "access_log": [1781600000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781600000.0,
+      "tags": ["convention"],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-14T12:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c19", "message": { "role": "user", "content": [ { "type": "text", "text": "又看到你 commit 写成 'Added user auth' 了——我上次就说过，commit 用现在时祈使句！是 Add，不是 Added。这都第二回了。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-14T12:00:08.000Z", "sessionId": "eval-c19", "message": { "role": "assistant", "content": [ { "type": "text", "text": "抱歉，这是第二次纠正了。commit message 一律现在时祈使句（Add / Fix / Refactor），绝不用过去式。我改过来，并把它当成必守约定牢牢记住。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "git commit --amend -m 'Add user auth'" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-14T12:01:00.000Z", "sessionId": "eval-c19", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "[main 3f2a1b0] Add user auth" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-14T12:02:00.000Z", "sessionId": "eval-c19", "message": { "role": "assistant", "content": [ { "type": "text", "text": "已改为 'Add user auth'。这条规矩被纠正两次，我把它从普通约定升为项目必守铁律、重点记牢。" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-14T12:03:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c19", "message": { "role": "user", "content": [ { "type": "text", "text": "对，这次务必记牢。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["现在时", "祈使句"],
+        "level_in": ["L4.1", "L4.2"],
+        "importance_range": [0.7, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": ["mem-19c1aaaaaaaaaaaa-0000000000000001"],
+    "forbidden_command_patterns": [],
+    "notes": "二次纠正 salience case：salience §③『被纠正/重复次数——用户为同一件事纠正第二次 → 重要且易忘』。合规复盘者据此升 importance（收在 L4.1/L4.2 两层锚重叠区 0.7-0.75，明显高于旧的 0.55），把 commit 规范从普通约定升为必守约束；旧的低档纠正记忆被新条 supersede（同一事实不留两份 active）。若沿用普通 importance（<0.7）即 must_write 判漏，专测『反复纠正=更该记牢』的档位识别。confirm_use 为空——旧记忆是被升级/替换的对象，非第 3 档真使用（与 case-04/09/14 一致）。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.1", "--project", "evaldemo", "--cue", "铁律：evaldemo commit message 一律现在时祈使句（Add/Fix，非 Added/Fixed）——用户第二次纠正，升为项目必守铁律", "--importance", "0.72", "--id", "mem-19f1aaaaaaaaaaaa-0000000000000011", "--tags", "iron-rule"] },
+    { "argv": ["supersede", "--id", "mem-19c1aaaaaaaaaaaa-0000000000000001", "--by", "mem-19f1aaaaaaaaaaaa-0000000000000011"] }
+  ]
+}

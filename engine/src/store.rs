@@ -23,6 +23,22 @@ use crate::model::Memory;
 /// 记忆表定义：key = `Memory.id`，value = 记忆的 JSON 字节序列。
 const MEMORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
 
+/// 库级 meta 表定义：key = 元数据名（字符串），value = `u64`。
+///
+/// 与 [`MEMORIES`] 分表存放，专记「整库」级别的少量元信息（当前只有
+/// [`DATA_VERSION_KEY`]），不与逐条记忆混在一处。老库从未写过本表，读时按缺省语义
+/// 处理（见 [`read_data_version`]）。
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+/// [`META`] 表中「库级数据版本」的键名（见 [`crate::model::ENGRAM_DATA_VERSION`]）。
+const DATA_VERSION_KEY: &str = "data_version";
+
+/// 老库（无 meta 表 / 无 data_version 键）读取时视为的缺省库级数据版本。
+///
+/// 语义见 [`crate::model::ENGRAM_DATA_VERSION`]：`1` = v0.8 原始规则。任何在引入 meta
+/// 表之前写下的库都没有版本标记，一律按最古老的版本 `1` 看待，从而触发一次性迁移。
+const DEFAULT_DATA_VERSION: u32 = 1;
+
 /// 打开数据库时，遇到「锁被占用」最多重试的总尝试次数（含首次）。
 ///
 /// 与 [`OPEN_RETRY_DELAY_MS`] 共同决定重试预算：60 × 50ms ≈ 3 秒。
@@ -424,6 +440,84 @@ pub fn remove(db: &Database, id: &str) -> Result<bool, StoreError> {
     Ok(existed)
 }
 
+/// 读取本库的**库级数据版本**（见 [`crate::model::ENGRAM_DATA_VERSION`]）。
+///
+/// 从 `meta` 表读 `data_version` 键；**表不存在或键缺失一律视为缺省版本
+/// `1`**——即「引入 meta 表之前写下的老库」，据此触发一次性迁移。读取走独立读事务，
+/// 不修改任何数据。
+///
+/// 存储上 `data_version` 以 `u64` 存放（redb 原生整型），读回后收窄为 `u32`；正常
+/// 写入路径（[`write_data_version`]）只会写下 `u32` 值域内的数，`u64::MAX` 之类的
+/// 越界值不会出现，`as u32` 收窄不会丢真实版本号。
+///
+/// # 参数
+/// - `db`：已打开的数据库。
+///
+/// # Errors
+/// - [`StoreError::Transaction`] —— 开启读事务失败。
+/// - [`StoreError::Table`] —— 打开 `meta` 表失败（表不存在除外，按缺省版本返回）。
+/// - [`StoreError::Storage`] —— get 过程中的底层存储错误。
+pub fn read_data_version(db: &Database) -> Result<u32, StoreError> {
+    let read_txn = db.begin_read()?;
+    // 全新库 / 老库尚无 meta 表：按缺省版本 1 处理。
+    let table = match read_txn.open_table(META) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(DEFAULT_DATA_VERSION),
+        Err(e) => return Err(StoreError::Table(Box::new(e))),
+    };
+    match table.get(DATA_VERSION_KEY)? {
+        Some(guard) => Ok(guard.value() as u32),
+        None => Ok(DEFAULT_DATA_VERSION),
+    }
+}
+
+/// 写入本库的**库级数据版本**（原子写事务 + commit）。
+///
+/// 把 `version` 以 `u64` 存入 `meta` 表的 `data_version` 键（同键覆盖）。
+/// 迁移收尾时调用，标记「本库已按新一代规则重洗完毕」，之后 `migrate --if-needed`
+/// 便会跳过（见 [`read_data_version`]）。
+///
+/// # 参数
+/// - `db`：已打开的数据库。
+/// - `version`：要写入的库级数据版本（通常为 [`crate::model::ENGRAM_DATA_VERSION`]）。
+///
+/// # Errors
+/// - [`StoreError::Transaction`] —— 开启写事务失败。
+/// - [`StoreError::Table`] —— 打开 `meta` 表失败。
+/// - [`StoreError::Storage`] —— insert 过程中的底层存储错误。
+/// - [`StoreError::Commit`] —— 提交事务失败。
+pub fn write_data_version(db: &Database, version: u32) -> Result<(), StoreError> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(META)?;
+        table.insert(DATA_VERSION_KEY, version as u64)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// 返回 `memories` 表中的**原始条目总数**（含无法反序列化的坏行），表不存在则为 0。
+///
+/// 与 [`all`]（只返回成功解析的记忆）配对：`raw_len - all().len()` 即「无法解析的
+/// 坏行数」，供 `doctor` 体检报告统计。走只读事务，不修改数据。
+///
+/// # 参数
+/// - `db`：已打开的数据库。
+///
+/// # Errors
+/// - [`StoreError::Transaction`] —— 开启读事务失败。
+/// - [`StoreError::Table`] —— 打开 `memories` 表失败（表不存在除外，返回 0）。
+/// - [`StoreError::Storage`] —— 读取表元数据失败。
+pub fn raw_len(db: &Database) -> Result<u64, StoreError> {
+    let read_txn = db.begin_read()?;
+    let table = match read_txn.open_table(MEMORIES) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(StoreError::Table(Box::new(e))),
+    };
+    Ok(table.len()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +562,7 @@ mod tests {
             superseded_by: None,
             created_at: 1_000_000_000.0,
             tags: vec!["intent".to_string()],
+            schema_version: crate::model::MEMORY_SCHEMA_VERSION,
         }
     }
 
@@ -635,6 +730,76 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 15. 库级数据版本：全新库读缺省为 1；写入后读回一致；覆盖写生效。
+    #[test]
+    fn data_version_defaults_to_one_then_roundtrips() {
+        let path = unique_db_path("data_version");
+        let db = open(&path).expect("应能创建数据库");
+        // 全新库无 meta 表：读缺省版本 1（=老库语义）。
+        assert_eq!(
+            read_data_version(&db).expect("读版本应成功"),
+            1,
+            "全新库应按缺省版本 1"
+        );
+        // 只写过记忆、没写过版本，仍应读缺省 1（meta 表由 write_data_version 才建）。
+        put(&db, &make("m", Level::L2, None)).expect("put 应成功");
+        assert_eq!(
+            read_data_version(&db).expect("读版本应成功"),
+            1,
+            "只写记忆不写版本仍应读缺省 1"
+        );
+        // 写入版本 2 后读回一致。
+        write_data_version(&db, 2).expect("写版本应成功");
+        assert_eq!(read_data_version(&db).expect("读版本应成功"), 2);
+        // 覆盖写为 5 生效。
+        write_data_version(&db, 5).expect("覆盖写版本应成功");
+        assert_eq!(read_data_version(&db).expect("读版本应成功"), 5);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    // 16. raw_len 计入坏行：写 2 条正常 + 1 条坏字节，all 返回 2、raw_len 返回 3。
+    #[test]
+    fn raw_len_counts_bad_rows() {
+        let path = unique_db_path("raw_len");
+        let db = open(&path).expect("应能创建数据库");
+        put(&db, &make("ok1", Level::L1, None)).expect("put 应成功");
+        put(&db, &make("ok2", Level::L3, None)).expect("put 应成功");
+        // 直接往 memories 表塞一段非法 JSON，模拟坏行。
+        {
+            let wtxn = db.begin_write().expect("开写事务");
+            {
+                let mut t = wtxn.open_table(MEMORIES).expect("开表");
+                t.insert("bad", b"{ not json".as_slice()).expect("插坏行");
+            }
+            wtxn.commit().expect("提交");
+        }
+        assert_eq!(
+            all(&db).expect("all 应成功").len(),
+            2,
+            "all 应只返回 2 条好行"
+        );
+        assert_eq!(
+            raw_len(&db).expect("raw_len 应成功"),
+            3,
+            "raw_len 应含坏行共 3"
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    // 17. 全新库 raw_len 为 0（无 memories 表不报错）。
+    #[test]
+    fn raw_len_on_fresh_db_is_zero() {
+        let path = unique_db_path("raw_len_fresh");
+        let db = open(&path).expect("应能创建数据库");
+        assert_eq!(raw_len(&db).expect("raw_len 应成功"), 0, "全新库应为 0 行");
+        drop(db);
+        cleanup(&path);
     }
 
     // ---- retry_acquire 重试退避逻辑（用闭包注入，不依赖真实文件锁/计时）----

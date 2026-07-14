@@ -63,6 +63,8 @@
 | **L3** | 普通 | 中等 |
 | **L4** | 项目级，存于 `<项目>/.engram/engram.redb` | 项目作用域，按 `.engram/` 锚点定位 |
 
+各层另有**字符预算**（token 治理）：巩固时条数上限与累计渲染字符预算**双约束**，先触发者生效——常驻注入成本被钳在常数。
+
 - **activation = 重要度 + 近因 + 频率**（ACT-R base-level），每层带 floor，让 L1 站得住。
 - **爬升要靠挣来的活跃度；下跌有 floor 和宽限期兜底**——新记忆、重要记忆不会被过早杀掉。
 - **巩固**在会话结束由一个**独立**的 `claude -p` 复盘者读转录完成，所以"哪些真被用到、值得留"的判断不会自卖自夸。
@@ -79,7 +81,7 @@
 **项目级 —— L4，存该项目的库（`<项目>/.engram/engram.redb`）：**
 - **L4.1**——项目铁律：**本仓库**不可违反的约定 / 禁忌，来自你的"永远 / 绝不"指令或踩坑确立。**不是**照抄 CLAUDE.md / lint 配置（那些是会被自动加载的 artifact）；L4.1 只存它们**没写**的隐性铁律。
 - **L4.2**——持久项目知识：这项目是干嘛的、**架构 / 模块心智地图**（各部分干嘛、为什么这么分——提炼版，不是 `ls` 罗列）、已定型 / 已辩论的决策（选了什么、否了什么及原因——免得后续会话重提死方案）。
-- **L4.3**——临时：未完成的开口 / 可交接的活（当前进度、卡在哪、下一步）。衰减快，做完即被取代。
+- **L4.3**——快衰减层：重要度低、时效短的记忆（当前进度、短命开口、可交接的活自然落这里）。层级不绑定内容类型——重要的长期开口按重要度落更高层；做完 / 失效核实后即删。
 
 > 黄金法则：**只存提炼的心智模型，绝不存单条 `grep` / `ls` 就能拿到的东西。** 文件位置放在指针里，不放进 cue。
 
@@ -93,10 +95,36 @@
 ## 查看 / 检验
 
 ```bash
-/engram status            # 各层条数、项目、冷库
+/engram status            # 各层条数、项目、冷库、复盘健康
 /engram list              # 列全部
 /engram recall <词>       # 检索（冷热都搜）
 /engram render            # 预览会注入什么
+engram export --dir <目录>  # 全量导出为 JSON（备份/迁移，直接调引擎二进制）
+engram doctor --general-db ~/.engram/general.redb [--json]  # 只读体检：库版本/各层分布/坏行/超预算层/未来时间戳/悬空指针/importance 偏离层锚/疑似重复（绝不写库）
+```
+
+## 备份与迁移
+
+官方路径是 `export` / `import`（对称互逆，逐条 JSON、含全部字段与 `schema_version`）：
+
+```bash
+# 备份：把公共库 + 项目库全量导出到目录（每条记忆一个 <id>.json）
+engram export --general-db ~/.engram/general.redb --project-db 名称=路径 --dir ./backup
+# 可选过滤：--project <名称> 只导某项目；--status active 只导活跃层
+
+# 恢复/迁移：在目标机上导回（L1-3 进公共库、L4 按 --project-db 路由）
+engram import --general-db ~/.engram/general.redb --project-db 名称=路径 --from-json-dir ./backup
+```
+
+redb 单文件（`general.redb` / `engram.redb`）也可以直接拷贝，但**必须在无会话活动时进行**
+（hook 随时可能持有写锁，热拷贝可能得到半截事务）；跨机迁移推荐走 export/import——
+import 还会顺手把异常的未来时间戳钳到当前时间（时钟回拨/跨机时钟差消毒）。
+
+**版本迁移（自动、无需手动）**：引擎数据版本升级后，**升级后首次会话（SessionStart）会自动迁移一次、迁移前自动备份**（备份到 `<公共库父目录>/backups/`，逐条 JSON，可用 `import` 原样导回）。迁移是 best-effort、绝不阻断会话，成功后不再重复。想先只读体检、或手动预演 / 执行：
+
+```bash
+engram doctor  --general-db ~/.engram/general.redb [--json]    # 只读体检，绝不写库
+engram migrate --general-db ~/.engram/general.redb --if-needed # 一次性迁移（迁移前自动备份）；加 --dry-run 只预演不写库
 ```
 
 ## 状态栏（可选，默认关闭）
@@ -115,6 +143,11 @@ engram 状态栏**默认关闭**——装好插件不会自动显示。想常显
 ## 配置
 
 - `ENGRAM_REVIEWER_CLI` —— `SessionEnd` 复盘者启动哪个 CLI（默认 `claude`）。若你的 CLI 不叫 `claude`（比如某个本地版），设这个变量指向它。
+- `ENGRAM_REVIEWER_PROXY` —— 显式指定复盘者子进程使用的代理（如 `http://127.0.0.1:7897`），优先级高于环境里已有的 `HTTPS_PROXY`/`ALL_PROXY` 与系统代理。
+
+### 代理环境（中国大陆等地区）
+
+复盘者是 hook 起的 **headless `claude -p` 子进程**。若你的 `claude` 靠本地代理访问 Anthropic，务必让 **`HTTPS_PROXY`（不能只有 `all_proxy`）对 hook 子进程可见**——否则子进程会走直连、被 Anthropic 以「403 Request not allowed」按地区限制拒绝（表现为复盘静默失败，`~/.engram/hook.log` 里出现 `403` / `not allowed` 诊断行）。engram 起复盘者前会**自动派生代理**，优先级：`ENGRAM_REVIEWER_PROXY`（显式）> 已有 `HTTPS_PROXY`/`https_proxy`（继承）> `ALL_PROXY`/`all_proxy`（据以派生）>（仅 Windows）系统代理注册表 `HKCU\...\Internet Settings`。多数情况下你无需手动配置；若自动派生不到，用 `ENGRAM_REVIEWER_PROXY` 直接指定即可。
 
 ## 平台与发布
 
@@ -126,4 +159,4 @@ Windows 上 hook 经 bash 执行，路径用正斜杠（随附启动器/脚本�
 
 ## 许可证
 
-MIT
+Apache License 2.0 —— 见 [LICENSE](./LICENSE)。第三方依赖的许可证清单见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。

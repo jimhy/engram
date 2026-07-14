@@ -1,0 +1,33 @@
+{
+  "name": "case-15-escaping",
+  "description": "转义链路：cue 含 Windows 反斜杠路径、空格与中文引号，检验 shim 录制与写入全链路不丢不坏",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T23:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c15", "message": { "role": "user", "content": [ { "type": "text", "text": "evaldemo 的用户配置文件到底在哪？主题怎么改？记下来，每次都找半天。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T23:00:06.000Z", "sessionId": "eval-c15", "message": { "role": "assistant", "content": [ { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "ls \"C:/Users/lab/AppData/Roaming/evaldemo app/\"" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T23:00:30.000Z", "sessionId": "eval-c15", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "config.toml" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T23:00:40.000Z", "sessionId": "eval-c15", "message": { "role": "assistant", "content": [ { "type": "text", "text": "找到了：配置在 C:\\Users\\lab\\AppData\\Roaming\\evaldemo app\\config.toml（注意目录名带空格），主题键是 \"ui.theme\"，取值 dark|light。已记录。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["config.toml", "AppData"],
+        "level_in": ["L4.3"],
+        "importance_range": [0.3, 0.5],
+        "pointer_required": true,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "健壮性 case：cue 里带反斜杠 Windows 路径、含空格的目录名与中文引号「ui.theme」，检验录制 shim 的 JSONL 转义（serde 负责）与 cmd/sh 参数传递全链路——任何一环把反斜杠吃掉或把参数截断，keywords（AppData/config.toml）就match不上判漏。配置文件定位是短命小事实 → 落项目快衰减层 L4.3（层锚 0.3-0.5，importance 收在锚内 ≤0.5）。路径用户名用通用占位（lab），不含真实用户画像。mock argv 刻意避开英文双引号与百分号（Windows .cmd 参数编码的已知雷区，属工具链限制而非复盘者能力）。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.3", "--project", "evaldemo", "--cue", "evaldemo 用户配置在 C:\\Users\\lab\\AppData\\Roaming\\evaldemo app\\config.toml（目录名带空格），主题键「ui.theme」取值 dark|light", "--importance", "0.45", "--pointer-kind", "file", "--pointer-ref", "C:\\Users\\lab\\AppData\\Roaming\\evaldemo app\\config.toml:12"] }
+  ]
+}

@@ -96,6 +96,8 @@
   .ptr .pk{color:var(--dim2)}
   .id{color:var(--dim2);font-size:11px}
   .eff-inf{color:var(--l1)}
+  .dberr{border:1px solid #5b2626;background:#241417;color:#fca5a5;border-radius:8px;
+    padding:10px 14px;margin-bottom:14px;font-size:13px;word-break:break-all}
   .empty{color:var(--dim);text-align:center;padding:60px 20px}
   .empty code{background:var(--panel2);padding:1px 6px;border-radius:5px}
 
@@ -173,6 +175,12 @@
 <div id="toast"></div>
 
 <script>
+/* 一次性 token：serve 启动 URL 携带 ?token=…，本页把它附到全部 fetch
+   （query 参数），与后端的常量时间校验配对。缺 token 时后端根路径直接
+   拒绝，故走到这里 token 基本必在；仍容错为空串。 */
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+function api(u){ return u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN); }
+
 const LEVELS = ["L1","L2","L3","L4.1","L4.2","L4.3"];
 const STATUSES = ["active","cold","superseded","tombstone"];
 const STATUS_LABEL = {active:"活跃",cold:"冷藏",superseded:"被取代",tombstone:"墓碑"};
@@ -196,6 +204,14 @@ function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;"
 function fmtEff(m){
   if(m.pinned || m.effective===null) return '<span class="eff-inf">∞</span>';
   return esc(m.effective.toFixed(2));
+}
+/* 升级分：后端给的 promotion_score_horizon（在 now+升级视界 采样，与
+   consolidate 的升级判定同语义——「明天它还够格吗」），pinned/∞ 同 eff 处理。 */
+function fmtPro(m){
+  const v=m.promotion_score_horizon;
+  if(m.pinned) return '<span class="eff-inf">∞</span>';
+  if(v==null) return "—";
+  return esc(v.toFixed(2));
 }
 function fmtTime(t){
   if(t==null) return "";
@@ -249,20 +265,21 @@ function renderMemSidebar(){
   d.memories.forEach(m=>{ const k=groupKey(m); counts[k]=(counts[k]||0)+1; });
 
   const dbByName={}; (d.dbs||[]).forEach(x=>dbByName[x.name]=x);
-  // 把发现到的库映射成 {key, name, kind, count}
+  // 把发现到的库映射成 {key, name, kind, count, err}（err = 该库暂不可读的原因）
   const rows=(d.dbs||[]).map(x=>{
     const key = x.kind==="general" ? GENERAL_KEY : x.name;
-    return {key, name:x.kind==="general"?"通用（公共库）":x.name, kind:x.kind, count:counts[key]||x.count||0};
+    return {key, name:x.kind==="general"?"通用（公共库）":x.name, kind:x.kind,
+      count:counts[key]||x.count||0, err:x.error||""};
   });
   const generals=rows.filter(r=>r.kind==="general");
   const projects=rows.filter(r=>r.kind!=="general").sort((a,b)=>a.name.localeCompare(b.name));
   const total=d.memories.length;
 
   let html="";
-  const item=(key,label,kind,count)=>
-    `<div class="dbitem${state.memDb===key?' on':''}" data-key="${esc(key)}">`+
-    `<span class="dot dot-${kind}"></span><span class="nm">${esc(label)}</span>`+
-    `<span class="ct">${count}</span></div>`;
+  const item=(key,label,kind,count,err)=>
+    `<div class="dbitem${state.memDb===key?' on':''}" data-key="${esc(key)}"${err?` title="该库暂不可读：${esc(err)}"`:""}>`+
+    `<span class="dot dot-${kind}"></span><span class="nm">${err?"⚠ ":""}${esc(label)}</span>`+
+    `<span class="ct">${err?"—":count}</span></div>`;
 
   html+=`<div class="sbgroup">`+
     `<div class="dbitem${state.memDb===''?' on':''}" data-key="">`+
@@ -270,11 +287,11 @@ function renderMemSidebar(){
     `<span class="ct">${total}</span></div></div>`;
   if(generals.length){
     html+=`<div class="sbgroup"><div class="sbtitle">通用</div>`+
-      generals.map(r=>item(r.key,r.name,r.kind,r.count)).join("")+`</div>`;
+      generals.map(r=>item(r.key,r.name,r.kind,r.count,r.err)).join("")+`</div>`;
   }
   if(projects.length){
     html+=`<div class="sbgroup"><div class="sbtitle">项目（${projects.length}）</div>`+
-      projects.map(r=>item(r.key,r.name,r.kind,r.count)).join("")+`</div>`;
+      projects.map(r=>item(r.key,r.name,r.kind,r.count,r.err)).join("")+`</div>`;
   }
   sb.innerHTML=html;
   sb.querySelectorAll(".dbitem").forEach(el=>{
@@ -304,10 +321,20 @@ function renderMem(){
     if(a===GENERAL_KEY) return -1; if(b===GENERAL_KEY) return 1;
     return a.localeCompare(b);
   });
-  if(order.length===0){ main.innerHTML='<div class="empty">没有符合当前筛选的记忆。</div>'; return; }
+
+  // 单库隔离：不可读的库以横幅提示（其余库照常展示，不再整体报错）。
+  let notice="";
+  (d.dbs||[]).filter(x=>x.error).forEach(x=>{
+    const key = x.kind==="general" ? GENERAL_KEY : x.name;
+    if(!state.memDb || state.memDb===key){
+      notice+=`<div class="dberr">⚠ 库「${esc(x.name)}」暂不可读：${esc(x.error)}</div>`;
+    }
+  });
+
+  if(order.length===0){ main.innerHTML=notice+'<div class="empty">没有符合当前筛选的记忆。</div>'; return; }
 
   const dbByName={}; (d.dbs||[]).forEach(x=>dbByName[x.name]=x);
-  let html="";
+  let html=notice;
   for(const g of order){
     const list=groups[g];
     const label = g===GENERAL_KEY ? "通用记忆（公共库 L1–L3）" : g;
@@ -326,7 +353,7 @@ function renderMem(){
     for(const m of list){
       if(m.level!==curLvl){
         curLvl=m.level;
-        html+=`<tr><td colspan="5" class="lvlhead">${curLvl}</td></tr>`;
+        html+=`<tr><td colspan="6" class="lvlhead">${curLvl}</td></tr>`;
       }
       const ref=m.pointer&&(m.pointer.reference||m.pointer.detail);
       const ptr = ref ? `<div class="ptr"><span class="pk">${esc(m.pointer.kind)}</span> ${esc(m.pointer.reference||m.pointer.detail)}</div>` : "";
@@ -338,6 +365,7 @@ function renderMem(){
         `<td class="cue">${esc(m.cue)}${tags}${ptr}<div class="id mono">${esc(m.id)} · 用 ${uses} 次 · ${fmtTime(m.created_at)}</div></td>`+
         `<td class="num" title="重要度">imp ${m.importance.toFixed(2)}</td>`+
         `<td class="num" title="有效活跃度 effective">eff ${fmtEff(m)}</td>`+
+        `<td class="num" title="升级分（明日视界采样，与升级判定同语义）">pro ${fmtPro(m)}</td>`+
         `</tr>`;
     }
     html+="</table></section>";
@@ -429,7 +457,7 @@ async function loadKbDoc(){
   const c=document.getElementById("kb-content");
   c.innerHTML='<div class="empty">加载文档原文…</div>';
   try{
-    const url="/api/kb/doc?db="+encodeURIComponent(sel.db)+"&doc="+encodeURIComponent(sel.doc);
+    const url=api("/api/kb/doc?db="+encodeURIComponent(sel.db)+"&doc="+encodeURIComponent(sel.doc));
     const r=await fetch(url,{cache:"no-store"});
     if(!r.ok){ throw new Error(await r.text()||("HTTP "+r.status)); }
     const data=await r.json();
@@ -456,7 +484,7 @@ async function loadKb(){
   const sb=document.getElementById("kb-sidebar");
   sb.innerHTML='<div class="empty">加载中…</div>';
   try{
-    const r=await fetch("/api/kb",{cache:"no-store"});
+    const r=await fetch(api("/api/kb"),{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     state.kb=await r.json();
     state.kbLoaded=true;
@@ -469,7 +497,7 @@ async function loadKb(){
 /* ---------- 记忆数据加载 ---------- */
 async function loadMem(){
   try{
-    const r=await fetch("/api/memories",{cache:"no-store"});
+    const r=await fetch(api("/api/memories"),{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     state.mem=await r.json();
     renderMemSidebar(); renderMem(); renderSummary();
@@ -491,7 +519,7 @@ document.getElementById("auto").addEventListener("change",e=>{
   else{clearInterval(state.timer);state.timer=null;}
 });
 document.getElementById("stop").onclick=async()=>{
-  try{ await fetch("/shutdown",{method:"POST"}); }catch(e){/* 连接被切断属正常 */}
+  try{ await fetch(api("/shutdown"),{method:"POST"}); }catch(e){/* 连接被切断属正常 */}
   document.getElementById("mem-main").innerHTML='<div class="empty">服务已停止，可关闭本页。</div>';
   document.getElementById("kb-content").innerHTML='<div class="empty">服务已停止，可关闭本页。</div>';
   document.getElementById("summary").textContent="服务已停止";

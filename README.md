@@ -63,6 +63,8 @@ Memory is **tiered**, like human memory:
 | **L3** | ordinary | medium |
 | **L4** | per-project, lives in `<project>/.engram/engram.redb` | scoped to the project, located via the `.engram/` anchor |
 
+Each tier also has a **character budget** (token governance): at consolidation the entry cap and the cumulative rendered-character budget act as **dual constraints** — whichever trips first wins — keeping the resident injection cost constant.
+
 - **Activation = importance + recency + frequency** (ACT-R base-level), with a per-tier floor so L1 stays put.
 - **Climbing requires earned activation; falling is cushioned** by the floor and a grace period — new and important memories aren't killed early.
 - **Consolidation** runs at session end via an *independent* `claude -p` reviewer reading the transcript, so the judgment of "what was actually used / worth keeping" isn't self-serving.
@@ -79,7 +81,7 @@ A memory is only worth keeping if it **can't be cheaply recovered** from the cod
 **Per-project — L4, in that project's store (`<project>/.engram/engram.redb`):**
 - **L4.1** — project hard rules: the inviolable conventions / taboos for *this* repo, learned from your "always / never" directives or hard-won corrections. *Not* a copy of CLAUDE.md / lint configs (those are auto-loaded artifacts); L4.1 holds what they **don't** say.
 - **L4.2** — durable project knowledge: what the project is, its **architecture / module mental-map** (what each part does and why it's split that way — distilled, not an `ls` dump), and settled / debated decisions (what was chosen, what was rejected and why — so a later session won't re-propose a dead option).
-- **L4.3** — transient: open loops / hand-off-able work (current progress, what's blocked, next step). Decays fast; superseded once done.
+- **L4.3** — fast-decay tier: low-importance, short-lived memories (current progress, short-lived open loops, hand-off-able work land here naturally). Tiers are not bound to content types — an important long-lived open loop goes to a higher tier by its importance; verified done / stale entries get deleted.
 
 > Golden rule: **store the distilled mental model, never what a single `grep` / `ls` already gives you.** File locations live in the pointer, not the cue.
 
@@ -93,10 +95,38 @@ Storage is **[redb](https://github.com/cberner/redb)** (embedded, single-file, A
 ## Inspect / verify
 
 ```bash
-/engram status            # counts per tier, projects, cold store
+/engram status            # counts per tier, projects, cold store, reviewer health
 /engram list              # list everything
 /engram recall <query>    # search (hot + cold)
 /engram render            # preview what gets injected
+engram export --dir <dir> # full JSON export (backup / migration, engine binary)
+engram doctor --general-db ~/.engram/general.redb [--json]  # read-only health check: data version / per-tier distribution / bad rows / over-budget tiers / future timestamps / dangling pointers / off-anchor importance / duplicates (never writes)
+```
+
+## Backup & migration
+
+The official path is `export` / `import` (symmetric inverses; one JSON per memory with
+every field including `schema_version`):
+
+```bash
+# Backup: export shared + project libraries into a directory (<id>.json per memory)
+engram export --general-db ~/.engram/general.redb --project-db name=path --dir ./backup
+# Optional filters: --project <name> for one project; --status active for the hot tiers only
+
+# Restore / migrate: import back on the target machine (L1-3 → shared, L4 routed via --project-db)
+engram import --general-db ~/.engram/general.redb --project-db name=path --from-json-dir ./backup
+```
+
+Copying the redb files (`general.redb` / `engram.redb`) directly also works, but **only
+while no session is active** (hooks may hold the write lock at any moment; a hot copy can
+capture a torn transaction). For cross-machine migration prefer export/import — import
+also clamps bogus future timestamps to now (clock-skew / rollback sanitization).
+
+**Version migration (automatic, hands-off):** when the engine's data version bumps, **the first session after the upgrade auto-migrates once, backing up first** (to `<general-db parent>/backups/`, one JSON per memory, restorable with `import`). Migration is best-effort and never blocks the session; once done it won't repeat. To inspect read-only first, or run it by hand:
+
+```bash
+engram doctor  --general-db ~/.engram/general.redb [--json]    # read-only check, never writes
+engram migrate --general-db ~/.engram/general.redb --if-needed # one-shot migration (backs up first); add --dry-run to preview without writing
 ```
 
 ## Status line (optional, off by default)
@@ -115,6 +145,11 @@ The engram status line is **off by default** — installing the plugin won't sho
 ## Configuration
 
 - `ENGRAM_REVIEWER_CLI` — which CLI the `SessionEnd` reviewer launches (default `claude`). Set it if your CLI isn't named `claude` (e.g. a local build).
+- `ENGRAM_REVIEWER_PROXY` — explicitly set the proxy for the reviewer subprocess (e.g. `http://127.0.0.1:7897`). Takes priority over any existing `HTTPS_PROXY`/`ALL_PROXY` and the system proxy.
+
+### Proxy environment
+
+The reviewer is a **headless `claude -p` subprocess** spawned by a hook. If your `claude` reaches Anthropic through a local proxy, make sure **`HTTPS_PROXY` (not just `all_proxy`) is visible to the hook subprocess** — otherwise it goes direct and Anthropic rejects it with a region-limited "403 Request not allowed" (the review silently fails; `~/.engram/hook.log` shows a `403` / `not allowed` diagnostic line). Before launching the reviewer engram **derives the proxy automatically**, in priority order: `ENGRAM_REVIEWER_PROXY` (explicit) > an existing `HTTPS_PROXY`/`https_proxy` (inherited) > `ALL_PROXY`/`all_proxy` (derived from) > (Windows only) the system proxy registry under `HKCU\...\Internet Settings`. Usually no manual setup is needed; if auto-derivation misses, point it explicitly with `ENGRAM_REVIEWER_PROXY`.
 
 ## Platforms & releases
 
@@ -126,4 +161,4 @@ On Windows, hooks run under bash, so paths use forward slashes (handled by the b
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](./LICENSE). Third-party dependency licenses are listed in [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md).

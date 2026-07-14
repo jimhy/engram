@@ -1,0 +1,51 @@
+# Engram 知识库检索质量 golden 集（v1）
+# 语料：docs/设计文档.md、docs/参数整定方案.md、docs/知识库设计文档.md（根仓库三份真实文档）。
+# 出题原则：答案必须真实存在于 expect_doc 中；expect_hint 是期望命中章节的标题（面包屑可含）
+# 或正文特征子串，人工可验证；文档重构（标题改名/删节）后需同步校对 hint 仍存在。
+# 判定口径：top-k 内出现 expect_doc 且该命中 chunk 的正文或面包屑含 expect_hint。
+# 难度分布（共 40 条）：
+#   - zh 24 条 = 20 条直白中文问句（用词与文档重合度较高，中低难度）
+#     + 4 条同义改述难题（本文件第 21~24 题，刻意避开文档原词，考纯语义召回）
+#   - en 8 条 = 英文查询命中中文文档（跨语言检索，中高难度；锚点多为文中英文术语）
+#   - ident 8 条 = 裸代码标识符查询（已知风险：FTS ngram(2,2) 对英文标识符是短板，此组专测）
+# 复现：engram-kb eval --db <库目录> --golden plugin/kb/eval/golden.jsonl --limit 8 [--json]
+{"query": "engram 的记忆衰减用的是什么模型？公式长什么样？", "expect_doc": "docs/设计文档.md", "expect_hint": "衰减与加固模型", "kind": "zh"}
+{"query": "什么算记忆的真使用？信号分几档强度？", "expect_doc": "docs/设计文档.md", "expect_hint": "真使用信号", "kind": "zh"}
+{"query": "复盘者在会话末要输出哪些判定结果？", "expect_doc": "docs/设计文档.md", "expect_hint": "复盘者", "kind": "zh"}
+{"query": "热索引是怎么自动注入到会话里的？", "expect_doc": "docs/设计文档.md", "expect_hint": "SessionStart", "kind": "zh"}
+{"query": "热层和冷库的检索方式怎么分工？RAG 该放哪里？", "expect_doc": "docs/设计文档.md", "expect_hint": "检索分工", "kind": "zh"}
+{"query": "为什么高层记忆的入口要设两扇门？", "expect_doc": "docs/设计文档.md", "expect_hint": "两扇门", "kind": "zh"}
+{"query": "记忆掉出热层之后有哪几种去向？", "expect_doc": "docs/设计文档.md", "expect_hint": "降级去向", "kind": "zh"}
+{"query": "什么条件下冷库条目会被真正硬删除？", "expect_doc": "docs/设计文档.md", "expect_hint": "硬删除", "kind": "zh"}
+{"query": "L3 层的记忆加载到上下文时是什么详略度？", "expect_doc": "docs/设计文档.md", "expect_hint": "仅载一行 cue", "kind": "zh"}
+{"query": "写入记忆的 salience 门槛由哪些因子构成？", "expect_doc": "docs/设计文档.md", "expect_hint": "不可恢复性", "kind": "zh"}
+{"query": "知识库为什么要做成独立的 sidecar 进程？", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "sidecar", "kind": "zh"}
+{"query": "知识库用的嵌入模型是哪一个？多少维？", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "bge-small-zh-v1.5", "kind": "zh"}
+{"query": "向量检索为什么 v1 不建 ANN 索引？", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "暴力扫", "kind": "zh"}
+{"query": "检索时查询侧要加什么指令前缀？", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "为这个句子生成表示以用于检索相关文章", "kind": "zh"}
+{"query": "文档分块的 token 容量和 overlap 是多少？", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "256..400", "kind": "zh"}
+{"query": "为什么说给记忆参数打分有循环论证陷阱？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "循环论证", "kind": "zh"}
+{"query": "记忆原型库里有哪几种原型？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "原型库", "kind": "zh"}
+{"query": "防自欺的铁律有哪几条？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "防自欺五铁律", "kind": "zh"}
+{"query": "拿真实历史回放当 oracle 有什么风险？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "幸存者偏差", "kind": "zh"}
+{"query": "题库分成哪三类题？各自什么用途？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "题库结构", "kind": "zh"}
+{"query": "怎么防止一条陈旧的错误认识一直赖在最高层不走？", "expect_doc": "docs/设计文档.md", "expect_hint": "superseded", "kind": "zh"}
+{"query": "刚写进来的条目还没证明价值就被挤掉了，怎么兜底？", "expect_doc": "docs/设计文档.md", "expect_hint": "冷启动宽限期", "kind": "zh"}
+{"query": "出题时怎么保证标准答案不是照着引擎公式反推出来的？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "正交", "kind": "zh"}
+{"query": "一年才碰一次的要紧事，会不会被天天都在用的琐事顶下去？", "expect_doc": "docs/参数整定方案.md", "expect_hint": "PREF-02", "kind": "zh"}
+{"query": "how does hybrid search fuse BM25 and vector scores", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "RRF", "kind": "en"}
+{"query": "which cognitive science equation models memory decay", "expect_doc": "docs/设计文档.md", "expect_hint": "base-level activation", "kind": "en"}
+{"query": "how long are tombstone entries kept before deletion", "expect_doc": "docs/设计文档.md", "expect_hint": "3650", "kind": "en"}
+{"query": "why choose redb over sqlite for the storage engine", "expect_doc": "docs/设计文档.md", "expect_hint": "存储引擎选型", "kind": "en"}
+{"query": "how is the session end review run in a separate process", "expect_doc": "docs/设计文档.md", "expect_hint": "claude -p", "kind": "en"}
+{"query": "is the onnx runtime statically linked into the binary", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "静态链接", "kind": "en"}
+{"query": "markdown chunking token capacity and overlap settings", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "with_overlap(40)", "kind": "en"}
+{"query": "survivorship bias when replaying real access logs", "expect_doc": "docs/参数整定方案.md", "expect_hint": "幸存者偏差", "kind": "en"}
+{"query": "promotion_score", "expect_doc": "docs/设计文档.md", "expect_hint": "promotion_score", "kind": "ident"}
+{"query": "tier_floor", "expect_doc": "docs/设计文档.md", "expect_hint": "tier_floor", "kind": "ident"}
+{"query": "promotion_horizon_days", "expect_doc": "docs/设计文档.md", "expect_hint": "promotion_horizon_days", "kind": "ident"}
+{"query": "RRF", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "RRF", "kind": "ident"}
+{"query": "ngram", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "ngram", "kind": "ident"}
+{"query": "execute_hybrid", "expect_doc": "docs/知识库设计文档.md", "expect_hint": "execute_hybrid", "kind": "ident"}
+{"query": "grace_b0", "expect_doc": "docs/参数整定方案.md", "expect_hint": "grace_b0", "kind": "ident"}
+{"query": "MIN_DT_DAYS", "expect_doc": "docs/参数整定方案.md", "expect_hint": "MIN_DT_DAYS", "kind": "ident"}

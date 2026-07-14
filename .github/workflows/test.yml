@@ -1,0 +1,100 @@
+name: test
+
+# push / PR 测试门：
+# - engine：三平台（ubuntu/windows/macos）cargo clippy -D warnings + cargo test；
+# - kb：只在 ubuntu 跑（理由见 job 注释）；
+# - lint：三端一致性校验（reviewer-prompt.md / SKILL.md 主版与各适配器副本不漂移）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: engine ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # 缓存 cargo registry + engine/target（用法参照 release.yml 的 kb 缓存）。
+      # rust-cache 自动把 runner OS 掺进 cache key，矩阵三平台天然各用各的缓存。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: clippy (engine)
+        working-directory: engine
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (engine)
+        working-directory: engine
+        run: cargo test
+
+  # kb 只在 ubuntu 跑：lancedb/datafusion/ort 全栈冷编约 40 分钟（见 release.yml 注释），
+  # 三平台 × 每次 push 的代价不可接受；逻辑正确性一个平台即可把关，
+  # 跨平台可编译性已由 release.yml 的多平台构建覆盖。
+  kb:
+    name: kb ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # lance 构建硬依赖完整 protoc（含 include/ 的 well-known types），同 release.yml。
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # cache-on-failure：kb 冷编极重，失败的 run 也留缓存供下次续用（同 release.yml）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kb
+          cache-on-failure: true
+      - name: clippy (kb)
+        working-directory: kb
+        # --locked：严格按已提交的 Cargo.lock 解析，防 CI 依赖漂移（同 release.yml）。
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: test (kb)
+        working-directory: kb
+        run: cargo test --locked
+
+  # 三端一致性校验：scripts/check-adapter-sync.sh 假定的目录布局是
+  #   <root>/plugin + <root>/adapters/codex + <root>/adapters/opencode
+  # （脚本以自身位置的上上级为 root）。三者各是独立 git 仓库，本仓库的 checkout
+  # 里没有 adapters/，所以这里按该布局把三个仓库拼装出来再跑脚本。
+  #
+  # 另：opencode 的 engram-desktop-bundle/ 是生成物（在其仓库中被 .gitignore，
+  # 由 export-desktop-bundle.sh 从 opencode-plugin/ 复制产出），checkout 后必须
+  # 先重建，脚本要校验的第三副本（engram-data/ 下）才存在。
+  #
+  # 适配器仓库若为私有，需要 secrets.ADAPTER_DISPATCH_TOKEN（release.yml 已用的
+  # 同一 PAT，本处只需 contents:read）；未配置时回落 github.token（公开仓库可用）。
+  lint:
+    name: adapter sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: jimhy/engram-codex
+          token: ${{ secrets.ADAPTER_DISPATCH_TOKEN || github.token }}
+          path: adapters/codex
+      - uses: actions/checkout@v4
+        with:
+          repository: jimhy/engram-opencode
+          token: ${{ secrets.ADAPTER_DISPATCH_TOKEN || github.token }}
+          path: adapters/opencode
+      - name: 重建 desktop bundle（生成物，不在 opencode 仓库里）
+        run: bash adapters/opencode/export-desktop-bundle.sh
+      - name: check-adapter-sync
+        run: bash plugin/scripts/check-adapter-sync.sh

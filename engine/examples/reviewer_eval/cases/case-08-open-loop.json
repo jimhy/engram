@@ -1,0 +1,34 @@
+{
+  "name": "case-08-open-loop",
+  "description": "开环记忆：flaky 测试修到一半收工，进度与疑似根因应写项目记忆供下次会话续接",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T16:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c08", "message": { "role": "user", "content": [ { "type": "text", "text": "test_ws_reconnect 这个测试三天两头 flaky，修一下" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T16:00:08.000Z", "sessionId": "eval-c08", "message": { "role": "assistant", "content": [ { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "cargo test test_ws_reconnect -- --nocapture" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T16:03:00.000Z", "sessionId": "eval-c08", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "10 次里挂 3 次：assertion failed: reconnect_at >= disconnect_at（相差 1ms 内时偶发倒挂）" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T16:05:00.000Z", "sessionId": "eval-c08", "message": { "role": "assistant", "content": [ { "type": "text", "text": "复现了：疑似根因是重连时间戳用了毫秒精度，两事件同毫秒时比较倒挂。改用单调时钟应该能根治，但改动面涉及 ws 模块三处，今天来不及收尾。" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-13T16:06:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c08", "message": { "role": "user", "content": [ { "type": "text", "text": "先到这，把进度记下来，下次接着修。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["test_ws_reconnect", "flaky"],
+        "level_in": ["L4.2", "L4.3"],
+        "importance_range": [0.3, 0.7],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "open-loop（未完成事项）case：用户显式要求「记进度、下次接着修」。条目必须承载三要素——哪个测试（test_ws_reconnect）、疑似根因（毫秒精度时间戳）、下一步（改单调时钟）——关键词锚定在测试名与 flaky 上。这是一条短命进度开口，按 v5「短命开口自然落快衰减层」应落 L4.3@0.3-0.5；但因带有具体疑似根因，落 L4.2 中档也合规——故 level_in 同时接受 L4.2/L4.3，importance_range 放宽到 [0.3,0.7] 覆盖两层锚（本 case 为容纳「相邻两层皆合规」的开口场景刻意放宽，是全集里唯一的跨层锚区间；判分靠 must_not_write / 计划外等其它维度兜底）。等修完后由后续会话 forget/supersede。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.3", "--project", "evaldemo", "--cue", "开环：test_ws_reconnect flaky 修到一半——疑似根因毫秒精度时间戳同毫秒倒挂，下一步 ws 模块三处改单调时钟", "--importance", "0.45", "--tags", "open-loop"] }
+  ]
+}

@@ -8,12 +8,14 @@
 //! - [`embedder`]：fastembed + bge-small-zh-v1.5 嵌入（query 侧加官方指令前缀，文档侧不加）；
 //! - [`store`]：LanceDB 嵌入式存取（向量 flat 检索 + ngram FTS 倒排 + RRF 混合召回）;
 //! - [`manifest`]：已入库文档清单与内容 hash（增量入库判断）；
-//! - [`scope`]：作用域锚定与各路径约定。
+//! - [`scope`]：作用域锚定与各路径约定；
+//! - [`eval`]：检索质量评测（golden 集判定、recall@k / MRR 汇总，纯函数）。
 //!
 //! 设计文档：`docs/知识库设计文档.md`。
 
 pub mod chunker;
 pub mod embedder;
+pub mod eval;
 pub mod manifest;
 pub mod scope;
 pub mod store;

@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 
 use crate::activation;
 use crate::commands::{ENGRAM_DB_FILE, ENGRAM_DIR, WORKSPACE_MARKER};
+use crate::model::{EngramConfig, SECS_PER_DAY};
 use crate::store;
 
 /// 编译期内嵌的看板页面（单文件、无外链资源，离线可用）。
@@ -115,6 +116,72 @@ fn now_secs() -> Result<f64, String> {
         .map_err(|e| format!("系统时钟早于 UNIX 纪元：{e}"))
 }
 
+/// 生成一次性会话 token（32 个 hex 字符），不引入新依赖。
+///
+/// 熵源：两个独立的 [`std::collections::hash_map::RandomState`]（其内部键来自
+/// OS 熵源，且每个实例互不相同）对「纳秒时间戳 + 进程 id」求哈希后拼接。
+/// 看板服务此前对本机任意进程 / DNS rebinding 页面完全裸奔（可读全部记忆、可调
+/// /shutdown）；启动时生成一次性 token、URL 携带、所有敏感路由校验，即把访问面
+/// 收敛到「看得到启动 URL 的人」。
+fn generate_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    // 两个 RandomState 各自带独立随机键，哈希结果外部不可预测。
+    let a = RandomState::new().hash_one((nanos, pid));
+    let b = RandomState::new().hash_one((pid, nanos, a));
+    format!("{a:016x}{b:016x}")
+}
+
+/// 常量时间比较两个 token 是否相等（防时序侧信道逐字节猜 token）。
+///
+/// 长度不等直接返回 false——token 定长 32 hex，长度信息不构成泄漏。
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    // 逐字节异或累积，无早退：比较耗时与差异位置无关。
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 从 query 串里取 `token=` 参数值（百分号解码）；无则 `None`。
+fn token_from_query(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == "token" {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// 校验一次请求携带的 token（query 的 `token=` 或 `X-Engram-Token` 头）。
+///
+/// 二者任一与 `expected` **常量时间**相等即通过；都缺失或都不匹配则拒绝。
+fn request_authorized(expected: &str, query: &str, header_token: Option<&str>) -> bool {
+    if let Some(t) = token_from_query(query) {
+        if constant_time_token_eq(expected, &t) {
+            return true;
+        }
+    }
+    if let Some(t) = header_token {
+        if constant_time_token_eq(expected, t.trim()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 去掉 Windows `std::fs::canonicalize` 可能带的 verbatim 前缀 `\\?\`（仅盘符形态）。
 fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
@@ -160,7 +227,10 @@ fn read_registry(cfg: &ServeConfig) -> Vec<(DbKind, String, PathBuf)> {
     let mut out = Vec::new();
     for item in arr {
         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("project");
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("project");
         let p = item.get("path").and_then(Value::as_str).unwrap_or("");
         if !name.is_empty() && !p.is_empty() {
             out.push((DbKind::from_str(kind), name.to_string(), PathBuf::from(p)));
@@ -342,18 +412,16 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push(h * 16 + l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -435,7 +503,8 @@ fn build_kb_doc_payload(cfg: &ServeConfig, query: &str) -> Result<String, String
     if !allowed {
         return Err("db 不在已发现的知识库范围内".to_string());
     }
-    let bin = kb_binary().ok_or_else(|| "未找到 engram-kb 二进制（知识库组件未安装）".to_string())?;
+    let bin =
+        kb_binary().ok_or_else(|| "未找到 engram-kb 二进制（知识库组件未安装）".to_string())?;
     let v = run_kb_json(&bin, &["dump", "--db", &db, "--doc", &doc, "--json"])?;
     serde_json::to_string(&v).map_err(|e| format!("序列化文档响应失败：{e}"))
 }
@@ -458,16 +527,42 @@ fn build_payload(cfg: &ServeConfig) -> Result<String, String> {
     let entries = discover(cfg);
     // 顺手把发现结果写回注册表，长期累积覆盖面。
     write_registry(cfg, &entries);
+    build_payload_from_entries(&entries, now, &cfg.scan_roots)
+}
+
+/// [`build_payload`] 的内核（按给定库列表构造响应），拆出以便单测。
+///
+/// **单库隔离**：某库 open / read 失败**不再让整个请求 500**——该库以
+/// `{error: "..."}` 字段进 `dbs`（count=0、无记忆），其余库照常返回；前端据此
+/// 在对应库位显示「该库暂不可读」。此前一个损坏/被占用的项目库会拖垮整个看板。
+fn build_payload_from_entries(
+    entries: &[DbEntry],
+    now: f64,
+    scan_roots: &[PathBuf],
+) -> Result<String, String> {
+    // 升级分的视界采样时刻：与 consolidate 的升级判定同语义（「明天它还够格吗」，
+    // 见 EngramConfig::promotion_horizon_days）——看板展示的 promotion_score_horizon
+    // 即升级状态机真正采样的那个值，避免「看板显示的分」与「实际升级用的分」两张皮。
+    let horizon_now = now + EngramConfig::default().promotion_horizon_days * SECS_PER_DAY;
 
     let mut db_vals: Vec<Value> = Vec::with_capacity(entries.len());
     let mut mem_vals: Vec<Value> = Vec::new();
 
-    for e in &entries {
-        let db = store::open(&e.path)
-            .map_err(|err| format!("打开库 {} 失败：{err}", e.path.display()))?;
-        let mems = store::all(&db)
-            .map_err(|err| format!("读取库 {} 失败：{err}", e.path.display()))?;
-        drop(db);
+    for e in entries {
+        // 单库隔离：open/read 失败只标记该库，不中断其余库。
+        let mems = match store::open(&e.path).and_then(|db| store::all(&db)) {
+            Ok(mems) => mems,
+            Err(err) => {
+                db_vals.push(json!({
+                    "kind": e.kind.as_str(),
+                    "name": e.name,
+                    "path": e.path.to_string_lossy(),
+                    "count": 0,
+                    "error": format!("{err}"),
+                }));
+                continue;
+            }
+        };
 
         db_vals.push(json!({
             "kind": e.kind.as_str(),
@@ -480,10 +575,19 @@ fn build_payload(cfg: &ServeConfig) -> Result<String, String> {
             let mut v = serde_json::to_value(m)
                 .map_err(|err| format!("序列化记忆 {} 失败：{err}", m.id))?;
             if let Value::Object(map) = &mut v {
-                map.insert("effective".to_string(), f64_json(activation::effective(m, now)));
+                map.insert(
+                    "effective".to_string(),
+                    f64_json(activation::effective(m, now)),
+                );
                 map.insert(
                     "promotion_score".to_string(),
                     f64_json(activation::promotion_score(m, now)),
+                );
+                // 与升级判定同语义的视界采样值（批1 引入升级视界后，即时
+                // promotion_score 已不再是升级状态机实际用的分）。
+                map.insert(
+                    "promotion_score_horizon".to_string(),
+                    f64_json(activation::promotion_score(m, horizon_now)),
                 );
             }
             mem_vals.push(v);
@@ -493,7 +597,7 @@ fn build_payload(cfg: &ServeConfig) -> Result<String, String> {
     let payload = json!({
         "generated_at": now,
         "now": now,
-        "scan_roots": cfg.scan_roots.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "scan_roots": scan_roots.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "dbs": db_vals,
         "memories": mem_vals,
     });
@@ -541,10 +645,22 @@ fn write_response(
     stream.flush()
 }
 
-/// 处理单个连接：解析请求行 → 路由 → 写响应。
+/// token 缺失/不符时根路径返回的提示页（不泄漏任何记忆数据）。
+const MISSING_TOKEN_HTML: &str = "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">\
+<title>Engram 看板</title><body style=\"font-family:sans-serif;padding:40px\">\
+<h2>缺 token，请从启动 URL 打开</h2>\
+<p>看板访问需要一次性 token。请回到启动 <code>engram serve</code> 的终端，\
+用它打印的完整 URL（含 <code>?token=…</code>）打开本页。</p></body></html>";
+
+/// 处理单个连接：解析请求行 → token 鉴权 → 路由 → 写响应。
+///
+/// 鉴权：全部路由都要求启动时生成的一次性 token（query `token=` 或
+/// `X-Engram-Token` 头，常量时间比较）。根路径缺 token 时回一页中文提示；
+/// `/api/*` 与 `/shutdown` 缺 token 时回 401。这挡住「本机任意进程 / DNS
+/// rebinding 页面读全部记忆、调 /shutdown」的裸奔面。
 ///
 /// `/shutdown` 会在回完确认后 `process::exit(0)`——这是后台服务进程，直接退出即停服。
-fn handle(mut stream: TcpStream, cfg: &ServeConfig) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, cfg: &ServeConfig, token: &str) -> std::io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let peek = stream.try_clone()?;
     let mut reader = BufReader::new(peek);
@@ -557,19 +673,51 @@ fn handle(mut stream: TcpStream, cfg: &ServeConfig) -> std::io::Result<()> {
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
+    let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
 
-    // 读掉剩余请求头（直到空行），不然某些客户端不认响应。
+    // 读掉剩余请求头（直到空行），顺带捕获 X-Engram-Token（大小写不敏感）。
+    let mut header_token: Option<String> = None;
     loop {
         let mut header = String::new();
         let n = reader.read_line(&mut header)?;
         if n == 0 || header == "\r\n" || header == "\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("x-engram-token") {
+                header_token = Some(value.trim().to_string());
+            }
+        }
     }
+
+    let authorized = request_authorized(token, query, header_token.as_deref());
 
     match (method, path) {
         (_, "/") | (_, "/index.html") => {
-            write_response(&mut stream, "200 OK", "text/html; charset=utf-8", VIEWER_HTML.as_bytes())
+            if !authorized {
+                // 不带（或带错）token：只给提示页，不给看板本体。
+                return write_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    "text/html; charset=utf-8",
+                    MISSING_TOKEN_HTML.as_bytes(),
+                );
+            }
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                VIEWER_HTML.as_bytes(),
+            )
+        }
+        // /api/* 与 /shutdown：token 校验失败一律 401，不执行任何逻辑。
+        ("GET", "/api/memories" | "/api/kb" | "/api/kb/doc") | (_, "/shutdown") if !authorized => {
+            write_response(
+                &mut stream,
+                "401 Unauthorized",
+                "text/plain; charset=utf-8",
+                "token 校验失败：请从启动 URL 携带 ?token= 访问".as_bytes(),
+            )
         }
         ("GET", "/api/memories") => match build_payload(cfg) {
             Ok(json) => write_response(
@@ -644,12 +792,19 @@ fn handle(mut stream: TcpStream, cfg: &ServeConfig) -> std::io::Result<()> {
 /// 绑定失败（非"端口被占"）时返回中文错误字符串。监听循环正常情况下不返回。
 pub fn run(cfg: ServeConfig) -> Result<(), String> {
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
-    let url = format!("http://{}:{}/", display_host(&cfg.host), cfg.port);
+    // 一次性 token：只在启动 URL 里出现；所有敏感路由都校验它（见 [`handle`]）。
+    let token = generate_token();
+    let url = format!(
+        "http://{}:{}/?token={token}",
+        display_host(&cfg.host),
+        cfg.port
+    );
 
     let listener = match TcpListener::bind(&bind_addr) {
         Ok(l) => l,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
             eprintln!("端口 {} 已被占用，视作看板已在运行。", cfg.port);
+            eprintln!("（注意：已在运行的实例有自己的 token，请用它启动时打印的 URL 访问。）");
             if cfg.open {
                 open_browser(&url);
             }
@@ -660,18 +815,22 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
     };
 
     println!("Engram 记忆看板已启动：{url}");
-    println!("（在页面上点「停止服务」，或直接结束本进程，即可关闭）");
+    println!(
+        "（在页面上点「停止服务」，或直接结束本进程，即可关闭；URL 含一次性 token，请勿外传）"
+    );
     if cfg.open {
         open_browser(&url);
     }
 
     let cfg = Arc::new(cfg);
+    let token = Arc::new(token);
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
                 let c = Arc::clone(&cfg);
+                let t = Arc::clone(&token);
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(s, &c) {
+                    if let Err(e) = handle(s, &c, &t) {
                         eprintln!("处理连接出错：{e}");
                     }
                 });
@@ -680,4 +839,358 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
+
+    // ---- token 鉴权（纯函数层，不起 TCP）----
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_token_eq("abcd1234", "abcd1234"));
+        assert!(
+            !constant_time_token_eq("abcd1234", "abcd1235"),
+            "末位不同应拒绝"
+        );
+        assert!(
+            !constant_time_token_eq("abcd", "abcd1234"),
+            "长度不同应拒绝"
+        );
+        assert!(!constant_time_token_eq("", "x"), "空串对非空应拒绝");
+        assert!(constant_time_token_eq("", ""), "两个空串相等");
+    }
+
+    #[test]
+    fn generate_token_is_32_hex_and_unique() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_eq!(a.len(), 32, "token 应为 32 个 hex 字符");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "应全为 hex：{a}");
+        assert_ne!(a, b, "两次生成应不同（RandomState 熵源）");
+    }
+
+    #[test]
+    fn request_authorized_accepts_query_or_header() {
+        let tok = "deadbeefdeadbeefdeadbeefdeadbeef";
+        // query 携带。
+        assert!(request_authorized(tok, &format!("token={tok}"), None));
+        // query 里混其它参数也能取到。
+        assert!(request_authorized(
+            tok,
+            &format!("db=x&token={tok}&doc=y"),
+            None
+        ));
+        // 头携带（含空白修剪）。
+        assert!(request_authorized(tok, "", Some(&format!(" {tok} "))));
+        // 都缺失 / 都错 → 拒绝。
+        assert!(!request_authorized(tok, "", None));
+        assert!(!request_authorized(tok, "token=wrong", Some("alsowrong")));
+    }
+
+    // ---- 单库隔离（build_payload_from_entries；文件 IO 但不起 TCP）----
+
+    /// 进程内唯一的临时目录。
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("engram_serve_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("应能创建临时目录");
+        dir
+    }
+
+    #[test]
+    fn payload_isolates_broken_db_and_keeps_good_one() {
+        let dir = unique_dir("isolate");
+        // 好库：写入一条记忆。
+        let good_path = dir.join("good.redb");
+        let db = store::open(&good_path).expect("应能建好库");
+        let m = Memory {
+            id: "mem_ok".to_string(),
+            cue: "好库里的记忆".to_string(),
+            pointer: Pointer {
+                kind: "none".to_string(),
+                reference: None,
+                detail: None,
+            },
+            level: Level::L2,
+            project: None,
+            importance: 0.5,
+            pinned: false,
+            access_log: vec![1_000_000_000.0],
+            status: Status::Active,
+            superseded_by: None,
+            created_at: 1_000_000_000.0,
+            tags: vec![],
+            schema_version: MEMORY_SCHEMA_VERSION,
+        };
+        store::put(&db, &m).expect("写入应成功");
+        drop(db);
+        // 坏库：写一段垃圾字节冒充 redb 文件（open 必失败）。
+        let bad_path = dir.join("bad.redb");
+        std::fs::write(&bad_path, b"this is not a redb database").expect("写坏库应成功");
+
+        let entries = vec![
+            DbEntry {
+                kind: DbKind::General,
+                name: "通用".to_string(),
+                path: good_path,
+            },
+            DbEntry {
+                kind: DbKind::Project,
+                name: "坏项目".to_string(),
+                path: bad_path,
+            },
+        ];
+        let json_str = build_payload_from_entries(&entries, 1_000_000_000.0, &[])
+            .expect("坏库不应让整个响应失败");
+        let v: Value = serde_json::from_str(&json_str).expect("应为合法 JSON");
+
+        let dbs = v.get("dbs").and_then(Value::as_array).expect("应有 dbs");
+        assert_eq!(dbs.len(), 2, "两个库都应出现在 dbs 里");
+        assert!(dbs[0].get("error").is_none(), "好库不应带 error");
+        let bad_err = dbs[1]
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("坏库应带 error 字段");
+        assert!(!bad_err.is_empty(), "error 说明不应为空");
+
+        let mems = v
+            .get("memories")
+            .and_then(Value::as_array)
+            .expect("应有 memories");
+        assert_eq!(mems.len(), 1, "好库的记忆应照常返回");
+        assert_eq!(mems[0].get("id").and_then(Value::as_str), Some("mem_ok"));
+        // 派生量齐全：effective / promotion_score / 与升级判定同语义的视界采样值。
+        assert!(mems[0].get("effective").is_some());
+        assert!(mems[0].get("promotion_score").is_some());
+        assert!(
+            mems[0].get("promotion_score_horizon").is_some(),
+            "应附带升级视界采样值 promotion_score_horizon"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- percent_decode 边界（纯函数）----
+
+    #[test]
+    fn percent_decode_handles_invalid_and_utf8_boundaries() {
+        // UTF-8 多字节（中文）逐字节转义应正确还原。
+        assert_eq!(percent_decode("%E4%B8%AD%E6%96%87"), "中文");
+        // 原生多字节字符与转义混排：原生字节原样透传、转义各自解码。
+        assert_eq!(percent_decode("中%E6%96%87"), "中文");
+        // '+' 与 %20 都是空格。
+        assert_eq!(percent_decode("a+b%20c"), "a b c");
+        // 大小写 hex 均可。
+        assert_eq!(percent_decode("%41%62"), "Ab");
+        // 非法 hex 转义（%zz）原样保留，不 panic、不吞字符。
+        assert_eq!(percent_decode("%zz"), "%zz");
+        // 截断转义：'%' 后不足两位，原样保留。
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("abc%"), "abc%");
+        // 解码出无效 UTF-8 字节时 lossy 替换（U+FFFD），绝不 panic。
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+        // 空串恒等。
+        assert_eq!(percent_decode(""), "");
+    }
+
+    // ---- discover 库发现（去重 + 扫描；文件 IO 但不起 TCP、不开真库）----
+
+    /// 构造一个只填必要字段的 ServeConfig（host/port/open 与发现逻辑无关）。
+    fn cfg_with(
+        general_db: PathBuf,
+        scan_roots: Vec<PathBuf>,
+        extra_project_dbs: Vec<(String, PathBuf)>,
+    ) -> ServeConfig {
+        ServeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            general_db,
+            scan_roots,
+            extra_project_dbs,
+            open: false,
+        }
+    }
+
+    // discover 应按规范化路径把「注册表 / 显式 --project-db / 不同拼法」的同一文件
+    // 去重成一条；不存在的注册表路径（is_file 为假）不得进入结果。
+    #[test]
+    fn discover_dedups_across_registry_and_explicit_sources() {
+        let dir = unique_dir("disc_dedup");
+        // 占位“库文件”：discover 只查 is_file、不开库，任意字节即可。
+        let general = dir.join("general.redb");
+        std::fs::write(&general, b"stub").expect("写 general 占位");
+        let proj = dir.join("proj.redb");
+        std::fs::write(&proj, b"stub").expect("写 proj 占位");
+
+        // 注册表（与公共库同目录的 projects.json）：登记 proj、一条不存在路径、
+        // 一条与公共库重复的路径。
+        let registry = json!([
+            { "name": "reg-name", "kind": "project", "path": proj.to_string_lossy() },
+            { "name": "ghost", "kind": "project",
+              "path": dir.join("missing.redb").to_string_lossy() },
+            { "name": "dup-general", "kind": "project", "path": general.to_string_lossy() },
+        ]);
+        std::fs::write(dir.join("projects.json"), registry.to_string()).expect("写注册表");
+
+        let cfg = cfg_with(
+            general.clone(),
+            vec![],
+            vec![
+                // 与注册表登记的是同一文件 → 应去重。
+                ("extra-name".to_string(), proj.clone()),
+                // 同一文件的另一种拼法（多一个 `.` 中间段）→ canon_key 应归一去重。
+                ("dotted".to_string(), dir.join(".").join("proj.redb")),
+                // 与公共库重复 → 应去重。
+                ("general-again".to_string(), general.clone()),
+            ],
+        );
+        let entries = discover(&cfg);
+        assert_eq!(
+            entries.len(),
+            2,
+            "同一文件的多来源/多拼法应去重成一条，实得：{entries:?}"
+        );
+        assert_eq!(entries[0].kind, DbKind::General, "公共库应恒排第一");
+        assert_eq!(entries[0].name, "通用");
+        assert_eq!(
+            entries[1].name, "reg-name",
+            "注册表先于显式 --project-db，首见名应保留"
+        );
+        assert_eq!(entries[1].kind, DbKind::Project);
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.path.file_name().is_some_and(|f| f != "missing.redb")),
+            "不存在的注册表路径不得进入结果"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // discover 对 scan_roots 的扫描：管理目录自身的管理库 + 直接子目录里的项目库；
+    // 无 .engram 的子目录与根下普通文件应被忽略。
+    #[test]
+    fn discover_scans_workspace_root_and_direct_children() {
+        let dir = unique_dir("disc_scan");
+        // 公共库放独立子目录，其旁不存在 projects.json（注册表为空）。
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("建 home");
+        let general = home.join("general.redb");
+        std::fs::write(&general, b"stub").expect("写 general 占位");
+
+        // 管理目录 ws：带 workspace 标记 + 自身管理库。
+        let root = dir.join("ws");
+        let root_engram = root.join(ENGRAM_DIR);
+        std::fs::create_dir_all(&root_engram).expect("建 ws/.engram");
+        std::fs::write(root_engram.join(WORKSPACE_MARKER), b"").expect("写 workspace 标记");
+        std::fs::write(root_engram.join(ENGRAM_DB_FILE), b"stub").expect("写管理库占位");
+
+        // 直接子项目 projA：有 .engram/engram.redb → 应被发现为 Project。
+        let proj_a_engram = root.join("projA").join(ENGRAM_DIR);
+        std::fs::create_dir_all(&proj_a_engram).expect("建 projA/.engram");
+        std::fs::write(proj_a_engram.join(ENGRAM_DB_FILE), b"stub").expect("写 projA 库占位");
+
+        // 干扰项：无 .engram 的子目录与根下普通文件都应被忽略。
+        std::fs::create_dir_all(root.join("plain")).expect("建 plain");
+        std::fs::write(root.join("note.txt"), b"x").expect("写 note");
+
+        let cfg = cfg_with(general.clone(), vec![root.clone()], vec![]);
+        let entries = discover(&cfg);
+        assert_eq!(
+            entries.len(),
+            3,
+            "应发现 公共库 + 管理库 + projA 恰三条，实得：{entries:?}"
+        );
+        assert_eq!(entries[0].kind, DbKind::General, "公共库应恒排第一");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind == DbKind::Workspace && e.name == "ws"),
+            "管理目录自身的管理库应以 Workspace 身份被发现"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind == DbKind::Project && e.name == "projA"),
+            "直接子目录的项目库应以 Project 身份被发现"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- /api/kb/doc 白名单等值校验（安全边界；不起 TCP）----
+
+    // db 参数必须与 discover 推导出的某个 kb 目录**逐字节等值**才放行：
+    // 父目录、尾分隔符、大小写变体、路径穿越统统拒绝——杜绝借 query 越权读任意目录。
+    #[test]
+    fn kb_doc_whitelist_requires_exact_db_match() {
+        const WHITELIST_ERR: &str = "db 不在已发现的知识库范围内";
+        let dir = unique_dir("kb_doc_wl");
+        let general = dir.join("general.redb");
+        std::fs::write(&general, b"stub").expect("写 general 占位");
+        let cfg = cfg_with(general.clone(), vec![], vec![]);
+
+        // 缺参数：各给出明确错误（db 先于 doc 校验）。
+        assert_eq!(
+            build_kb_doc_payload(&cfg, "doc=x").expect_err("缺 db 应拒绝"),
+            "缺少 db 参数"
+        );
+        assert_eq!(
+            build_kb_doc_payload(&cfg, "db=whatever").expect_err("缺 doc 应拒绝"),
+            "缺少 doc 参数"
+        );
+
+        // 白名单里唯一的放行值：公共库锚点推导出的共享 kb 目录串。
+        let kb_dir = kb_dir_for(&DbEntry {
+            kind: DbKind::General,
+            name: "通用".to_string(),
+            path: general.clone(),
+        })
+        .expect("应能推导公共库的 kb 目录");
+        let kb_str = kb_dir.to_string_lossy().into_owned();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        // 大小写变体：末段 store → STORE（Windows 文件系统视作同目录，但校验是
+        // 字节等值，必须拒绝）。构造自 kb_dir 的父目录，确保仅大小写不同。
+        let case_variant = kb_dir
+            .parent()
+            .expect("kb 目录应有父目录")
+            .join("STORE")
+            .to_string_lossy()
+            .into_owned();
+        let attempts = [
+            // 锚点目录本身（白名单值的祖先）。
+            dir.to_string_lossy().into_owned(),
+            // 合法值补一个尾分隔符。
+            format!("{kb_str}{sep}"),
+            // 大小写变体。
+            case_variant,
+            // 路径穿越。
+            format!("{kb_str}{sep}..{sep}..{sep}evil"),
+        ];
+        for attempt in &attempts {
+            assert_eq!(
+                build_kb_doc_payload(&cfg, &format!("db={attempt}&doc=x"))
+                    .expect_err("越权 db 应被拒绝"),
+                WHITELIST_ERR,
+                "非等值 db（{attempt}）必须被白名单拦下"
+            );
+        }
+
+        // 等值命中：必须通过白名单闸门——其后的失败只会是「sidecar 未装」或
+        // engram-kb 对不存在 kb 目录的调用失败，决不能再是白名单拒绝
+        // （若机器装了 sidecar 且 dump 意外成功返回 Ok，同样证明已通过白名单）。
+        if let Err(e) = build_kb_doc_payload(&cfg, &format!("db={kb_str}&doc=x")) {
+            assert_ne!(e, WHITELIST_ERR, "等值 db 不应被白名单拦下");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

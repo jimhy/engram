@@ -1,0 +1,41 @@
+{
+  "name": "case-12-importance-calibration",
+  "description": "importance 标定：重大架构决策（渲染层换 wgpu）应打高档，路径小事实（图标目录）只配低档",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T20:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c12", "message": { "role": "user", "content": [ { "type": "text", "text": "定了：evaldemo 渲染层从 egui 换成 wgpu 自绘，这是接下来半年的技术路线。另外图标资源以后统一放 assets/icons 目录。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T20:00:08.000Z", "sessionId": "eval-c12", "message": { "role": "assistant", "content": [ { "type": "text", "text": "两条都记：①架构级决策——渲染层迁 wgpu 自绘（半年主线，影响所有 UI 代码走向）；②资源约定——图标进 assets/icons。我先把目录建好。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "mkdir -p assets/icons" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T20:00:30.000Z", "sessionId": "eval-c12", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T20:00:40.000Z", "sessionId": "eval-c12", "message": { "role": "assistant", "content": [ { "type": "text", "text": "assets/icons 已建好。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["wgpu"],
+        "level_in": ["L4.1", "L4.2"],
+        "importance_range": [0.7, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      },
+      {
+        "keywords_any": ["assets/icons"],
+        "level_in": ["L4.3"],
+        "importance_range": [0.3, 0.5],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "档位标定 case：两条都该写，但档位必须拉开——半年技术路线是重大架构决策（L4.2 高档 / 若视为项目铁律则 L4.1，importance 收在两层锚重叠区 0.7-0.75），图标目录是随手约定（L4.3 快衰减，importance 0.3-0.5）。全打高档或全打低档都会有一条落到区间外判漏，借层级/importance 诊断指标区分「写了但档位放错」。区间贴层锚（wgpu 0.7-0.75、icons 0.3-0.5），杜绝宽区间放过违锚写入。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.2", "--project", "evaldemo", "--cue", "架构决策：evaldemo 渲染层从 egui 迁 wgpu 自绘（未来半年技术主线，2026-07 定）", "--importance", "0.72", "--tags", "decision"] },
+    { "argv": ["write", "--level", "L4.3", "--project", "evaldemo", "--cue", "evaldemo 图标资源统一放 assets/icons 目录", "--importance", "0.35"] }
+  ]
+}

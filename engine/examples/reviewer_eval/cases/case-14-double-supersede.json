@@ -1,0 +1,74 @@
+{
+  "name": "case-14-double-supersede",
+  "description": "双重取代：构建入口与部署方式同会话双双换新，两条旧结论都要标 superseded、两条新结论都要写",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-1401aaaaaaaaaaaa-0000000000000001",
+      "cue": "evaldemo 构建入口是 make build",
+      "pointer": { "kind": "file", "reference": "Makefile:1", "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.6,
+      "pinned": false,
+      "access_log": [1781000000.0, 1782000000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781000000.0,
+      "tags": [],
+      "schema_version": 1
+    },
+    {
+      "id": "mem-1402aaaaaaaaaaaa-0000000000000002",
+      "cue": "evaldemo 部署方式：构建产物手动 scp 到服务器",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.55,
+      "pinned": false,
+      "access_log": [1781100000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781100000.0,
+      "tags": [],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T22:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c14", "message": { "role": "user", "content": [ { "type": "text", "text": "把 evaldemo 的构建从 make 换成 just，部署也别手动 scp 了，改 GitHub Actions 自动发。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T22:00:10.000Z", "sessionId": "eval-c14", "message": { "role": "assistant", "content": [ { "type": "text", "text": "开始：写 justfile 替代 Makefile，加 deploy.yml 工作流替代手动 scp。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "just build && gh workflow run deploy.yml" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T22:04:00.000Z", "sessionId": "eval-c14", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "just build: ok\nworkflow deploy.yml dispatched" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T22:04:10.000Z", "sessionId": "eval-c14", "message": { "role": "assistant", "content": [ { "type": "text", "text": "都换好了：构建入口现在是 just build（justfile），部署走 GitHub Actions 的 deploy.yml 自动发布，旧的 make 与手动 scp 流程同时作废。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["just build", "justfile"],
+        "level_in": ["L4.2"],
+        "importance_range": [0.55, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      },
+      {
+        "keywords_any": ["GitHub Actions", "deploy.yml"],
+        "level_in": ["L4.2"],
+        "importance_range": [0.55, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": ["mem-1401aaaaaaaaaaaa-0000000000000001", "mem-1402aaaaaaaaaaaa-0000000000000002"],
+    "forbidden_command_patterns": [],
+    "notes": "多重 supersede case：同一会话两条旧结论各自被独立的新结论取代，取代关系必须一一对应（构建→构建、部署→部署），漏标任何一条即 fail。两条旧记忆都是被替换 / 被作废的对象（make → just、手动 scp → GitHub Actions），是 supersede 的靶子而非第 3 档真使用——只 supersede、不 confirm_use（与 case-04 / case-09 判法一致，不强制加固被否定的旧结论）。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.2", "--project", "evaldemo", "--cue", "evaldemo 构建入口换为 just build（justfile 取代 Makefile，2026-07）", "--importance", "0.65", "--id", "mem-14f1aaaaaaaaaaaa-0000000000000011", "--pointer-kind", "file", "--pointer-ref", "justfile:1"] },
+    { "argv": ["write", "--level", "L4.2", "--project", "evaldemo", "--cue", "evaldemo 部署改为 GitHub Actions 自动发布（deploy.yml 取代手动 scp）", "--importance", "0.65", "--id", "mem-14f2aaaaaaaaaaaa-0000000000000012", "--pointer-kind", "file", "--pointer-ref", ".github/workflows/deploy.yml:1"] },
+    { "argv": ["supersede", "--id", "mem-1401aaaaaaaaaaaa-0000000000000001", "--by", "mem-14f1aaaaaaaaaaaa-0000000000000011"] },
+    { "argv": ["supersede", "--id", "mem-1402aaaaaaaaaaaa-0000000000000002", "--by", "mem-14f2aaaaaaaaaaaa-0000000000000012"] }
+  ]
+}

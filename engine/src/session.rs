@@ -105,6 +105,44 @@ fn ensure_parent(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// 把 `bytes` **原子地**写入 `path`：先写同目录临时文件再 rename 覆盖。
+///
+/// 裸 `fs::write` 是「截断后再写」——另一进程并发读会读到空/半截内容（曾踩：
+/// watermark 半截 JSON 被静默当空表，水位线归零、全量重复复盘）。改成
+/// tmp+rename 后，读方任何时刻看到的都是完整旧文件或完整新文件。
+/// Windows / Unix 的 rename 对已存在目标均为原子替换（模式照抄
+/// `kb/src/manifest.rs` 的 `Manifest::save`）。父目录不存在则先创建。
+///
+/// # Errors
+/// 建父目录、写临时文件或 rename 失败时返回 [`SessionError::Io`]。
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
+    ensure_parent(path)?;
+    // 临时文件放同目录（rename 跨卷不原子），扩展名追加 .tmp 与正式文件区分。
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 向 `dir/hook.log` 追加一行带时间戳的诊断记录（best-effort，全程失败静默）。
+///
+/// 供本模块内「不该崩、但也不该完全无声」的退化路径使用（如水位线解析失败）。
+/// 时间戳取系统钟 unix 秒；日志是旁路，任何失败都不影响主流程。
+fn append_hook_log_in(dir: &Path, msg: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{ts} {msg}\n");
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("hook.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// 数一个文本文件的行数（确定 transcript 当前进度）。文件不存在视作 0 行。
 ///
 /// # Errors
@@ -159,34 +197,44 @@ pub fn slice_lines(
 /// 读水位线表；文件缺失或解析失败时返回空表。
 ///
 /// 容错语义：水位线只是「省 token 的优化」，丢了最坏不过全量重跑一次，绝不该让
-/// hook 崩。故解析失败也静默退化为空表，而非上抛。
+/// hook 崩。故解析失败也退化为空表，而非上抛——但**不再完全静默**：文件存在却
+/// 解析失败（损坏）时，向同目录 `hook.log` 记一行诊断，便于事后发现「水位线被
+/// 静默归零、全量重复复盘」这类退化。
 pub fn read_watermark(path: &Path) -> Watermark {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(wm) => wm,
+            Err(e) => {
+                // 退化为空表照旧，但留一行痕迹（best-effort，失败静默）。
+                if let Some(dir) = path.parent() {
+                    append_hook_log_in(
+                        dir,
+                        &format!("watermark 解析失败（退化为空表）：{} {e}", path.display()),
+                    );
+                }
+                Watermark::new()
+            }
+        },
         Err(_) => Watermark::new(),
     }
 }
 
-/// 写水位线表（父目录不存在先建）。
+/// 写水位线表（tmp+rename 原子覆盖，父目录不存在先建）。
 ///
 /// # Errors
-/// 建父目录、序列化或写文件失败时返回 [`SessionError`]。
+/// 建父目录、序列化、写临时文件或 rename 失败时返回 [`SessionError`]。
 pub fn write_watermark(path: &Path, wm: &Watermark) -> Result<(), SessionError> {
-    ensure_parent(path)?;
     let bytes = serde_json::to_vec_pretty(wm)?;
-    fs::write(path, bytes)?;
-    Ok(())
+    write_atomic(path, &bytes)
 }
 
-/// 写一条 pending 标记到 `path`（父目录不存在先建）。
+/// 写一条 pending 标记到 `path`（tmp+rename 原子覆盖，父目录不存在先建）。
 ///
 /// # Errors
-/// 建父目录、序列化或写文件失败时返回 [`SessionError`]。
+/// 建父目录、序列化、写临时文件或 rename 失败时返回 [`SessionError`]。
 pub fn write_pending(path: &Path, p: &Pending) -> Result<(), SessionError> {
-    ensure_parent(path)?;
     let bytes = serde_json::to_vec_pretty(p)?;
-    fs::write(path, bytes)?;
-    Ok(())
+    write_atomic(path, &bytes)
 }
 
 /// 从 `path` 读回一条 pending 标记。
@@ -241,6 +289,13 @@ pub fn remove_pending(pending_path: &Path, slice_path: &Path) {
 /// 远大于一次正常复盘的耗时（分钟级），持有者活着绝不会被误夺；又足够短，
 /// 持有者崩溃 / 被强杀残留的锁最多卡一个 TTL 就会被下一个领单者按陈旧夺取。
 pub const CLAIM_TTL_SECS: f64 = 900.0;
+
+/// watermark 读-改-写锁的陈旧阈值（秒）。
+///
+/// consolidate-done 对水位线的「读-改-写」持锁仅毫秒级（读小 JSON、改一个键、
+/// 原子写回），30 秒足够宽裕；持有者崩溃残留的锁最多卡 30 秒即可被夺取，
+/// 不会长期阻塞后续收尾。
+pub const WATERMARK_LOCK_TTL_SECS: f64 = 30.0;
 
 /// claim 锁文件的内容：持有者 pid 与创建时间，序列化为 JSON。
 ///
@@ -298,43 +353,61 @@ fn create_claim(claim_path: &Path, info: &ClaimInfo) -> Result<ClaimOutcome, Ses
     Ok(ClaimOutcome::Acquired)
 }
 
-/// 判定既有 claim 是否陈旧（可被夺取）。
+/// 判定既有 claim 是否陈旧（可被夺取），陈旧阈值由 `ttl_secs` 给定。
 ///
-/// 正常路径：读回 [`ClaimInfo`] 的 `created_at`，距 `now` 超过 [`CLAIM_TTL_SECS`]
+/// 正常路径：读回 [`ClaimInfo`] 的 `created_at`，距 `now` 超过 `ttl_secs`
 /// 即陈旧。内容解析失败（半截写入 / 损坏）时**不轻易夺取**——改用文件 mtime 兜底：
 /// 同样超过 TTL 才算陈旧；mtime 也读不到则保守当作未陈旧（Held）。取舍：宁可这
 /// 一轮不补跑（下次会话还有机会），也不抢一个状态完全未知的锁；坏文件最终会因
 /// mtime 超时被夺取，不会永久卡死。
-fn claim_is_stale(claim_path: &Path, now: f64) -> bool {
+fn claim_is_stale(claim_path: &Path, now: f64, ttl_secs: f64) -> bool {
     if let Ok(bytes) = fs::read(claim_path) {
         if let Ok(info) = serde_json::from_slice::<ClaimInfo>(&bytes) {
-            return now - info.created_at > CLAIM_TTL_SECS;
+            return now - info.created_at > ttl_secs;
         }
     }
     // 解析失败：按文件 mtime 兜底判定。
     match fs::metadata(claim_path).and_then(|m| m.modified()) {
         Ok(mtime) => match mtime.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => now - d.as_secs_f64() > CLAIM_TTL_SECS,
+            Ok(d) => now - d.as_secs_f64() > ttl_secs,
             Err(_) => false,
         },
         Err(_) => false,
     }
 }
 
-/// 尝试领走（占用）一个 pending：对其 claim 路径原子建锁。
+/// 尝试领走（占用）一个 pending：对其 claim 路径原子建锁（陈旧阈值取
+/// [`CLAIM_TTL_SECS`]）。语义详见 [`try_claim_ttl`]。
+///
+/// # Errors
+/// 建父目录、序列化 [`ClaimInfo`] 或写新锁文件失败时返回 [`SessionError`]；
+/// 「锁被他人持有」不是错误（以 [`ClaimOutcome::Held`] 表达）。
+pub fn try_claim(claim_path: &Path, now: f64, pid: u32) -> Result<ClaimOutcome, SessionError> {
+    try_claim_ttl(claim_path, now, pid, CLAIM_TTL_SECS)
+}
+
+/// 同 [`try_claim`]，但陈旧阈值由 `ttl_secs` 显式给定。
+///
+/// 复盘领单用长阈值 [`CLAIM_TTL_SECS`]（复盘者要跑分钟级）；watermark 读-改-写
+/// 这类毫秒级临界区用短阈值 [`WATERMARK_LOCK_TTL_SECS`]，持有者崩溃也只卡 30 秒。
 ///
 /// 互斥根基是 `OpenOptions::create_new`——「文件已存在则失败」由 OS 保证原子
 /// （Windows / Unix 皆然），故两个进程同时领同一个 pending 时必恰有一方
 /// [`ClaimOutcome::Acquired`]、另一方 [`ClaimOutcome::Held`]。
 ///
-/// 已存在的 claim 若距 `now` 超过 [`CLAIM_TTL_SECS`]（持有者大概率已崩），按陈旧
+/// 已存在的 claim 若距 `now` 超过 `ttl_secs`（持有者大概率已崩），按陈旧
 /// **夺取**：先删旧锁再原子新建；夺取途中任一步竞争失败（他人抢先重建 / 删除受阻）
 /// 一律退回 [`ClaimOutcome::Held`]，绝不出现双 owner。
 ///
 /// # Errors
 /// 建父目录、序列化 [`ClaimInfo`] 或写新锁文件失败时返回 [`SessionError`]；
 /// 「锁被他人持有」不是错误（以 [`ClaimOutcome::Held`] 表达）。
-pub fn try_claim(claim_path: &Path, now: f64, pid: u32) -> Result<ClaimOutcome, SessionError> {
+pub fn try_claim_ttl(
+    claim_path: &Path,
+    now: f64,
+    pid: u32,
+    ttl_secs: f64,
+) -> Result<ClaimOutcome, SessionError> {
     ensure_parent(claim_path)?;
     let info = ClaimInfo {
         pid,
@@ -345,7 +418,7 @@ pub fn try_claim(claim_path: &Path, now: f64, pid: u32) -> Result<ClaimOutcome, 
         return Ok(ClaimOutcome::Acquired);
     }
     // 已存在：未陈旧则尊重现有持有者。
-    if !claim_is_stale(claim_path, now) {
+    if !claim_is_stale(claim_path, now, ttl_secs) {
         return Ok(ClaimOutcome::Held);
     }
     // 陈旧 → 夺取：先删旧锁再原子新建。删除失败（除「已不存在」外）保守按 Held；
@@ -585,6 +658,75 @@ mod tests {
         release_claim(&cp);
         // 再释放一次（已不存在）不应 panic。
         release_claim(&cp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 13. 原子写：写后读回一致，且同目录不残留 .tmp 临时文件（rename 已完成）。
+    #[test]
+    fn atomic_write_roundtrip_leaves_no_tmp() {
+        let dir = unique_dir("atomic");
+        let wmf = dir.join("watermark.json");
+        let mut wm = Watermark::new();
+        wm.insert("/t.jsonl".to_string(), 7);
+        write_watermark(&wmf, &wm).expect("原子写水位线应成功");
+        assert_eq!(read_watermark(&wmf).get("/t.jsonl"), Some(&7), "读回应一致");
+
+        let pf = dir.join("sid.json");
+        let p = sample_pending("sid", "/t.jsonl", "/sid.slice.jsonl", 9.0);
+        write_pending(&pf, &p).expect("原子写 pending 应成功");
+        assert_eq!(read_pending(&pf).expect("读回应成功"), p);
+
+        // rename 完成后目录里不应残留任何 .tmp 半成品。
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("读目录应成功")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留 .tmp 临时文件");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 14. 水位线损坏：退化为空表，且同目录 hook.log 记下一行（不再完全静默）。
+    #[test]
+    fn read_watermark_corrupt_logs_and_returns_empty() {
+        let dir = unique_dir("wm_corrupt");
+        let wmf = dir.join("watermark.json");
+        write_file(&wmf, "{ 半截损坏的 JSON");
+        let wm = read_watermark(&wmf);
+        assert!(wm.is_empty(), "损坏水位线应退化为空表（行为不变）");
+        let log = fs::read_to_string(dir.join("hook.log")).expect("应写下 hook.log");
+        assert!(
+            log.contains("watermark 解析失败"),
+            "hook.log 应含解析失败记录，实得：{log}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 15. try_claim_ttl 短阈值：互斥同 try_claim，且超过自定义 TTL（30s）即可夺取。
+    #[test]
+    fn try_claim_ttl_short_lock_mutex_and_steal() {
+        let dir = unique_dir("wm_lock");
+        let cp = dir.join("watermark.lock");
+        assert_eq!(
+            try_claim_ttl(&cp, 1000.0, 1, WATERMARK_LOCK_TTL_SECS).expect("首领应成功"),
+            ClaimOutcome::Acquired
+        );
+        // 未陈旧（同一秒）：第二个领单者必须 Held——这就是读-改-写互斥。
+        assert_eq!(
+            try_claim_ttl(&cp, 1000.0, 2, WATERMARK_LOCK_TTL_SECS).expect("应正常返回"),
+            ClaimOutcome::Held
+        );
+        // 超过 30 秒短阈值：可夺取（持有者崩溃残留不至长期卡死）。
+        assert_eq!(
+            try_claim_ttl(
+                &cp,
+                1000.0 + WATERMARK_LOCK_TTL_SECS + 1.0,
+                3,
+                WATERMARK_LOCK_TTL_SECS
+            )
+            .expect("夺取应成功"),
+            ClaimOutcome::Acquired
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

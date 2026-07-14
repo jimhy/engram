@@ -4,9 +4,12 @@
 //! - 嵌入式本地连接（`connect(目录)`），无任何服务进程；
 //! - **向量检索不建 ANN 索引**——LanceDB 无索引时自动 flat 暴力扫，官方称
 //!   几十万行内可接受；chunk 数上到十万级再上 `Index::Auto`（v2）；
-//! - **FTS 必须有倒排索引才能查**（无索引直接报错），用 ngram(2,2) 分词器：
+//! - **FTS 倒排索引是性能优化而非查询前提**——lance 7（本版 lancedb 0.30 所用
+//!   表格式）起，未进倒排索引的 fragment 会走 flat BM25 兜底扫描、不报错
+//!   （旧版「无索引直接报错」的行为已成历史）。仍用 ngram(2,2) 分词器建索引：
 //!   零外部依赖的中文兜底（jieba 需外置词典，留 v2）；每次 ingest 尾部
-//!   `replace=true` 重建——建索引后新增的行不在旧倒排里，重建保证全量可查；
+//!   `replace=true` 重建——建索引后新增/删除的行走兜底扫描虽能查但慢，
+//!   重建保证全量走倒排；
 //! - 混合检索：FTS(BM25) + 向量(Cosine) 双路召回，SDK 默认 RRF 融合。
 
 use std::path::Path;
@@ -251,7 +254,32 @@ pub async fn rebuild_fts_index(table: &Table) -> Result<(), String> {
         .map_err(|e| format!("构建全文索引失败：{e}"))
 }
 
+/// 混合检索内部 over-fetch 系数（内部召回条数 = `max(limit × 系数, 下限)`）。
+///
+/// lancedb 0.30 的 `execute_hybrid` 会把查询上的同一个 limit 克隆给 FTS 路与
+/// 向量路各自执行——每路只有各自的 top-limit 进 RRF 融合。若把用户 limit
+/// （默认 8）直接设给查询，单路秩在 8 开外、但两路综合相关性高的 chunk 永远
+/// 进不了融合候选，最终排序被「单路截断伪影」主导。故内部放大召回、融合后在
+/// Rust 侧截回用户 limit。成本近零：向量路不建 ANN 索引、本就是全表 flat 扫
+/// （每行距离都已算过，over-fetch 只是少截几行）；FTS 倒排多取一些 top-N
+/// 同样极廉价。
+const HYBRID_OVERFETCH_FACTOR: usize = 5;
+
+/// 混合检索内部召回下限：用户 limit 很小（如 1~2）时也保证两路各有足够候选
+/// 进入 RRF 融合，避免小 limit 下截断伪影更严重。
+const HYBRID_OVERFETCH_MIN: usize = 40;
+
+/// 计算混合检索的内部召回条数：`max(limit × 5, 40)`（饱和乘法防极端 limit 溢出）。
+fn hybrid_fetch_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(HYBRID_OVERFETCH_FACTOR)
+        .max(HYBRID_OVERFETCH_MIN)
+}
+
 /// 混合检索：FTS(BM25) + 向量(Cosine) 双路召回，RRF 融合（SDK 默认 reranker）。
+///
+/// 内部按 [`hybrid_fetch_limit`] over-fetch（两路各多召回一些候选进融合），
+/// 融合结果按相关性降序，在 Rust 侧截回 `limit` 条返回。
 ///
 /// # 参数
 /// - `query_text`：原始查询文本（FTS 用）；
@@ -274,7 +302,7 @@ pub async fn search_hybrid(
         .nearest_to(query_vector)
         .map_err(|e| format!("构造向量查询失败：{e}"))?
         .distance_type(DistanceType::Cosine)
-        .limit(limit);
+        .limit(hybrid_fetch_limit(limit));
     if let Some(f) = filter {
         q = q.only_if(f);
     }
@@ -285,7 +313,10 @@ pub async fn search_hybrid(
         .try_collect()
         .await
         .map_err(|e| format!("读取检索结果失败：{e}"))?;
-    Ok(parse_hits(&batches))
+    // 融合结果已按 RRF 分降序；内部 over-fetch 之后在这里截回用户要求的条数。
+    let mut hits = parse_hits(&batches);
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 /// 表内 chunk 总数。
@@ -397,4 +428,21 @@ fn parse_hits(batches: &[RecordBatch]) -> Vec<Hit> {
         }
     }
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// over-fetch 计算：小 limit 走下限、大 limit 走倍数、极端值饱和不 panic。
+    #[test]
+    fn hybrid_fetch_limit_bounds() {
+        assert_eq!(hybrid_fetch_limit(1), HYBRID_OVERFETCH_MIN);
+        // 默认 limit 8：8×5=40，恰为下限。
+        assert_eq!(hybrid_fetch_limit(8), HYBRID_OVERFETCH_MIN);
+        assert_eq!(hybrid_fetch_limit(9), 45);
+        assert_eq!(hybrid_fetch_limit(100), 500);
+        // 极端 limit 用饱和乘法，不得溢出 panic。
+        assert_eq!(hybrid_fetch_limit(usize::MAX), usize::MAX);
+    }
 }

@@ -1,0 +1,50 @@
+{
+  "name": "case-04-decision-supersede",
+  "description": "决策变更：存储从 SQLite 迁到 Postgres，旧选型结论应被 supersede，新决策写 L4.2",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-0401aaaaaaaaaaaa-0000000000000001",
+      "cue": "evaldemo 用 SQLite 做存储（v0 选型，单文件够用）",
+      "pointer": { "kind": "file", "reference": "src/db.rs:1", "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.7,
+      "pinned": false,
+      "access_log": [1780900000.0, 1782100000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1780900000.0,
+      "tags": ["decision"],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T12:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c04", "message": { "role": "user", "content": [ { "type": "text", "text": "SQLite 顶不住并发写了，把 evaldemo 的存储迁到 Postgres，这是正式决策。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T12:00:08.000Z", "sessionId": "eval-c04", "message": { "role": "assistant", "content": [ { "type": "text", "text": "明白，开始迁移：引入 sqlx + Postgres，连接串走环境变量 DATABASE_URL（值不落库）。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "cargo test --features postgres" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T12:05:00.000Z", "sessionId": "eval-c04", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "test result: ok. 61 passed; 0 failed" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T12:05:10.000Z", "sessionId": "eval-c04", "message": { "role": "assistant", "content": [ { "type": "text", "text": "迁移完成，61 个测试全过。evaldemo 存储正式从 SQLite 换成 Postgres（sqlx），旧的 SQLite 选型作废。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["Postgres"],
+        "level_in": ["L4.2"],
+        "importance_range": [0.6, 0.75],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": ["61 passed", "全过"],
+    "forbidden_strings": [],
+    "supersede": ["mem-0401aaaaaaaaaaaa-0000000000000001"],
+    "forbidden_command_patterns": [],
+    "notes": "supersede 语义主 case：旧 SQLite 选型被本次会话明确作废 → 必须标 superseded（而不是 forget 物理删除，痕迹要留）；新 Postgres 决策写 L4.2 高档 importance。旧结论是被否定 / 被替换的对象（用户亲口否定「SQLite 顶不住」），不构成第 3 档真使用——只 supersede、不 confirm_use（与 case-09 判法一致，避免强制加固一条无真使用证据的被否定记忆）。测试通过数是一次性噪声，不得入 cue。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L4.2", "--project", "evaldemo", "--cue", "决策：evaldemo 存储从 SQLite 迁到 Postgres（sqlx，连接串走 DATABASE_URL），因并发写瓶颈", "--importance", "0.72", "--id", "mem-04f1aaaaaaaaaaaa-0000000000000011", "--tags", "decision"] },
+    { "argv": ["supersede", "--id", "mem-0401aaaaaaaaaaaa-0000000000000001", "--by", "mem-04f1aaaaaaaaaaaa-0000000000000011"] }
+  ]
+}

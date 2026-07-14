@@ -1,0 +1,41 @@
+{
+  "name": "case-07-scope-routing",
+  "description": "作用域分流：同一会话产出一条跨项目偏好（→公共库）与一条项目事实（→项目库），各写错库即判漏",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T15:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c07", "message": { "role": "user", "content": [ { "type": "text", "text": "两件事：第一，以后所有项目的 git 提交信息都用 Conventional Commits 格式；第二，evaldemo 本地开发端口固定 8787，别再随机换了。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T15:00:06.000Z", "sessionId": "eval-c07", "message": { "role": "assistant", "content": [ { "type": "text", "text": "收到：①Conventional Commits 是跨项目长期规范；②evaldemo 开发端口固定 8787，我把 dev-server 配置改过来。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "sed -i 's/port = 0/port = 8787/' dev.toml" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T15:00:40.000Z", "sessionId": "eval-c07", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T15:00:50.000Z", "sessionId": "eval-c07", "message": { "role": "assistant", "content": [ { "type": "text", "text": "dev.toml 已改：port = 8787。两条约定都会记住。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["Conventional Commits"],
+        "level_in": ["L2"],
+        "importance_range": [0.6, 0.8],
+        "pointer_required": false,
+        "scope": "general"
+      },
+      {
+        "keywords_any": ["8787"],
+        "level_in": ["L4.3"],
+        "importance_range": [0.3, 0.5],
+        "pointer_required": false,
+        "scope": "project"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "分流判别 case：「所有项目」的提交规范必须进公共库（L2，层锚 0.55-0.8），「evaldemo 的端口」是短命小配置事实、进项目库快衰减层（L4.3，层锚 0.3-0.5）——两条内容都写但库放反，同样按漏判 fail。这是复盘者最常犯的错误之一，单独立 case。端口条目 importance 收在 L4.3 层锚内（≤0.5），杜绝落到 0.5-0.55 的层间无人区。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L2", "--cue", "用户规范：所有项目 git 提交信息一律用 Conventional Commits 格式", "--importance", "0.7", "--tags", "preference"] },
+    { "argv": ["write", "--level", "L4.3", "--project", "evaldemo", "--cue", "evaldemo 本地开发端口固定 8787（dev.toml 的 port 项，用户要求不再随机）", "--importance", "0.45", "--pointer-kind", "file", "--pointer-ref", "dev.toml:3"] }
+  ]
+}

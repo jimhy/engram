@@ -17,9 +17,13 @@ try {
 
     $work = Join-Path $env:USERPROFILE '.engram\pending'
     $wm = Join-Path $env:USERPROFILE '.engram\watermark.json'
+    $sessions = Join-Path $env:USERPROFILE '.engram\active-sessions'
 
-    # ask the engine whether there is a leftover pending to catch up on (it also clears older ones)
-    $planRaw = & $ENGRAM catchup-scan --work-dir $work
+    # ask the engine whether there is a leftover pending to catch up on (it also clears older ones).
+    # --sessions-dir/--watermark: orphan-session rebuild -- on hard-kill/power-loss SessionEnd never
+    # fired and no pending exists; the engine rebuilds one from the active-sessions registration
+    # left by UserPromptSubmit (still "most recent one only").
+    $planRaw = & $ENGRAM catchup-scan --work-dir $work --sessions-dir $sessions --watermark $wm
     $plan = $null
     if ($planRaw) { try { $plan = $planRaw | ConvertFrom-Json } catch { $plan = $null } }
     if ($plan -and $plan.action -eq 'review') {

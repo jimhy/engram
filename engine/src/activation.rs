@@ -164,6 +164,7 @@ mod tests {
             superseded_by: None,
             created_at,
             tags: vec![],
+            schema_version: crate::model::MEMORY_SCHEMA_VERSION,
         }
     }
 

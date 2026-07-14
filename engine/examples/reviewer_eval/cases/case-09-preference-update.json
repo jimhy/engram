@@ -1,0 +1,50 @@
+{
+  "name": "case-09-preference-update",
+  "description": "偏好更新：用户把包管理器从 npm 改成 pnpm——公共库旧偏好应被 supersede，新偏好写 L2",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-0901aaaaaaaaaaaa-0000000000000001",
+      "cue": "用户偏好：前端项目包管理用 npm",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L2",
+      "project": null,
+      "importance": 0.6,
+      "pinned": false,
+      "access_log": [1780500000.0, 1781600000.0, 1782400000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1780500000.0,
+      "tags": ["preference"],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T17:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c09", "message": { "role": "user", "content": [ { "type": "text", "text": "以后别用 npm 了，所有前端项目全部改用 pnpm，磁盘占用小太多了。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T17:00:05.000Z", "sessionId": "eval-c09", "message": { "role": "assistant", "content": [ { "type": "text", "text": "好，长期偏好更新为 pnpm。先把 evaldemo 前端的依赖用 pnpm 重装验证。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "pnpm install" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T17:01:30.000Z", "sessionId": "eval-c09", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "Done in 8.2s using pnpm v9" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T17:01:40.000Z", "sessionId": "eval-c09", "message": { "role": "assistant", "content": [ { "type": "text", "text": "pnpm 安装通过。旧的 npm 偏好作废，以后一律 pnpm。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["pnpm"],
+        "level_in": ["L2"],
+        "importance_range": [0.6, 0.8],
+        "pointer_required": false,
+        "scope": "general"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": ["mem-0901aaaaaaaaaaaa-0000000000000001"],
+    "forbidden_command_patterns": ["forget --id mem-0901aaaaaaaaaaaa-0000000000000001"],
+    "notes": "公共库 supersede case（case-04 是项目库，这里检验跨库路由）：旧 npm 偏好被用户明确推翻→标 superseded 留痕，禁止 forget 物理删除（历史偏好是有价值的演化轨迹）；新 pnpm 偏好写 L2 general。旧偏好本轮没有支撑任何输出（是被否定对象），不设 confirm_use。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L2", "--cue", "用户偏好：前端项目包管理一律用 pnpm（2026-07 起取代旧的 npm 偏好，理由：磁盘占用小）", "--importance", "0.7", "--id", "mem-09f1aaaaaaaaaaaa-0000000000000011", "--tags", "preference"] },
+    { "argv": ["supersede", "--id", "mem-0901aaaaaaaaaaaa-0000000000000001", "--by", "mem-09f1aaaaaaaaaaaa-0000000000000011"] }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "case-20-recall-not-used",
+  "description": "第 2 档不加固：agent 显式取出一条候选记忆但最终未采纳（对输出零影响），复盘者不得 confirm_use 它（取出≠真使用）",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-20c1aaaaaaaaaaaa-0000000000000001",
+      "cue": "曾调研过用 lru crate 给 evaldemo 做缓存（备选方案，未落地）",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.5,
+      "pinned": false,
+      "access_log": [1781500000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781500000.0,
+      "tags": ["archive"],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-14T13:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c20", "message": { "role": "user", "content": [ { "type": "text", "text": "给 evaldemo 的用户查询加个缓存吧，最近有点慢。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-14T13:00:08.000Z", "sessionId": "eval-c20", "message": { "role": "assistant", "content": [ { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "engram recall --query 缓存 lru" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-14T13:00:30.000Z", "sessionId": "eval-c20", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "候选：mem-20c1aaaaaaaaaaaa-0000000000000001 [L4.2] 曾调研过用 lru crate 给 evaldemo 做缓存（备选方案，未落地）" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-14T13:01:00.000Z", "sessionId": "eval-c20", "message": { "role": "assistant", "content": [ { "type": "text", "text": "取出了之前那条 lru crate 备选方案看了看。不过这次只是热点用户查询、数据量很小，引入 lru crate 属于杀鸡用牛刀——我不采用它，直接用一个进程内 HashMap 缓存就够。那条 lru 候选这次没派上用场。" }, { "type": "tool_use", "id": "t-2", "name": "Bash", "input": { "command": "echo add simple HashMap cache" } } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-14T13:02:00.000Z", "sessionId": "eval-c20", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-2", "content": "" } ] } },
+    { "type": "assistant", "uuid": "a-3", "timestamp": "2026-07-14T13:02:20.000Z", "sessionId": "eval-c20", "message": { "role": "assistant", "content": [ { "type": "text", "text": "已加一个简单的 HashMap 缓存（数据量小，够用）。lru crate 那条只是取出来对比了下，没影响最终选型。" } ] } },
+    { "type": "user", "uuid": "u-4", "timestamp": "2026-07-14T13:03:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c20", "message": { "role": "user", "content": [ { "type": "text", "text": "好，收工。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": ["mem-20c1aaaaaaaaaaaa-0000000000000001"],
+    "must_write": [],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "真使用四档 case（第 2 档 vs 第 3 档）：agent 显式 recall 取出 lru 候选，但对比后明确不采纳、最终选了 HashMap——候选对输出零影响，属第 2 档『被 recall 取出但没派上用场』，不算真使用。合规复盘者据『与被加载解耦』铁律不得 confirm_use 它；加固即 confirm_violations 判 fail。HashMap 选型是一次性、可 grep 的实现细节，宁缺勿滥不入库（must_write 为空）。mock 只做一次只读 list、零加固零写入。"
+  },
+  "mock_actions": [
+    { "argv": ["list", "--json"] }
+  ]
+}

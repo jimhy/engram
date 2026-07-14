@@ -1,0 +1,32 @@
+{
+  "name": "case-13-identity-l1",
+  "description": "身份级信息进最底层：用户自我介绍并要求「记到最底层」，应写 L1 高 importance 通用记忆",
+  "project_name": "evaldemo",
+  "preexisting": [],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T21:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c13", "message": { "role": "user", "content": [ { "type": "text", "text": "正式介绍下：我是林晚舟，后端工程师，主力平台 macOS，主语言 Go，跟我交流用中文。这些记到最底层，别让它被冲掉。" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T21:00:05.000Z", "sessionId": "eval-c13", "message": { "role": "assistant", "content": [ { "type": "text", "text": "记住了，林晚舟：后端工程师 / macOS / Go / 中文交流——这组身份信息会进最稳固的记忆层，长期有效。" } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T21:00:30.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c13", "message": { "role": "user", "content": [ { "type": "text", "text": "好。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": [],
+    "confirm_use_forbidden": [],
+    "must_write": [
+      {
+        "keywords_any": ["林晚舟", "后端工程师"],
+        "level_in": ["L1"],
+        "importance_range": [0.85, 1.0],
+        "pointer_required": false,
+        "scope": "general"
+      }
+    ],
+    "must_not_write_keywords": [],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "L1 覆盖 case（其余 case 都写 L2-L4，这里补最底层）：用户身份 + 显式「记到最底层、别被冲掉」→ 必须 L1 + importance 落 L1 层锚 0.85-1.0 + pinned（判分器不查 pinned，凭 notes 供人审）；写成 L2/L3 即层级落错判漏。persona 为纯虚构（林晚舟 / 后端工程师 / macOS / Go），与真实用户画像不重合。"
+  },
+  "mock_actions": [
+    { "argv": ["write", "--level", "L1", "--cue", "用户是林晚舟：后端工程师，主力 macOS + Go，交流一律中文", "--importance", "0.9", "--pinned", "--tags", "identity"] }
+  ]
+}

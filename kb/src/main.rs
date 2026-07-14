@@ -4,12 +4,15 @@
 //! `--json` 可选结构化输出（单行）、错误中文走 stderr + 非 0 退出、不 panic。
 //!
 //! 子命令（设计文档 §6）：
-//! - `ingest`：文档入库 / 增量更新（分块 → 嵌入 → LanceDB → 重建 FTS 索引）；
+//! - `ingest`：文档入库 / 增量更新（分块 → 嵌入 → LanceDB → 重建 FTS 索引），
+//!   并顺带清理本次路径范围内「源文件已从磁盘消失」的孤儿 chunk；
 //! - `search`：混合检索（向量 Cosine + ngram BM25，RRF 融合）；
 //! - `list`：已入库文档清单（读 manifest）；
 //! - `remove`：删除某文档的全部 chunk；
+//! - `prune`：清理全库孤儿文档（manifest 有记录而源文件已不在磁盘）；
 //! - `status`：库统计 + 模型就绪状态；
-//! - `ensure-model`：预下载 / 校验嵌入模型。
+//! - `ensure-model`：预下载 / 校验嵌入模型；
+//! - `eval`：检索质量评测（golden 集逐条跑混合检索，输出 recall@k / MRR）。
 //!
 //! 知识库目录解析：`--db` 显式指定优先；否则从 cwd 向上锚定 `.engram/`（与主
 //! 引擎同判据）取 `<锚点>/.engram/kb/`。模型缓存恒为 `<HOME>/.engram/kb/models/`
@@ -23,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 use engram_kb::chunker::{Chunk, Chunker};
 use engram_kb::embedder::{self, Embedder};
+use engram_kb::eval;
 use engram_kb::manifest::{content_hash, DocEntry, Manifest, PIPELINE_VERSION};
 use engram_kb::scope;
 use engram_kb::store::{self, KbStore};
@@ -108,6 +112,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 清理孤儿文档：manifest 有记录但源文件已从磁盘删除/改名的条目
+    /// （删其残留 chunk、移除 manifest 记录并重建全文索引）。
+    Prune {
+        /// 知识库目录；缺省同 ingest 的锚定规则。
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// 清理用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
+        /// 只列出将被清理的孤儿文档，不做任何删除。
+        #[arg(long)]
+        dry_run: bool,
+        /// 以单行 JSON 输出（默认输出可读文本）。
+        #[arg(long)]
+        json: bool,
+    },
     /// 知识库概况：文档数 / chunk 数 / 模型就绪状态。
     Status {
         /// 知识库目录；缺省同 ingest 的锚定规则。
@@ -140,6 +160,26 @@ enum Command {
     /// 预下载 / 校验嵌入模型（bge-small-zh-v1.5，约 95MB，仅首次联网）。
     EnsureModel {
         /// 以单行 JSON 输出（默认输出可读文本）。
+        #[arg(long)]
+        json: bool,
+    },
+    /// 检索质量评测：对 golden 集逐条跑混合检索，输出 recall@1/4/8、MRR、
+    /// 分 kind 细分表与逐条失败清单（检索侧的量化「尺子」，调参锚定数字）。
+    Eval {
+        /// 知识库目录；缺省同 ingest 的锚定规则。
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// 评测用户级共享知识库（`<HOME>/.engram/kb/store/`）而非项目库；与 `--db` 互斥。
+        #[arg(long)]
+        shared: bool,
+        /// golden 集文件（JSONL：每行 {query, expect_doc, expect_hint, kind}；
+        /// `#` 开头行与空行为注释）。
+        #[arg(long)]
+        golden: PathBuf,
+        /// 每条查询取的命中数上限（判定在该 top-k 内做）。
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// 以单行 JSON 输出完整结果（默认输出可读文本报告）。
         #[arg(long)]
         json: bool,
     },
@@ -191,9 +231,13 @@ async fn dispatch(cli: Cli) -> ExitCode {
         }
         Command::List { db, shared, json } => run_list(db, shared, json),
         Command::Remove { db, shared, doc, json } => run_remove(db, shared, &doc, json).await,
+        Command::Prune { db, shared, dry_run, json } => run_prune(db, shared, dry_run, json).await,
         Command::Status { db, shared, json } => run_status(db, shared, json).await,
         Command::Dump { db, shared, doc, json } => run_dump(db, shared, &doc, json).await,
         Command::EnsureModel { json } => run_ensure_model(json),
+        Command::Eval { db, shared, golden, limit, json } => {
+            run_eval(EvalArgs { db, shared, golden, limit, json }).await
+        }
         Command::Digest { db, shared, emit } => run_digest(db, shared, &emit),
     };
     match result {
@@ -415,13 +459,19 @@ struct IngestArgs {
     json: bool,
 }
 
-/// 执行 `ingest`：收集 → 一致性预检 → 增量比对 → 分块 → 嵌入 → 写库 → 重建 FTS。
+/// 执行 `ingest`：收集 → 一致性预检 → 增量比对 → 孤儿清理 → 分块 → 嵌入 →
+/// 写库 → 重建 FTS。
 ///
 /// 一致性保证（审查后强化）：
 /// - **管线版本变更 → 全量重建**：旧向量与新管线不可比，drop 整张表 + 清空
 ///   manifest，绝不让两套不可比向量混在同一空间（设计文档 §9.8）；
 /// - **manifest 与表互验**：表不存在但 manifest 非空（库被手动删除/迁移）时
 ///   重置 manifest，避免「为空 → ingest → 均为最新」的死循环；
+/// - **孤儿差集清理**：本次入库路径覆盖范围内「manifest 有而磁盘无」的文档
+///   （被删除 / 被改名的旧路径），其 chunk 与 manifest 条目一并清掉——否则
+///   增量 ingest 只正向遍历磁盘上现存的文件，删掉的文档会以过期内容无限期
+///   命中检索、改名的会以新旧两份同内容 chunk 双倍挤占 top-k，`--force` 也
+///   救不了（磁盘上不存在的文件进不了收集循环）。范围外的孤儿留给 `prune`；
 /// - **逐文档落盘**：每个文档写库成功后立即保存 manifest；删旧之后任一步失败，
 ///   先把该文档从 manifest 移除再退出，维持「表里没有 ⇒ manifest 也没有」的
 ///   不变式（否则 --force 重入中途失败会造成永久静默丢块）。
@@ -499,13 +549,17 @@ async fn run_ingest(args: IngestArgs) -> Result<(), String> {
         todo.push((doc_path, hash, content));
     }
 
-    if todo.is_empty() {
+    // —— 孤儿差集清理：本次入库范围内「manifest 有而磁盘无」的文档 ——
+    // 注意在一致性预检之后判定（预检可能已清空 manifest，孤儿集自然为空）。
+    let orphans = find_ingest_orphans(&manifest, &args.paths, &exts, ctx.anchor_root.as_deref());
+
+    if todo.is_empty() && orphans.is_empty() {
         if args.json {
             println!(
                 "{}",
                 serde_json::json!({
-                    "action": "ingest", "ingested": 0, "skipped": skipped, "chunks": 0,
-                    "db": ctx.db_dir.to_string_lossy(),
+                    "action": "ingest", "ingested": 0, "skipped": skipped, "removed": 0,
+                    "chunks": 0, "db": ctx.db_dir.to_string_lossy(),
                 })
             );
         } else {
@@ -514,43 +568,55 @@ async fn run_ingest(args: IngestArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    // 模型与分块器（首次会触发模型下载，stderr 有体积预期提示）。
-    let (mut emb, model_cache) = open_embedder()?;
-    let chunker = open_chunker(&model_cache)?;
     let table = kb.open_or_create_table().await?;
 
-    let now = system_now();
+    // 先清孤儿（只删不嵌入，不需要模型）：逐文档删 chunk 并同步 manifest 落盘。
+    for doc in &orphans {
+        store::delete_doc(&table, doc).await?;
+        manifest.docs.remove(doc);
+        manifest.save(&mpath)?;
+        eprintln!("已清理孤儿文档 {doc}（源文件已不在磁盘）");
+    }
+
     let mut total_chunks = 0usize;
-    for (doc_path, hash, content) in &todo {
-        match ingest_one(&table, &chunker, &mut emb, doc_path, hash, content).await {
-            Ok(0) => {
-                // 空文档：旧 chunk 已删，manifest 条目同步移除。
-                eprintln!("提示：{doc_path} 没有可入库的内容（空文档？），已跳过。");
-                manifest.docs.remove(doc_path.as_str());
-                manifest.save(&mpath)?;
-            }
-            Ok(n) => {
-                eprintln!("已入库 {doc_path}（{n} 个 chunk）");
-                total_chunks += n;
-                manifest.docs.insert(
-                    doc_path.clone(),
-                    DocEntry { hash: hash.clone(), chunks: n, ingested_at: now },
-                );
-                // 逐文档落盘：中途失败不丢已完成文档的状态。
-                manifest.save(&mpath)?;
-            }
-            Err(e) => {
-                // 旧 chunk 可能已被删除：维持「表里没有 ⇒ manifest 也没有」。
-                manifest.docs.remove(doc_path.as_str());
-                let _ = manifest.save(&mpath); // best-effort，主错误优先上抛。
-                return Err(format!(
-                    "{e}\n（文档 {doc_path} 本次入库失败，已从清单移除；重跑 ingest 会重新入库它。）"
-                ));
+    if !todo.is_empty() {
+        // 模型与分块器（首次会触发模型下载，stderr 有体积预期提示）。
+        let (mut emb, model_cache) = open_embedder()?;
+        let chunker = open_chunker(&model_cache)?;
+
+        let now = system_now();
+        for (doc_path, hash, content) in &todo {
+            match ingest_one(&table, &chunker, &mut emb, doc_path, hash, content).await {
+                Ok(0) => {
+                    // 空文档：旧 chunk 已删，manifest 条目同步移除。
+                    eprintln!("提示：{doc_path} 没有可入库的内容（空文档？），已跳过。");
+                    manifest.docs.remove(doc_path.as_str());
+                    manifest.save(&mpath)?;
+                }
+                Ok(n) => {
+                    eprintln!("已入库 {doc_path}（{n} 个 chunk）");
+                    total_chunks += n;
+                    manifest.docs.insert(
+                        doc_path.clone(),
+                        DocEntry { hash: hash.clone(), chunks: n, ingested_at: now },
+                    );
+                    // 逐文档落盘：中途失败不丢已完成文档的状态。
+                    manifest.save(&mpath)?;
+                }
+                Err(e) => {
+                    // 旧 chunk 可能已被删除：维持「表里没有 ⇒ manifest 也没有」。
+                    manifest.docs.remove(doc_path.as_str());
+                    let _ = manifest.save(&mpath); // best-effort，主错误优先上抛。
+                    return Err(format!(
+                        "{e}\n（文档 {doc_path} 本次入库失败，已从清单移除；重跑 ingest 会重新入库它。）"
+                    ));
+                }
             }
         }
     }
 
-    // 重建全文索引（建索引后新增的行不在旧倒排里，重建保证全量可查）。
+    // 重建全文索引（写入新块或清理孤儿任一发生都要重建：建索引后新增的行不在
+    // 旧倒排里，重建保证全量可查；删行后重建把幽灵条目也一并甩掉）。
     store::rebuild_fts_index(&table).await?;
 
     if args.json {
@@ -558,19 +624,53 @@ async fn run_ingest(args: IngestArgs) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "action": "ingest", "ingested": todo.len(), "skipped": skipped,
-                "chunks": total_chunks, "db": ctx.db_dir.to_string_lossy(),
+                "removed": orphans.len(), "chunks": total_chunks,
+                "db": ctx.db_dir.to_string_lossy(),
             })
         );
     } else {
         println!(
-            "入库完成：{} 个文档（跳过 {} 个未变更），共 {} 个 chunk。库：{}",
+            "入库完成：{} 个文档（跳过 {} 个未变更，清理 {} 个孤儿），共 {} 个 chunk。库：{}",
             todo.len(),
             skipped,
+            orphans.len(),
             total_chunks,
             ctx.db_dir.display()
         );
     }
     Ok(())
+}
+
+/// 找出「本次入库路径覆盖范围内、manifest 有记录而磁盘上已不存在」的孤儿文档。
+///
+/// 典型来源：源文件被删除（旧 chunk 以过期内容继续命中检索）或被改名（新旧两份
+/// 同内容 chunk 双倍挤占 top-k）。覆盖范围判定复用 [`scope::ingest_covers`]
+/// （语义与 [`collect_files`] 的收集规则一致），doc_path 定位复用
+/// [`scope::resolve_doc_abs`]；只清理本次输入路径覆盖到的条目——范围外的留给
+/// `prune` 子命令统一处理，保证一次 ingest 的影响面可预期。
+fn find_ingest_orphans(
+    manifest: &Manifest,
+    roots: &[PathBuf],
+    exts: &[String],
+    anchor_root: Option<&Path>,
+) -> Vec<String> {
+    // 输入路径规范化一次（doc_path 是由规范化路径生成的，须在同一空间比较）。
+    let roots: Vec<(PathBuf, bool)> =
+        roots.iter().map(|p| (canonicalize_lenient(p), p.is_dir())).collect();
+    let mut orphans = Vec::new();
+    for doc in manifest.docs.keys() {
+        // 无锚点且 doc_path 为相对路径：无从定位源文件，宁可漏判也不误删。
+        let Some(abs) = scope::resolve_doc_abs(doc, anchor_root) else {
+            continue;
+        };
+        if abs.is_file() {
+            continue; // 源文件还在磁盘上，不是孤儿。
+        }
+        if roots.iter().any(|(root, is_dir)| scope::ingest_covers(root, *is_dir, &abs, exts)) {
+            orphans.push(doc.clone());
+        }
+    }
+    orphans
 }
 
 /// 单文档入库：删旧 chunk → 分块 → 嵌入 → 写新。返回写入的 chunk 数（0 = 空文档）。
@@ -673,33 +773,108 @@ fn run_list(db: Option<PathBuf>, shared: bool, json: bool) -> Result<(), String>
     Ok(())
 }
 
-/// 执行 `remove`：删 chunk + 更新 manifest + 重建全文索引。
+/// 从库与 manifest 中删除一组文档（chunk + manifest 条目）——`remove` 与
+/// `prune` 共用的内部逻辑。chunk 删完后统一重建一次 FTS 索引、manifest 原子落盘。
 ///
-/// 容忍表缺失：库被手动删除时仍允许清掉 manifest 里的幽灵条目（否则该条目
-/// 永远删不掉、list 永远显示它）。
-async fn run_remove(db: Option<PathBuf>, shared: bool, doc: &str, json: bool) -> Result<(), String> {
-    let ctx = resolve_kb_context(db, shared)?;
-    let mpath = manifest_path(&ctx.db_dir);
-    let mut manifest = Manifest::load(&mpath)?;
-    if manifest.docs.remove(doc).is_none() {
-        return Err(format!(
-            "manifest 中没有文档 {doc}（用 list 查看现有 doc_path，需完全一致）"
-        ));
+/// 容忍库 / 表缺失：库被手动删除时仍允许清掉 manifest 里的幽灵条目（否则那些
+/// 条目永远删不掉、list 永远显示它们）。
+async fn purge_docs(
+    ctx: &KbContext,
+    manifest: &mut Manifest,
+    mpath: &Path,
+    docs: &[String],
+) -> Result<(), String> {
+    for doc in docs {
+        manifest.docs.remove(doc);
     }
     if ctx.lance_dir().is_dir() {
         let kb = KbStore::open(&ctx.lance_dir()).await?;
         if kb.table_exists().await? {
             let table = kb.open_table().await?;
-            store::delete_doc(&table, doc).await?;
+            for doc in docs {
+                store::delete_doc(&table, doc).await?;
+            }
             store::rebuild_fts_index(&table).await?;
         }
     }
-    manifest.save(&mpath)?;
+    manifest.save(mpath)
+}
+
+/// 执行 `remove`：删 chunk + 更新 manifest + 重建全文索引（内部走 [`purge_docs`]）。
+async fn run_remove(db: Option<PathBuf>, shared: bool, doc: &str, json: bool) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
+    let mpath = manifest_path(&ctx.db_dir);
+    let mut manifest = Manifest::load(&mpath)?;
+    if !manifest.docs.contains_key(doc) {
+        return Err(format!(
+            "manifest 中没有文档 {doc}（用 list 查看现有 doc_path，需完全一致）"
+        ));
+    }
+    let docs = [doc.to_string()];
+    purge_docs(&ctx, &mut manifest, &mpath, &docs).await?;
 
     if json {
         println!("{}", serde_json::json!({ "action": "remove", "doc": doc }));
     } else {
         println!("已删除文档 {doc} 的全部 chunk。");
+    }
+    Ok(())
+}
+
+/// 执行 `prune`：清理**全部**孤儿文档（manifest 有记录而源文件已不在磁盘），
+/// 含任何 ingest 路径范围之外的；`--dry-run` 只列出、不做任何删除。
+///
+/// 与 ingest 的顺带清理互补：ingest 只清本次输入路径覆盖到的孤儿（影响面可
+/// 预期），prune 负责全库兜底。删除路径复用 `remove` 的内部逻辑（[`purge_docs`]）。
+async fn run_prune(
+    db: Option<PathBuf>,
+    shared: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), String> {
+    let ctx = resolve_kb_context(db, shared)?;
+    let mpath = manifest_path(&ctx.db_dir);
+    let mut manifest = Manifest::load(&mpath)?;
+
+    let mut orphans: Vec<String> = Vec::new();
+    for doc in manifest.docs.keys() {
+        match scope::resolve_doc_abs(doc, ctx.anchor_root.as_deref()) {
+            // 源文件已不在磁盘 → 孤儿。
+            Some(abs) if !abs.is_file() => orphans.push(doc.clone()),
+            Some(_) => {}
+            // 相对 doc_path 但当前无锚点（如在项目外用 --db 打开项目库）：
+            // 无从判断源文件是否存在，宁可跳过也不误删。
+            None => eprintln!(
+                "警告：无法定位 {doc} 的源文件（当前目录不在项目锚点内），跳过孤儿判定。"
+            ),
+        }
+    }
+
+    if !dry_run && !orphans.is_empty() {
+        purge_docs(&ctx, &mut manifest, &mpath, &orphans).await?;
+    }
+
+    let removed = if dry_run { 0 } else { orphans.len() };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "prune", "dry_run": dry_run, "orphans": orphans,
+                "removed": removed, "db": ctx.db_dir.to_string_lossy(),
+            })
+        );
+    } else if orphans.is_empty() {
+        println!("没有孤儿文档，无需清理。");
+    } else if dry_run {
+        println!("发现 {} 个孤儿文档（--dry-run，未删除）：", orphans.len());
+        for doc in &orphans {
+            println!("  {doc}");
+        }
+    } else {
+        println!("已清理 {} 个孤儿文档：", orphans.len());
+        for doc in &orphans {
+            println!("  {doc}");
+        }
     }
     Ok(())
 }
@@ -799,6 +974,64 @@ fn run_ensure_model(json: bool) -> Result<(), String> {
         );
     } else {
         println!("嵌入模型已就绪（缓存 {}）。", cache_dir.display());
+    }
+    Ok(())
+}
+
+/// `eval` 的参数集合。
+struct EvalArgs {
+    db: Option<PathBuf>,
+    shared: bool,
+    golden: PathBuf,
+    limit: usize,
+    json: bool,
+}
+
+/// 执行 `eval`：解析 golden 集 → 逐条混合检索并判定 → 输出指标与失败清单。
+///
+/// 判定与汇总走 [`eval`] 模块的纯函数（命中 = top-k 内 expect_doc 出现且该
+/// chunk 正文或面包屑含 expect_hint）；本函数只做编排：读文件、跑检索、选输出格式。
+async fn run_eval(args: EvalArgs) -> Result<(), String> {
+    let ctx = resolve_kb_context(args.db, args.shared)?;
+    if !ctx.lance_dir().is_dir() {
+        return Err("知识库为空（尚未 ingest 过任何文档），请先执行 ingest 入库".to_string());
+    }
+    let golden_text = std::fs::read_to_string(&args.golden)
+        .map_err(|e| format!("读取 golden 集 {} 失败：{e}", args.golden.display()))?;
+    let cases = eval::parse_golden(&golden_text)?;
+    if cases.is_empty() {
+        return Err(format!(
+            "golden 集 {} 里没有任何题目（全是注释/空行？）",
+            args.golden.display()
+        ));
+    }
+
+    let kb = KbStore::open(&ctx.lance_dir()).await?;
+    let table = kb.open_table().await?;
+    let (mut emb, _cache) = open_embedder()?;
+
+    let mut results = Vec::with_capacity(cases.len());
+    for case in cases {
+        let qvec = emb.embed_query(&case.query)?;
+        let hits = store::search_hybrid(&table, &case.query, qvec, args.limit, None).await?;
+        results.push(eval::evaluate_case(case, &hits));
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "eval",
+                "db": ctx.db_dir.to_string_lossy(),
+                "golden": args.golden.to_string_lossy(),
+                "limit": args.limit,
+                "overall": eval::overall_stats(&results),
+                "by_kind": eval::stats_by_kind(&results),
+                "cases": results,
+            })
+        );
+    } else {
+        print!("{}", eval::render_text_report(args.limit, &results));
     }
     Ok(())
 }
@@ -947,5 +1180,29 @@ mod tests {
         }
         let ctx = build_digest_context(Path::new("/kb"), &m);
         assert!(ctx.contains("还有 5 个"), "实得：{ctx}");
+    }
+
+    /// 孤儿判定：只有「范围内 + manifest 有 + 磁盘无」才算；磁盘尚存 / 范围外 /
+    /// 扩展名不符的都不动（范围外留给 prune）。
+    #[test]
+    fn ingest_orphan_detection() {
+        let tmp = tempfile::tempdir().expect("建临时目录失败");
+        let root = canonicalize_lenient(tmp.path());
+        std::fs::create_dir_all(root.join("docs")).expect("建目录失败");
+        std::fs::write(root.join("docs").join("live.md"), "x").expect("写文件失败");
+
+        let mut m = Manifest::default();
+        m.docs.insert("docs/live.md".into(), entry(1)); // 磁盘尚存：不是孤儿。
+        m.docs.insert("docs/gone.md".into(), entry(1)); // 已删除：孤儿。
+        m.docs.insert("docs/gone.txt".into(), entry(1)); // 扩展名不在本次 --ext：不清。
+        m.docs.insert("other/gone.md".into(), entry(1)); // 不在本次路径范围：留给 prune。
+
+        let exts = vec!["md".to_string()];
+        let orphans = find_ingest_orphans(&m, &[root.join("docs")], &exts, Some(&root));
+        assert_eq!(orphans, vec!["docs/gone.md".to_string()]);
+
+        // 无锚点且 doc_path 为相对路径：无从定位，一律不判为孤儿（宁漏不误删）。
+        let orphans = find_ingest_orphans(&m, &[root.join("docs")], &exts, None);
+        assert!(orphans.is_empty());
     }
 }

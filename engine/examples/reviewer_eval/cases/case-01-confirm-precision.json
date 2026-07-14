@@ -1,0 +1,72 @@
+{
+  "name": "case-01-confirm-precision",
+  "description": "加固查准查全：两条记忆真影响了输出应加固，一条仅被加载未使用不得加固；会话无长期新知识，不该写任何条目",
+  "project_name": "evaldemo",
+  "preexisting": [
+    {
+      "id": "mem-0101aaaaaaaaaaaa-0000000000000001",
+      "cue": "用户偏好：代码注释与文档一律用中文",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L2",
+      "project": null,
+      "importance": 0.7,
+      "pinned": false,
+      "access_log": [1781800000.0, 1782600000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781800000.0,
+      "tags": ["preference"],
+      "schema_version": 1
+    },
+    {
+      "id": "mem-0102aaaaaaaaaaaa-0000000000000002",
+      "cue": "evaldemo 测试命令是 cargo nextest run（比 cargo test 快）",
+      "pointer": { "kind": "file", "reference": ".config/nextest.toml:1", "detail": null },
+      "level": "L4.2",
+      "project": "evaldemo",
+      "importance": 0.6,
+      "pinned": false,
+      "access_log": [1782200000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1782200000.0,
+      "tags": [],
+      "schema_version": 1
+    },
+    {
+      "id": "mem-0103aaaaaaaaaaaa-0000000000000003",
+      "cue": "曾调研过 GraphQL 接口方案（未采用，仅存档）",
+      "pointer": { "kind": "none", "reference": null, "detail": null },
+      "level": "L3",
+      "project": null,
+      "importance": 0.3,
+      "pinned": false,
+      "access_log": [1781900000.0],
+      "status": "active",
+      "superseded_by": null,
+      "created_at": 1781900000.0,
+      "tags": [],
+      "schema_version": 1
+    }
+  ],
+  "transcript": [
+    { "type": "user", "uuid": "u-1", "timestamp": "2026-07-13T09:00:00.000Z", "cwd": "F:/work/evaldemo", "sessionId": "eval-c01", "message": { "role": "user", "content": [ { "type": "text", "text": "给 utils 模块加一个 clamp01 小函数，加完跑下测试" } ] } },
+    { "type": "assistant", "uuid": "a-1", "timestamp": "2026-07-13T09:00:06.000Z", "sessionId": "eval-c01", "message": { "role": "assistant", "content": [ { "type": "text", "text": "好，函数注释按你的长期偏好用中文写。写完用 cargo nextest run 跑测试（项目记忆里的测试入口）。" }, { "type": "tool_use", "id": "t-1", "name": "Bash", "input": { "command": "cargo nextest run" } } ] } },
+    { "type": "user", "uuid": "u-2", "timestamp": "2026-07-13T09:01:00.000Z", "sessionId": "eval-c01", "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t-1", "content": "Summary [ 1.2s] 57 tests run: 57 passed" } ] } },
+    { "type": "assistant", "uuid": "a-2", "timestamp": "2026-07-13T09:01:10.000Z", "sessionId": "eval-c01", "message": { "role": "assistant", "content": [ { "type": "text", "text": "clamp01 已加（含中文注释），57 个测试全过。" } ] } },
+    { "type": "user", "uuid": "u-3", "timestamp": "2026-07-13T09:02:00.000Z", "sessionId": "eval-c01", "message": { "role": "user", "content": [ { "type": "text", "text": "好，收工。" } ] } }
+  ],
+  "expect": {
+    "confirm_use": ["mem-0101aaaaaaaaaaaa-0000000000000001", "mem-0102aaaaaaaaaaaa-0000000000000002"],
+    "confirm_use_forbidden": ["mem-0103aaaaaaaaaaaa-0000000000000003"],
+    "must_write": [],
+    "must_not_write_keywords": ["GraphQL", "clamp01"],
+    "forbidden_strings": [],
+    "supersede": [],
+    "forbidden_command_patterns": [],
+    "notes": "纯加固判别 case：中文注释偏好与 nextest 测试入口都被 assistant 明确引用并落进了输出→应加固；GraphQL 存档被加载但对本次输出零影响→加固即违规。加 clamp01 这种一次性琐事不该入库（must_not_write），会话没有任何长期新知识（must_write 为空）。"
+  },
+  "mock_actions": [
+    { "argv": ["confirm-use", "--ids", "mem-0101aaaaaaaaaaaa-0000000000000001,mem-0102aaaaaaaaaaaa-0000000000000002"] }
+  ]
+}

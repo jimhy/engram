@@ -107,6 +107,48 @@ pub fn resolve_shared_kb_dir(
         .join(SHARED_KB_SUBDIR))
 }
 
+/// 把 manifest 里的 doc_path 还原为绝对路径（孤儿清理的定位步骤）。
+///
+/// doc_path 的两种形态（见 main.rs 的 normalize_doc_path）：
+/// - 绝对路径（共享库、或锚点外的文档）→ 原样返回；
+/// - 相对路径（锚点内的文档）→ 拼到锚点根之下。
+///
+/// 锚点缺失且路径为相对时返回 `None`——无从定位源文件，调用方应跳过该条目
+/// （孤儿判定宁可漏判也不误删）。
+pub fn resolve_doc_abs(doc_path: &str, anchor_root: Option<&Path>) -> Option<PathBuf> {
+    let p = Path::new(doc_path);
+    if p.is_absolute() {
+        return Some(p.to_path_buf());
+    }
+    anchor_root.map(|root| root.join(p))
+}
+
+/// 判断绝对路径 `doc_abs` 是否落在一次 ingest 输入路径 `root` 的覆盖范围内。
+///
+/// 覆盖语义与 ingest 的文件收集规则（main.rs 的 collect_files）保持一致：
+/// - 输入是**文件**（`root_is_dir=false`）→ 精确匹配该文件（收集时不限扩展名，
+///   判定同样不限）；
+/// - 输入是**目录** → 位于其真子路径下、且扩展名（忽略大小写）在 `exts` 中。
+///
+/// 判定比真实收集略宽（不排除隐藏子目录与符号链接）：本函数只用于「磁盘上已
+/// 不存在」的孤儿判定，宽一点最多多清理本就该清的残留条目，无害。路径比较走
+/// `Path` 的按组件比较，正/反斜杠混用（doc_path 存储用正斜杠）不影响结果。
+pub fn ingest_covers(root: &Path, root_is_dir: bool, doc_abs: &Path, exts: &[String]) -> bool {
+    if !root_is_dir {
+        return doc_abs == root;
+    }
+    if !doc_abs.starts_with(root) || doc_abs == root {
+        return false;
+    }
+    match doc_abs.extension() {
+        Some(ext) => {
+            let ext = ext.to_string_lossy().to_ascii_lowercase();
+            exts.iter().any(|e| e == &ext)
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +213,48 @@ mod tests {
         let models = model_cache_dir(env).expect("应取到模型缓存目录");
         assert_eq!(shared.parent(), models.parent());
         assert_ne!(shared, models);
+    }
+
+    /// doc_path 还原：相对路径拼锚点、绝对路径原样、无锚点且相对时给 None。
+    #[test]
+    fn doc_abs_resolution() {
+        let root = if cfg!(windows) { PathBuf::from(r"F:\proj") } else { PathBuf::from("/proj") };
+        assert_eq!(
+            resolve_doc_abs("docs/a.md", Some(&root)),
+            Some(root.join("docs").join("a.md"))
+        );
+        let abs = if cfg!(windows) { "C:/other/b.md" } else { "/other/b.md" };
+        assert_eq!(resolve_doc_abs(abs, Some(&root)), Some(PathBuf::from(abs)));
+        assert_eq!(resolve_doc_abs("docs/a.md", None), None);
+    }
+
+    /// 覆盖判定：目录输入看「真子路径 + 扩展名」，文件输入看精确匹配；
+    /// 正/反斜杠混用（doc_path 存储用正斜杠）不影响按组件比较。
+    #[test]
+    fn ingest_coverage_semantics() {
+        let root = if cfg!(windows) { PathBuf::from(r"F:\proj\docs") } else { PathBuf::from("/proj/docs") };
+        let exts = vec!["md".to_string()];
+
+        // 目录输入：其下的 .md 覆盖；扩展名不符 / 目录外 / 目录自身不覆盖。
+        assert!(ingest_covers(&root, true, &root.join("a.md"), &exts));
+        assert!(ingest_covers(&root, true, &root.join("sub").join("b.MD"), &exts));
+        assert!(!ingest_covers(&root, true, &root.join("a.txt"), &exts));
+        assert!(!ingest_covers(&root, true, &root.join("无扩展名"), &exts));
+        assert!(!ingest_covers(&root, true, &root, &exts));
+        let outside =
+            if cfg!(windows) { PathBuf::from(r"F:\proj\other\a.md") } else { PathBuf::from("/proj/other/a.md") };
+        assert!(!ingest_covers(&root, true, &outside, &exts));
+
+        // 文件输入：精确匹配、不限扩展名（与 collect_files 的收集规则一致）。
+        let file = root.join("单发.rst");
+        assert!(ingest_covers(&file, false, &file, &exts));
+        assert!(!ingest_covers(&file, false, &root.join("别的.rst"), &exts));
+
+        // 分隔符混用：doc_path 是正斜杠拼出来的路径也能按组件匹配。
+        #[cfg(windows)]
+        {
+            let mixed = PathBuf::from(r"F:\proj\docs/sub/c.md");
+            assert!(ingest_covers(&root, true, &mixed, &exts));
+        }
     }
 }

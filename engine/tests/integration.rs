@@ -27,11 +27,14 @@ use engram::store;
 
 /// 全局测试串行锁。
 ///
-/// 本集成测试在**单进程内多线程**地（libtest 默认按 CPU 数并行）反复
-/// `store::open` 打开大量 redb 库文件；redb 在 Windows 上用内存映射文件，
-/// 高并行下多个线程同时 mmap/munmap 会触发底层访问冲突（STATUS_ACCESS_VIOLATION，
-/// 与具体用例逻辑无关、纯属并发下的 mmap 竞态）。每个测试在开头取本锁串行执行，
-/// 即可彻底规避该竞态、保证套件稳定全绿（单测本就快，串行开销可忽略）。
+/// 本机跑本套件时偶发 STATUS_ACCESS_VIOLATION，**根因未定位**（本机连 rustc
+/// 编译过程也会随机 AV，疑似环境/硬件层问题），保守做法是每个测试开头取本锁
+/// 串行执行，套件即稳定全绿（单测本就快，串行开销可忽略）。
+///
+/// 更正：此前注释把该 AV 归因为「redb Windows mmap 竞态」——经核实 redb 2.6.3
+/// 源码**没有任何 mmap**（Windows 后端是 seek_read/seek_write + LockFile），
+/// 该归因有误；「生产是独立进程所以无关」的说法对 serve 每连接一线程的场景
+/// 也不成立。串行化仅是针对本机偶发 AV 的保守缓解，不代表已定位并发缺陷。
 fn test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     // 锁被 poison（某测试 panic 时）也照常取用：本锁只为串行化，不保护共享状态。
@@ -108,6 +111,7 @@ fn make(
         superseded_by: None,
         created_at,
         tags: vec![],
+        schema_version: engram::model::MEMORY_SCHEMA_VERSION,
     }
 }
 
@@ -3283,8 +3287,11 @@ fn hot_index_state_gates_unchanged_scope() {
     );
     let general_path = seed_db("hi_state_g", &[]);
     let g = general_path.to_string_lossy().to_string();
-    let state_path = ws.join("hot-index-state.txt");
-    let sp = state_path.to_string_lossy().to_string();
+    // 行为变更（刻意）：--state 原路径只作定位基准，门控状态改写到
+    // <父目录>/active-state/<session_id>.state；无 session_id 时回退 default.state。
+    let state_base = ws.join("hot-index-state.txt");
+    let state_path = ws.join("active-state").join("default.state");
+    let sp = state_base.to_string_lossy().to_string();
     let a_arg = proj_a.to_string_lossy().to_string();
     let b_arg = proj_b.to_string_lossy().to_string();
     // 与二进制 resolve_scope 一致：规范化后剥离 Windows verbatim 前缀 `\\?\`。
@@ -3304,7 +3311,8 @@ fn hot_index_state_gates_unchanged_scope() {
     assert!(out1.status.success(), "首次 hot-index 应成功");
     let s1 = String::from_utf8(out1.stdout).expect("stdout 非 UTF-8");
     assert!(s1.contains("cue-s_a"), "首次应渲染项目 a 的 L4");
-    let recorded = std::fs::read_to_string(&state_path).expect("应能读状态");
+    assert!(!state_base.exists(), "旧单文件（--state 原路径）不应再被写");
+    let recorded = std::fs::read_to_string(&state_path).expect("应能读按会话分文件的状态");
     assert_eq!(
         recorded.trim(),
         canon_a.to_string_lossy(),
@@ -4277,8 +4285,24 @@ fn status_dedups_same_db_mounted_as_scope_and_project_db() {
     let scope_db = seed_engram_db(
         &proj,
         &[
-            make("p1", Level::L4_2, Some("proj"), Status::Active, 0.5, created, vec![]),
-            make("p2", Level::L4_3, Some("proj"), Status::Active, 0.5, created, vec![]),
+            make(
+                "p1",
+                Level::L4_2,
+                Some("proj"),
+                Status::Active,
+                0.5,
+                created,
+                vec![],
+            ),
+            make(
+                "p2",
+                Level::L4_3,
+                Some("proj"),
+                Status::Active,
+                0.5,
+                created,
+                vec![],
+            ),
         ],
     );
 
@@ -4288,7 +4312,15 @@ fn status_dedups_same_db_mounted_as_scope_and_project_db() {
         let gdb = store::open(&general).expect("应能建公共库");
         store::put_many(
             &gdb,
-            &[make("g1", Level::L3, None, Status::Active, 0.5, created, vec![])],
+            &[make(
+                "g1",
+                Level::L3,
+                None,
+                Status::Active,
+                0.5,
+                created,
+                vec![],
+            )],
         )
         .expect("put_many 应成功");
         drop(gdb);
@@ -4361,4 +4393,1769 @@ fn status_dedups_same_db_mounted_as_scope_and_project_db() {
 
     cleanup_file(&general);
     let _ = std::fs::remove_dir_all(&proj);
+}
+
+// ============================================================================
+// 批2：CLI/可观测性/数据安全（schema_version、降级注入、门控分文件、防覆盖、
+// export/import 往返、复盘健康面、孤儿会话补建）
+// ============================================================================
+
+/// 以给定 stdin 内容运行一个 engram 子命令，返回完整 Output。
+fn run_subcommand_with_stdin(
+    subcommand: &str,
+    args: &[&str],
+    stdin_payload: &str,
+) -> std::process::Output {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let exe = env!("CARGO_BIN_EXE_engram");
+    let mut cmd = Command::new(exe);
+    cmd.arg(subcommand);
+    for a in args {
+        cmd.arg(a);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("应能 spawn engram");
+    child
+        .stdin
+        .as_mut()
+        .expect("应有 stdin")
+        .write_all(stdin_payload.as_bytes())
+        .expect("写 stdin 失败");
+    child.wait_with_output().expect("等待子进程失败")
+}
+
+/// 把路径转为 JSON 字符串字面量安全形式（反斜杠转义）。
+fn json_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "\\\\")
+}
+
+// 43. 项 2：打库失败降级——general_db 指向目录（必打不开）时，hot-index 应
+//     stderr 报错但 stdout 输出最小降级注入（hook JSON 格式）、hook.log 留痕、exit 0。
+#[test]
+fn hot_index_degrades_to_notice_when_db_unreadable() {
+    let _guard = test_guard();
+    let ws = unique_workspace_root("hi_degrade");
+    // general_db 指向一个**目录**：store::open 必失败（且非锁竞争、不重试）。
+    let bad_general = ws.join("not-a-db.redb");
+    std::fs::create_dir_all(&bad_general).expect("应能建目录");
+    let log_path = ws.join("hook.log");
+
+    let out = run_hot_index_raw(&[
+        "--general-db",
+        bad_general.to_string_lossy().as_ref(),
+        "--workspace-root",
+        ws.to_string_lossy().as_ref(),
+        "--emit",
+        "json",
+        "--log",
+        log_path.to_string_lossy().as_ref(),
+        "--now",
+        "1000000000",
+    ]);
+    assert!(
+        out.status.success(),
+        "打库失败应降级 exit 0（hook 语义），stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("降级输出应为合法 hook JSON");
+    let ctx = v
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(|x| x.as_str())
+        .expect("应有 additionalContext");
+    assert!(
+        ctx.contains("engram 记忆库暂不可用"),
+        "降级注入应说明记忆缺席，实得：{ctx}"
+    );
+    assert!(ctx.contains("/engram:status"), "应给出自查指引");
+    // stderr 仍完整报错。
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hot-index 失败"),
+        "stderr 应保留报错"
+    );
+    // hook.log 留痕。
+    let log = std::fs::read_to_string(&log_path).expect("hook.log 应存在");
+    assert!(
+        log.contains("打库失败降级"),
+        "hook.log 应记录降级事件，实得：{log}"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// 44. 项 3：门控按 session 分文件——同一项目下两个会话各自独立门控，
+//     互不干扰（旧全局单文件会被两窗口交替翻转导致每条 prompt 全量重注入）。
+#[test]
+fn hot_index_state_isolated_per_session() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let proj = unique_workspace_root("hi_sid_state");
+    let proj_name = last_segment(&proj);
+    let _db = seed_engram_db(
+        &proj,
+        &[make(
+            "sid_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let general_path = seed_db("hi_sid_state_g", &[]);
+    let g = general_path.to_string_lossy().to_string();
+    let state_base = proj.join("engram-state").join("active.state");
+    let sp = state_base.to_string_lossy().to_string();
+    let stdin_a = format!(r#"{{"cwd":"{}","session_id":"sid-AAA"}}"#, json_path(&proj));
+    let stdin_b = format!(r#"{{"cwd":"{}","session_id":"sid-BBB"}}"#, json_path(&proj));
+    let args = [
+        "--general-db",
+        g.as_str(),
+        "--state",
+        sp.as_str(),
+        "--from-hook-stdin",
+        "--now",
+        "1000000000",
+    ];
+
+    // 会话 A 第一次：应注入并写 A 的门控文件。
+    let a1 = run_subcommand_with_stdin("hot-index", &args, &stdin_a);
+    assert!(a1.status.success());
+    assert!(
+        String::from_utf8_lossy(&a1.stdout).contains("cue-sid_l4"),
+        "会话 A 首次应注入"
+    );
+    // 会话 A 第二次（作用域未变）：门控判空。
+    let a2 = run_subcommand_with_stdin("hot-index", &args, &stdin_a);
+    assert!(a2.status.success());
+    assert!(
+        a2.stdout.is_empty(),
+        "会话 A 作用域未变应输出空，实得：{}",
+        String::from_utf8_lossy(&a2.stdout)
+    );
+    // 会话 B 第一次（同一作用域）：B 有自己的门控文件，仍应注入——这正是分文件的意义。
+    let b1 = run_subcommand_with_stdin("hot-index", &args, &stdin_b);
+    assert!(b1.status.success());
+    assert!(
+        String::from_utf8_lossy(&b1.stdout).contains("cue-sid_l4"),
+        "会话 B 首次应注入（不被 A 的门控波及）"
+    );
+    // 两个会话各有各的门控文件。
+    let state_dir = proj.join("engram-state").join("active-state");
+    assert!(
+        state_dir.join("sid-AAA.state").is_file(),
+        "A 的门控文件应存在"
+    );
+    assert!(
+        state_dir.join("sid-BBB.state").is_file(),
+        "B 的门控文件应存在"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 45. 项 5：复盘健康面——pending 残留 + last-review-ok 超 48h → oneline 加
+//     ⚠reviewer、full 版输出停摆原因；清掉 pending 后标记消失。
+#[test]
+fn status_reports_reviewer_health_and_stall() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    // 复盘产物与公共库同目录：用独立临时目录承载 general.redb / pending / last-review-ok。
+    let base = unique_workspace_root("status_health");
+    let general = base.join("general.redb");
+    {
+        let gdb = store::open(&general).expect("应能建公共库");
+        drop(gdb);
+    }
+    // pending 残留 1 条 + last-review-ok 停在 3 天前（> 48h）。
+    let pending_dir = base.join("pending");
+    std::fs::create_dir_all(&pending_dir).expect("建 pending 目录");
+    std::fs::write(pending_dir.join("sid-x.json"), "{}").expect("写 pending 残留");
+    std::fs::write(
+        base.join("last-review-ok"),
+        format!(r#"{{"ts":{}}}"#, now - 3.0 * 86400.0),
+    )
+    .expect("写 last-review-ok");
+
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).expect("建项目目录");
+    let g = general.to_string_lossy().to_string();
+    let p = proj.to_string_lossy().to_string();
+
+    let one = run_subcommand_raw(
+        "status",
+        &[
+            "--general-db",
+            &g,
+            "--workspace-root",
+            &p,
+            "--format",
+            "oneline",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(one.status.success());
+    let one_out = String::from_utf8(one.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        one_out.contains("⚠reviewer"),
+        "疑似停摆时状态栏串应加 ⚠reviewer，实得：{one_out}"
+    );
+
+    let full = run_subcommand_raw(
+        "status",
+        &[
+            "--general-db",
+            &g,
+            "--workspace-root",
+            &p,
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(full.status.success());
+    let full_out = String::from_utf8(full.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        full_out.contains("复盘健康："),
+        "full 版应有复盘健康段，实得：\n{full_out}"
+    );
+    assert!(
+        full_out.contains("pending 残留 1 条"),
+        "应报告 pending 残留数，实得：\n{full_out}"
+    );
+    assert!(
+        full_out.contains("疑似停摆"),
+        "应输出停摆原因与自查指引，实得：\n{full_out}"
+    );
+
+    // 清掉 pending：无积压即无停摆，标记应消失。
+    std::fs::remove_file(pending_dir.join("sid-x.json")).expect("删 pending");
+    let one2 = run_subcommand_raw(
+        "status",
+        &[
+            "--general-db",
+            &g,
+            "--workspace-root",
+            &p,
+            "--format",
+            "oneline",
+            "--now",
+            "1000000000",
+        ],
+    );
+    let one2_out = String::from_utf8(one2.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        !one2_out.contains("⚠reviewer"),
+        "无 pending 时不应再标停摆，实得：{one2_out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// 46. 项 7①：write 防覆盖——同 id 二次写默认拒绝并提示 --overwrite；带旗标则覆盖。
+#[test]
+fn write_rejects_duplicate_id_unless_overwrite() {
+    let _guard = test_guard();
+    let general_path = unique_db_path("write_dup_g");
+    let g = general_path.to_string_lossy().to_string();
+
+    let first = run_subcommand_raw(
+        "write",
+        &[
+            "--general-db",
+            &g,
+            "--level",
+            "L3",
+            "--cue",
+            "第一版",
+            "--id",
+            "dup_id",
+            "--now",
+            "1000000000",
+        ],
+    );
+    assert!(first.status.success(), "首次写入应成功");
+
+    // 同 id 再写：默认拒绝，提示 --overwrite，且不改动旧记忆。
+    let second = run_subcommand_raw(
+        "write",
+        &[
+            "--general-db",
+            &g,
+            "--level",
+            "L3",
+            "--cue",
+            "第二版",
+            "--id",
+            "dup_id",
+            "--now",
+            "1000000001",
+        ],
+    );
+    assert!(!second.status.success(), "同 id 二次写应被拒绝");
+    let err = String::from_utf8_lossy(&second.stderr).to_string();
+    assert!(
+        err.contains("--overwrite"),
+        "报错应提示 --overwrite，实得：{err}"
+    );
+    {
+        let db = store::open(&general_path).expect("应能开库");
+        let m = store::get(&db, "dup_id")
+            .expect("get 应成功")
+            .expect("应存在");
+        assert_eq!(m.cue, "第一版", "被拒绝的写入不应改动旧记忆");
+        drop(db);
+    }
+
+    // 带 --overwrite：允许覆盖。
+    let third = run_subcommand_raw(
+        "write",
+        &[
+            "--general-db",
+            &g,
+            "--level",
+            "L3",
+            "--cue",
+            "第二版",
+            "--id",
+            "dup_id",
+            "--overwrite",
+            "--now",
+            "1000000002",
+        ],
+    );
+    assert!(third.status.success(), "--overwrite 应允许覆盖");
+    {
+        let db = store::open(&general_path).expect("应能开库");
+        let m = store::get(&db, "dup_id")
+            .expect("get 应成功")
+            .expect("应存在");
+        assert_eq!(m.cue, "第二版", "--overwrite 后应为新内容");
+        drop(db);
+    }
+
+    cleanup_file(&general_path);
+}
+
+// 47. 项 7②：--now 消毒——NaN / 负数直接报错退出，什么都不写。
+#[test]
+fn write_rejects_non_finite_or_negative_now() {
+    let _guard = test_guard();
+    let general_path = unique_db_path("write_nan_g");
+    let g = general_path.to_string_lossy().to_string();
+
+    // 用 `--now=值` 形式：`-5` 若作独立参数会被 clap 误当旗标（那也是拒绝，
+    // 但报的是 clap 的错，测不到我们的消毒逻辑）。
+    for bad in ["--now=NaN", "--now=inf", "--now=-5"] {
+        let out = run_subcommand_raw(
+            "write",
+            &[
+                "--general-db",
+                &g,
+                "--level",
+                "L3",
+                "--cue",
+                "非法时间",
+                bad,
+            ],
+        );
+        assert!(!out.status.success(), "{bad} 应被拒绝");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--now 非法"),
+            "{bad} 应报中文错误"
+        );
+    }
+    // 全程未写入任何记忆（库可能都没建出来；建出来了也应为空）。
+    if general_path.exists() {
+        let db = store::open(&general_path).expect("应能开库");
+        assert!(store::all(&db).expect("all 应成功").is_empty());
+        drop(db);
+    }
+    cleanup_file(&general_path);
+}
+
+// 48. 项 7③：import 对未来时间戳钳制到 now 并警告（跨机拷库/时钟回拨消毒）。
+#[test]
+fn import_clamps_future_timestamps() {
+    let _guard = test_guard();
+    let json_dir = unique_json_dir("clamp");
+    let general_path = unique_db_path("clamp_g");
+    let g = general_path.to_string_lossy().to_string();
+
+    // 构造带未来时间戳的记忆 JSON：created_at 与一条 access_log 在 10 天后。
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("系统时钟应晚于 unix 纪元")
+        .as_secs_f64();
+    let future = wall + 10.0 * 86400.0;
+    let mut m = make(
+        "future_mem",
+        Level::L3,
+        None,
+        Status::Active,
+        0.5,
+        future,
+        vec![wall - 100.0, future],
+    );
+    m.cue = "来自未来的记忆".to_string();
+    std::fs::write(
+        json_dir.join("future_mem.json"),
+        serde_json::to_string_pretty(&m).expect("序列化应成功"),
+    )
+    .expect("写 JSON 应成功");
+
+    let out = run_subcommand_raw(
+        "import",
+        &[
+            "--general-db",
+            &g,
+            "--from-json-dir",
+            json_dir.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "import 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("未来时间戳"),
+        "应有钳制警告"
+    );
+
+    let db = store::open(&general_path).expect("应能开库");
+    let got = store::get(&db, "future_mem")
+        .expect("get 应成功")
+        .expect("应已导入");
+    drop(db);
+    let limit = wall + 120.0; // 导入用系统时间，放宽 120s 容忍测试自身耗时。
+    assert!(
+        got.created_at <= limit,
+        "created_at 应被钳到当前时间附近：{}",
+        got.created_at
+    );
+    assert!(
+        got.access_log.iter().all(|t| *t <= limit),
+        "access_log 不应残留未来时间戳：{:?}",
+        got.access_log
+    );
+    assert!(
+        got.access_log.windows(2).all(|w| w[0] <= w[1]),
+        "钳制后 access_log 应仍升序"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&json_dir);
+}
+
+// 49. 项 8：export/import 往返一致（含 schema_version、跨公共库与项目库）。
+#[test]
+fn export_import_roundtrip_preserves_memories() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let gmems = vec![
+        make(
+            "exp_g1",
+            Level::L1,
+            None,
+            Status::Active,
+            0.9,
+            now,
+            vec![now],
+        ),
+        make("exp_g2", Level::L3, None, Status::Cold, 0.1, now, vec![]),
+    ];
+    let pmems = vec![make(
+        "exp_p1",
+        Level::L4_2,
+        Some("alpha"),
+        Status::Active,
+        0.5,
+        now,
+        vec![now],
+    )];
+    let general_path = seed_db("exp_g", &gmems);
+    let project_path = seed_db("exp_p", &pmems);
+    let out_dir = unique_json_dir("exp_out");
+    let g = general_path.to_string_lossy().to_string();
+    let p = format!("alpha={}", project_path.display());
+
+    // 导出全量。
+    let out = run_subcommand_raw(
+        "export",
+        &[
+            "--general-db",
+            &g,
+            "--project-db",
+            &p,
+            "--dir",
+            out_dir.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "export 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("已导出 3 条"),
+        "应汇总条数"
+    );
+    // 每条一个 <id>.json，内容含 schema_version。
+    for id in ["exp_g1", "exp_g2", "exp_p1"] {
+        let f = out_dir.join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("应有 {id}.json：{e}"));
+        assert!(
+            text.contains("\"schema_version\": 1"),
+            "{id}.json 应含 schema_version，实得：{text}"
+        );
+    }
+
+    // 导回全新库：逐条与原始记忆完全相等（往返一致）。
+    let general2 = unique_db_path("exp_g2db");
+    let project2 = unique_db_path("exp_p2db");
+    let import_out = run_subcommand_raw(
+        "import",
+        &[
+            "--general-db",
+            general2.to_string_lossy().as_ref(),
+            "--project-db",
+            &format!("alpha={}", project2.display()),
+            "--from-json-dir",
+            out_dir.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(
+        import_out.status.success(),
+        "import 应成功，stderr={}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+    {
+        let gdb = store::open(&general2).expect("应能开公共库");
+        for want in &gmems {
+            let got = store::get(&gdb, &want.id)
+                .expect("get 应成功")
+                .expect("应存在");
+            assert_eq!(&got, want, "公共库记忆 {} 往返应逐字段一致", want.id);
+        }
+        drop(gdb);
+        let pdb = store::open(&project2).expect("应能开项目库");
+        let got = store::get(&pdb, "exp_p1")
+            .expect("get 应成功")
+            .expect("应存在");
+        assert_eq!(&got, &pmems[0], "项目库记忆往返应逐字段一致");
+        drop(pdb);
+    }
+
+    cleanup_file(&general_path);
+    cleanup_file(&project_path);
+    cleanup_file(&general2);
+    cleanup_file(&project2);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+// 50. 项 10：hot-index（带 --state 的 UserPromptSubmit 路径）落活跃会话登记。
+#[test]
+fn hot_index_registers_active_session() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let proj = unique_workspace_root("hi_reg");
+    let proj_name = last_segment(&proj);
+    let _db = seed_engram_db(
+        &proj,
+        &[make(
+            "reg_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let general_path = seed_db("hi_reg_g", &[]);
+    let g = general_path.to_string_lossy().to_string();
+    let state_base = proj.join("st").join("active.state");
+    let transcript = proj.join("transcript.jsonl");
+    std::fs::write(&transcript, "l1\nl2\n").expect("写 transcript");
+
+    let stdin_payload = format!(
+        r#"{{"cwd":"{}","session_id":"sid-reg","transcript_path":"{}"}}"#,
+        json_path(&proj),
+        json_path(&transcript)
+    );
+    let out = run_subcommand_with_stdin(
+        "hot-index",
+        &[
+            "--general-db",
+            &g,
+            "--state",
+            state_base.to_string_lossy().as_ref(),
+            "--from-hook-stdin",
+            "--now",
+            "1000000000",
+        ],
+        &stdin_payload,
+    );
+    assert!(out.status.success());
+
+    let reg_file = proj.join("st").join("active-sessions").join("sid-reg.json");
+    let text = std::fs::read_to_string(&reg_file).expect("登记文件应存在");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("登记应为合法 JSON");
+    assert_eq!(
+        v.get("session_id").and_then(|x| x.as_str()),
+        Some("sid-reg")
+    );
+    assert_eq!(
+        v.get("transcript_path").and_then(|x| x.as_str()),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    assert!(v.get("general_db").is_some() && v.get("project_db").is_some());
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 51. 项 10：catchup-scan 孤儿补建——登记过、无 pending、行数 > 水位线 →
+//     现场补建 pending 并按原流程领取输出 review；consolidate-done 收尾后
+//     水位线推进、last-review-ok 落盘。
+#[test]
+fn catchup_rebuilds_orphan_pending_and_consolidate_done_closes() {
+    let _guard = test_guard();
+    let base = unique_workspace_root("orphan");
+    let work_dir = base.join("pending");
+    let sessions_dir = base.join("active-sessions");
+    std::fs::create_dir_all(&work_dir).expect("建 work_dir");
+    std::fs::create_dir_all(&sessions_dir).expect("建 sessions_dir");
+    let watermark = base.join("watermark.json");
+    // transcript 5 行，水位线已巩固前 2 行 → 孤儿增量 = 行 3..5。
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "l1\nl2\nl3\nl4\nl5\n").expect("写 transcript");
+    let tkey = transcript.to_string_lossy().to_string();
+    std::fs::write(
+        &watermark,
+        serde_json::to_string(&serde_json::json!({ &tkey: 2 })).expect("序列化水位线"),
+    )
+    .expect("写水位线");
+    // 库路径（consolidate-done 的确定性巩固会开它们，空库即可）。
+    let gdb = base.join("g.redb");
+    let pdb = base.join("p.redb");
+    // 登记文件：模拟 UserPromptSubmit 落的活跃会话登记（SessionEnd 从未触发）。
+    let reg = serde_json::json!({
+        "session_id": "sid-orphan",
+        "transcript_path": tkey,
+        "ts": 1000.0,
+        "general_db": gdb.to_string_lossy(),
+        "project_db": pdb.to_string_lossy(),
+        "project_name": "orphanproj",
+    });
+    std::fs::write(
+        sessions_dir.join("sid-orphan.json"),
+        serde_json::to_string_pretty(&reg).expect("序列化登记"),
+    )
+    .expect("写登记");
+
+    let out = run_subcommand_raw(
+        "catchup-scan",
+        &[
+            "--work-dir",
+            work_dir.to_string_lossy().as_ref(),
+            "--sessions-dir",
+            sessions_dir.to_string_lossy().as_ref(),
+            "--watermark",
+            watermark.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "catchup-scan 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("应为 JSON");
+    assert_eq!(
+        plan.get("action").and_then(|x| x.as_str()),
+        Some("review"),
+        "孤儿应被补建并领取，实得：{plan}"
+    );
+    assert_eq!(plan.get("start_line").and_then(|x| x.as_u64()), Some(2));
+    assert_eq!(plan.get("end_line").and_then(|x| x.as_u64()), Some(5));
+    // 切片被重切出来，且恰为第 3..5 行。
+    let slice = PathBuf::from(
+        plan.get("slice")
+            .and_then(|x| x.as_str())
+            .expect("应有 slice"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&slice).expect("切片应存在"),
+        "l3\nl4\nl5\n"
+    );
+    // 登记文件已被消费删除（避免重复补建）。
+    assert!(
+        !sessions_dir.join("sid-orphan.json").exists(),
+        "补建后登记应被删除"
+    );
+
+    // 复盘者收尾：consolidate-done 推进水位线并写 last-review-ok。
+    let pending_path = PathBuf::from(
+        plan.get("pending")
+            .and_then(|x| x.as_str())
+            .expect("应有 pending"),
+    );
+    let done = run_subcommand_raw(
+        "consolidate-done",
+        &[
+            "--pending",
+            pending_path.to_string_lossy().as_ref(),
+            "--watermark",
+            watermark.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(
+        done.status.success(),
+        "consolidate-done 应成功，stderr={}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    let wm_text = std::fs::read_to_string(&watermark).expect("读水位线");
+    let wm: serde_json::Value = serde_json::from_str(&wm_text).expect("水位线应为 JSON");
+    assert_eq!(
+        wm.get(&tkey).and_then(|x| x.as_u64()),
+        Some(5),
+        "水位线应推进到 5"
+    );
+    assert!(!pending_path.exists(), "pending 应被清理");
+    // last-review-ok 健康标记（复盘健康面 / 停摆判定的数据源）。
+    let ok_text =
+        std::fs::read_to_string(base.join("last-review-ok")).expect("应写 last-review-ok");
+    let ok: serde_json::Value = serde_json::from_str(&ok_text).expect("应为 JSON");
+    assert!(
+        ok.get("ts").and_then(|x| x.as_f64()).is_some(),
+        "应记录时间戳"
+    );
+    assert_eq!(ok.get("end_line").and_then(|x| x.as_u64()), Some(5));
+    // watermark 锁已释放（不残留 .lock）。
+    assert!(
+        !base.join("watermark.lock").exists(),
+        "watermark 锁应已释放"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ============================================================================
+// 测试盲区补测：真实多进程锁竞争 / 崩溃恢复 / 晋升端到端（CLI 层）
+// ============================================================================
+
+/// 组装（但不 spawn）一个 engram 子命令，stdout/stderr 均接管为管道。
+///
+/// 供多进程用例先**统一 spawn、再统一 wait**：若边 spawn 边 wait 就把并发串行化了，
+/// 测不到真实的跨进程锁竞争。管道输出极短（各一两行），不会撑满管道缓冲造成死锁。
+fn build_engram_cmd(subcommand: &str, args: &[&str]) -> Command {
+    let exe = env!("CARGO_BIN_EXE_engram");
+    let mut cmd = Command::new(exe);
+    cmd.arg(subcommand);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd
+}
+
+// 52. 真实多进程锁竞争：15 个并发 write 子进程（3 组 × 每组 5 条不同 id）+ 1 个并发
+//     consolidate 子进程同抢一个 general.redb 的进程级排他文件锁。断言：
+//     - 全部子进程 exit 0——store::open 的重试退避（60 × 50ms ≈ 3s）必须真的兜住
+//       DatabaseAlreadyOpen（这是 store.rs `open` rustdoc 自我标榜、此前从未被真实
+//       多进程验证过的核心能力）；
+//     - 库里恰好 15 条、id 集合与写入完全一致（无丢写、无幻写）。
+//
+//     纪律：先在本进程预建空库并 drop 掉 Database 再 spawn（redb 文件独占锁，见
+//     文件头注释），也避免 16 个进程同时“无中生有”创建同一文件的边界情形。
+#[test]
+fn multi_process_concurrent_writes_and_consolidate_no_lost_write() {
+    let _guard = test_guard();
+    let now = "1000000000";
+    let general_path = unique_db_path("mp_lock_g");
+    let db = store::open(&general_path).expect("应能预建空库");
+    drop(db); // 释放本进程文件锁，交由子进程们竞争。
+    let g = general_path.to_string_lossy().to_string();
+
+    // 先统一 spawn 全部 16 个子进程（15 write + 1 consolidate），此刻它们并发抢锁。
+    let mut children: Vec<(String, std::process::Child)> = Vec::new();
+    for grp in 0..3 {
+        for i in 0..5 {
+            let id = format!("mp_w_{grp}_{i}");
+            let cue = format!("并发写入 组{grp} 第{i}条");
+            let child = build_engram_cmd(
+                "write",
+                &[
+                    "--general-db",
+                    &g,
+                    "--level",
+                    "L3",
+                    "--cue",
+                    &cue,
+                    "--id",
+                    &id,
+                    "--now",
+                    now,
+                ],
+            )
+            .spawn()
+            .expect("spawn write 子进程失败");
+            children.push((id, child));
+        }
+    }
+    let cons = build_engram_cmd("consolidate", &["--general-db", &g, "--now", now])
+        .spawn()
+        .expect("spawn consolidate 子进程失败");
+    children.push(("consolidate".to_string(), cons));
+
+    // 再统一 wait：收集所有失败者一次性报告（比逐个 assert 更利于诊断并发问题）。
+    let mut failures: Vec<String> = Vec::new();
+    for (label, child) in children {
+        let out = child.wait_with_output().expect("等待子进程退出失败");
+        if !out.status.success() {
+            failures.push(format!(
+                "{label}（exit={:?}）：{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "全部子进程都应 exit 0（重试退避应兜住 DatabaseAlreadyOpen），失败者：{failures:#?}"
+    );
+
+    // 无丢写：库里恰好 15 条，id 集合与写入完全一致，且每条完整可解析。
+    let db = store::open(&general_path).expect("竞争结束后应能重开公共库");
+    let mems = store::all(&db).expect("all 应成功");
+    assert_eq!(mems.len(), 15, "15 条并发写入应一条不丢");
+    let mut got: Vec<String> = mems.iter().map(|m| m.id.clone()).collect();
+    got.sort();
+    let mut want: Vec<String> = Vec::new();
+    for grp in 0..3 {
+        for i in 0..5 {
+            want.push(format!("mp_w_{grp}_{i}"));
+        }
+    }
+    want.sort();
+    assert_eq!(got, want, "id 集合应与写入完全一致（无丢写、无幻写）");
+    for m in &mems {
+        // importance 0 的刚写 L3：并发跑的 consolidate 不应产生任何变迁
+        // （升级被视界抹平、grace 防淘汰），故层级/状态应保持原样。
+        assert_eq!(m.status, Status::Active, "{} 应保持 Active", m.id);
+        assert_eq!(m.level, Level::L3, "{} 应保持 L3", m.id);
+    }
+    drop(db);
+    cleanup_file(&general_path);
+}
+
+// 53. 崩溃恢复（redb ACID 实证）：先顺序提交 30 条基线，再对若干**正在运行中**的
+//     write 子进程中途 kill（Windows 下 Child::kill 即 TerminateProcess，延迟逐级
+//     放大以覆盖启动中/开库中/写事务中/已提交未退出各阶段），随后重开库断言：
+//     - open + all() 正常（崩溃后能恢复到最近一次提交的一致状态）；
+//     - 已提交的 30 条一条不丢、逐字段完整可解析；
+//     - 被 kill 的写入要么完整落库、要么整体不存在，绝无半截条目
+//       （按 id 逐条 store::get——半截条目会在 get 处暴露为 Serde 错）；
+//     - 恢复后的库仍可正常写入（文件锁已随进程终止由内核释放）。
+#[test]
+fn kill_mid_write_recovers_with_committed_entries_intact() {
+    let _guard = test_guard();
+    let now = "1000000000";
+    let general_path = unique_db_path("crash_g");
+    let db = store::open(&general_path).expect("应能预建空库");
+    drop(db); // 同上：先释放本进程文件锁再 spawn 子进程。
+    let g = general_path.to_string_lossy().to_string();
+
+    // 阶段 1：顺序提交 30 条基线（run_write 已断言 exit 0，即事务确已提交）。
+    for i in 0..30 {
+        let cue = format!("崩溃前提交 {i}");
+        let id = format!("crash_ok_{i}");
+        run_write(&[
+            "--general-db",
+            &g,
+            "--level",
+            "L3",
+            "--cue",
+            &cue,
+            "--id",
+            &id,
+            "--now",
+            now,
+        ]);
+    }
+
+    // 阶段 2：10 个写进程在运行中途被 kill。被 kill 的写入成败皆可，
+    // 但绝不许破坏库文件或留下半截条目。
+    let delays_ms: [u64; 10] = [0, 1, 2, 4, 6, 9, 13, 18, 25, 40];
+    for (k, delay) in delays_ms.iter().enumerate() {
+        let cue = format!("中途被杀 {k}");
+        let id = format!("crash_kill_{k}");
+        let mut child = build_engram_cmd(
+            "write",
+            &[
+                "--general-db",
+                &g,
+                "--level",
+                "L3",
+                "--cue",
+                &cue,
+                "--id",
+                &id,
+                "--now",
+                now,
+            ],
+        )
+        .spawn()
+        .expect("spawn 待杀写进程失败");
+        std::thread::sleep(std::time::Duration::from_millis(*delay));
+        // 子进程若已自然退出，kill 返回错误，忽略即可（本用例不关心它死在哪一步）。
+        let _ = child.kill();
+        // 回收句柄，确保其持有的文件锁已随进程终止释放，后续开库不再与之竞争。
+        let _ = child.wait();
+    }
+
+    // 阶段 3：重开库验证（这一步 open 本身就是“崩溃后可恢复”的断言）。
+    let db = store::open(&general_path).expect("kill 后库应能正常重开（redb 崩溃恢复）");
+    let mems = store::all(&db).expect("all() 应能正常遍历全库");
+
+    // 3a. 已提交的 30 条一条不丢、逐字段完整。
+    for i in 0..30 {
+        let id = format!("crash_ok_{i}");
+        let m = store::get(&db, &id)
+            .expect("get 不应报错（半截条目会在此暴露为 Serde 错）")
+            .unwrap_or_else(|| panic!("已提交的 {id} 不应丢失"));
+        assert_eq!(m.cue, format!("崩溃前提交 {i}"), "{id} 的 cue 应完整");
+        assert_eq!(m.level, Level::L3);
+        assert_eq!(m.status, Status::Active);
+    }
+
+    // 3b. 被 kill 的写入：要么完整、要么不存在（原子性），并统计已提交者。
+    let mut committed_kills = 0usize;
+    for k in 0..delays_ms.len() {
+        let id = format!("crash_kill_{k}");
+        match store::get(&db, &id) {
+            Ok(Some(m)) => {
+                assert_eq!(
+                    m.cue,
+                    format!("中途被杀 {k}"),
+                    "{id} 若已提交则必须逐字段完整"
+                );
+                committed_kills += 1;
+            }
+            Ok(None) => {} // 提交前即被杀：整体不存在，符合原子性。
+            Err(e) => panic!("{id} 读出即错（疑似半截条目，ACID 被破坏）：{e}"),
+        }
+    }
+
+    // 3c. 全库条数 = 基线 30 + 已提交的被杀写入，精确一致（无幻条目、无静默跳过）。
+    assert_eq!(
+        mems.len(),
+        30 + committed_kills,
+        "全库条数应与已提交写入精确一致"
+    );
+    drop(db);
+
+    // 阶段 4：崩溃恢复后的库仍可正常写入与读回。
+    run_write(&[
+        "--general-db",
+        &g,
+        "--level",
+        "L3",
+        "--cue",
+        "崩溃恢复后的写入",
+        "--id",
+        "crash_after",
+        "--now",
+        now,
+    ]);
+    let db = store::open(&general_path).expect("恢复后的库应能再次打开");
+    let after = store::get(&db, "crash_after")
+        .expect("get 应成功")
+        .expect("恢复后的写入应存在");
+    assert_eq!(after.cue, "崩溃恢复后的写入");
+    drop(db);
+    cleanup_file(&general_path);
+}
+
+// 54. 晋升端到端（CLI 层复验 v0.9 语义）：write --now 注入 + 多次 confirm-use --now
+//     （跨日时间戳）+ consolidate --now，全程走真实子进程。断言三条红线：
+//     - 跨日持续真使用者（连续 7 天、每天 3 次，importance 0.5 < 门）经频率门升 L2；
+//     - 5 分钟前单次使用者不升级——分钟级红线：前置自检证明其真实 now 采样的
+//       promotion_score 确有越阈尖峰（踩在旧缺陷红线上），是升级视界挡下它，
+//       而非分数本身不够（consolidate.rs 单测 11 的跨进程版本）；
+//     - importance 0.85（≥ 门 0.8）零真使用直升中层 L2（重要度门）。
+#[test]
+fn promotion_e2e_cli_cross_day_minute_red_line_and_importance_gate() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0_f64;
+    let day = 86400.0_f64;
+    let general_path = unique_db_path("promo_g");
+    let g = general_path.to_string_lossy().to_string();
+
+    // A. 跨日持续使用者：8 天前写入，随后连续 7 天（含 now 当天）每天 3 次真使用。
+    //    importance 0.5 < 门 0.8，确保走的是频率门而非重要度门。
+    let created_a = format!("{}", now - 8.0 * day);
+    run_write(&[
+        "--general-db",
+        &g,
+        "--level",
+        "L3",
+        "--cue",
+        "跨日持续使用者",
+        "--importance",
+        "0.5",
+        "--id",
+        "promo_freq",
+        "--now",
+        &created_a,
+    ]);
+    for k in 0..7 {
+        let ts = format!("{}", now - k as f64 * day);
+        for _ in 0..3 {
+            let out = run_subcommand_raw(
+                "confirm-use",
+                &["--general-db", &g, "--ids", "promo_freq", "--now", &ts],
+            );
+            assert!(
+                out.status.success(),
+                "confirm-use 应成功，stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // B. 5 分钟前单次使用者：写入 + 单次 confirm-use 都在 now − 5 分钟。
+    let five_min_ago = format!("{}", now - 300.0);
+    run_write(&[
+        "--general-db",
+        &g,
+        "--level",
+        "L3",
+        "--cue",
+        "五分钟前的单次使用者",
+        "--importance",
+        "0.3",
+        "--id",
+        "promo_recent",
+        "--now",
+        &five_min_ago,
+    ]);
+    let out = run_subcommand_raw(
+        "confirm-use",
+        &[
+            "--general-db",
+            &g,
+            "--ids",
+            "promo_recent",
+            "--now",
+            &five_min_ago,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "confirm-use 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // C. 重要度门：importance 0.85、零真使用。
+    let created_c = format!("{}", now - 10.0 * day);
+    run_write(&[
+        "--general-db",
+        &g,
+        "--level",
+        "L3",
+        "--cue",
+        "高重要度直升者",
+        "--importance",
+        "0.85",
+        "--id",
+        "promo_gate",
+        "--now",
+        &created_c,
+    ]);
+
+    // 前置自检：进程内短暂开库核对注入结果，读毕立即 drop（再 spawn consolidate）。
+    {
+        let db = store::open(&general_path).expect("应能开库自检");
+        let freq = store::get(&db, "promo_freq")
+            .expect("get 应成功")
+            .expect("promo_freq 应存在");
+        assert_eq!(
+            freq.access_log.len(),
+            21,
+            "7 天 × 每天 3 次 confirm-use 应累计 21 条真使用"
+        );
+        let recent = store::get(&db, "promo_recent")
+            .expect("get 应成功")
+            .expect("promo_recent 应存在");
+        assert_eq!(recent.access_log.len(), 1, "应恰有 1 次真使用");
+        // 真实 now 采样确有越阈尖峰——证明用例踩在旧缺陷红线上，
+        // 下面不升级只能归因于升级视界，而非分数本身不够。
+        assert!(
+            engram::activation::promotion_score(&recent, now) >= engram::model::PROMOTE_L2,
+            "前置：promo_recent 真实 now 采样应有越阈尖峰"
+        );
+        drop(db);
+    }
+
+    // 会话末巩固（真实子进程；run_consolidate 已断言 exit 0）。
+    let stdout = run_consolidate(&general_path, &[], now, false);
+
+    // 断言 v0.9 语义（重开库读回落盘状态）。
+    let db = store::open(&general_path).expect("应能重开库");
+    let freq = store::get(&db, "promo_freq")
+        .expect("get 应成功")
+        .expect("promo_freq 应存在");
+    assert_eq!(freq.level, Level::L2, "跨日持续使用者应经频率门升 L2");
+    assert_eq!(freq.status, Status::Active);
+    let recent = store::get(&db, "promo_recent")
+        .expect("get 应成功")
+        .expect("promo_recent 应存在");
+    assert_eq!(
+        recent.level,
+        Level::L3,
+        "5 分钟前的单次使用者不得升级（分钟级红线）"
+    );
+    assert_eq!(recent.status, Status::Active, "grace 应保其 Active");
+    let gate = store::get(&db, "promo_gate")
+        .expect("get 应成功")
+        .expect("promo_gate 应存在");
+    assert_eq!(
+        gate.level,
+        Level::L2,
+        "importance 0.85 应经重要度门直升中层"
+    );
+    assert_eq!(gate.status, Status::Active);
+    drop(db);
+
+    // CLI 输出复验：变迁摘要应含两名晋升者、不含未晋升者。
+    assert!(
+        stdout.contains("promo_freq") && stdout.contains("promo_gate"),
+        "变迁摘要应包含两名晋升者，实得：{stdout}"
+    );
+    assert!(
+        !stdout.contains("promo_recent"),
+        "未晋升者不应出现在变迁摘要，实得：{stdout}"
+    );
+    cleanup_file(&general_path);
+}
+
+// ============================================================================
+// migrate / doctor / session-start 自动迁移：版本触发的一次性数据迁移 + 健康体检
+// ============================================================================
+
+const MIG_NOW: f64 = 1_000_000_000.0;
+const MIG_DAY: f64 = 86400.0;
+
+/// 在系统临时目录下建一个**独立**的进程内唯一目录（已创建），返回其路径。
+///
+/// 迁移测试需要控制「公共库父目录」以隔离默认备份目录（`<父目录>/backups`），
+/// 避免多个用例共享 temp_dir 根下的 backups 撞车。
+fn dedicated_dir(tag: &str) -> PathBuf {
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("engram_it_{tag}_{pid}_{}", unique_suffix()));
+    std::fs::create_dir_all(&dir).expect("应能创建独立测试目录");
+    dir
+}
+
+/// 构造一批「脏旧库」夹具记忆（模拟老用户升级后按旧规则分布的存量脏数据）。
+///
+/// 覆盖迁移各条清洗/诊断路径：缺 schema_version、旧尖峰升到 L2、一层塞超字符预算、
+/// 未来时间戳、悬空 superseded_by、importance 偏离层锚、疑似同 cue 重复。全部通用
+/// 作用域（project=None）。
+fn dirty_fixture() -> Vec<Memory> {
+    let long_cue = "记".repeat(2500);
+    let mut out = Vec::new();
+
+    // 1) 旧近因尖峰升上来的 L2（importance 低、单次访问已远去）→ 迁移应降回 L3 Active。
+    out.push(make(
+        "spike_l2",
+        Level::L2,
+        None,
+        Status::Active,
+        0.3,
+        MIG_NOW - 30.0 * MIG_DAY,
+        vec![MIG_NOW - 5.0 * MIG_DAY],
+    ));
+
+    // 2) 一层塞超字符预算的三条 L2（长 cue，importance 拉开排序）→ 溢出把最低者挤到 L3。
+    for (i, imp) in [0.62_f64, 0.61, 0.60].iter().enumerate() {
+        let mut m = make(
+            &format!("over{}", i + 1),
+            Level::L2,
+            None,
+            Status::Active,
+            *imp,
+            MIG_NOW - 1.0 * MIG_DAY,
+            vec![MIG_NOW - 0.5 * MIG_DAY],
+        );
+        m.cue = format!("{long_cue}{}", i + 1); // 各自不同，避免误判为重复。
+        out.push(m);
+    }
+
+    // 3) 未来时间戳（跨机拷库/时钟回拨）→ 迁移应钳到 now 并重排。
+    out.push(make(
+        "future_ts",
+        Level::L3,
+        None,
+        Status::Active,
+        0.2,
+        MIG_NOW - 10.0 * MIG_DAY,
+        vec![MIG_NOW + 10.0 * MIG_DAY],
+    ));
+
+    // 4) 悬空 superseded_by（指向库中不存在 id）→ 语义性，只标记不改不删。
+    let mut dangling = make(
+        "dangling",
+        Level::L3,
+        None,
+        Status::Superseded,
+        0.2,
+        MIG_NOW - 10.0 * MIG_DAY,
+        vec![MIG_NOW - 10.0 * MIG_DAY],
+    );
+    dangling.superseded_by = Some("ghost-x".to_string());
+    out.push(dangling);
+
+    // 5) importance 偏离层锚：L1 pinned 但 importance 0.1（层锚 [0.85,1.0]）→ 只标记，
+    //    pinned 恒守 L1、importance 绝不被改。
+    let mut off = make(
+        "offanchor",
+        Level::L1,
+        None,
+        Status::Active,
+        0.1,
+        MIG_NOW - 100.0 * MIG_DAY,
+        vec![],
+    );
+    off.pinned = true;
+    out.push(off);
+
+    // 6) 缺 schema_version（显式 0）→ 迁移补为当前 schema 版本。
+    let mut legacy = make(
+        "legacy_schema",
+        Level::L3,
+        None,
+        Status::Active,
+        0.2,
+        MIG_NOW - 10.0 * MIG_DAY,
+        vec![MIG_NOW - 1.0 * MIG_DAY],
+    );
+    legacy.schema_version = 0;
+    out.push(legacy);
+
+    // 7) 疑似同 cue 重复（两条完全同 cue）→ 语义性，只标记。
+    for id in ["dup_a", "dup_b"] {
+        let mut m = make(
+            id,
+            Level::L3,
+            None,
+            Status::Active,
+            0.2,
+            MIG_NOW - 2.0 * MIG_DAY,
+            vec![MIG_NOW - 1.0 * MIG_DAY],
+        );
+        m.cue = "重复的一句话".to_string();
+        out.push(m);
+    }
+
+    out
+}
+
+/// 调用 `engram migrate ...`，返回完整 Output。
+fn run_migrate_raw(general_db: &Path, extra: &[&str]) -> std::process::Output {
+    let exe = env!("CARGO_BIN_EXE_engram");
+    let mut cmd = Command::new(exe);
+    cmd.arg("migrate")
+        .arg("--general-db")
+        .arg(general_db)
+        .arg("--now")
+        .arg(MIG_NOW.to_string());
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.output().expect("运行 engram 二进制失败")
+}
+
+/// 读取某库的库级 data_version（测试断言用）。
+fn read_version(path: &Path) -> u32 {
+    let db = store::open(path).expect("应能打开库");
+    let v = store::read_data_version(&db).expect("读版本应成功");
+    drop(db);
+    v
+}
+
+/// 取库中某 id 的记忆（不存在则 panic）。
+fn get_mem(path: &Path, id: &str) -> Memory {
+    let db = store::open(path).expect("应能打开库");
+    let m = store::get(&db, id)
+        .expect("get 应成功")
+        .unwrap_or_else(|| panic!("{id} 应存在"));
+    drop(db);
+    m
+}
+
+// M1. migrate 主路径：结构自动洗 + 重分层 + 容量执行 + 语义只标记 + 版本写入 + 备份完整。
+#[test]
+fn migrate_cleans_structurally_relayers_and_reports_semantics_only() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("mig_main");
+    let general = dir.join("general.redb");
+    let backup_root = dir.join("bk");
+    let fixture = dirty_fixture();
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &fixture).expect("灌库应成功");
+        drop(db);
+    }
+    assert_eq!(read_version(&general), 1, "迁移前应为老库版本 1");
+
+    let out = run_migrate_raw(&general, &["--backup-dir", &backup_root.to_string_lossy()]);
+    assert!(
+        out.status.success(),
+        "migrate 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+
+    // 版本已写入。
+    assert_eq!(read_version(&general), 2, "迁移后库级版本应为 2");
+
+    // 结构性①：schema_version 补齐。
+    assert_eq!(
+        get_mem(&general, "legacy_schema").schema_version,
+        1,
+        "缺失/为 0 的 schema_version 应补为当前版本"
+    );
+
+    // 结构性②：未来时间戳被钳制（无任何 > now+60）。
+    let fut = get_mem(&general, "future_ts");
+    assert!(
+        fut.created_at <= MIG_NOW + 60.0 && fut.access_log.iter().all(|&t| t <= MIG_NOW + 60.0),
+        "未来时间戳应被钳到 now，实得 access_log={:?}",
+        fut.access_log
+    );
+
+    // 结构性③：旧尖峰 L2 记忆重分层降回 L3（仍 Active，importance 未被改）。
+    let spike = get_mem(&general, "spike_l2");
+    assert_eq!(spike.level, Level::L3, "旧尖峰应降回 L3");
+    assert_eq!(
+        spike.status,
+        Status::Active,
+        "降级后应仍 Active（未被淘汰）"
+    );
+    assert!(
+        (spike.importance - 0.3).abs() < 1e-12,
+        "importance 不应被迁移改动"
+    );
+
+    // 结构性④：超字符预算的层被执行——over1/over2/over3 中恰 2 条留 L2、1 条（over3）被挤到 L3。
+    let l2_overs = ["over1", "over2", "over3"]
+        .iter()
+        .filter(|id| get_mem(&general, id).level == Level::L2)
+        .count();
+    assert_eq!(l2_overs, 2, "超预算 L2 层应被执行为 2 条常驻");
+    assert_eq!(
+        get_mem(&general, "over3").level,
+        Level::L3,
+        "effective 最低的 over3 应被字符预算挤到 L3"
+    );
+
+    // 语义性（只标记不改不删）：
+    // (a) importance 偏离层锚——offanchor 仍在 L1、pinned、importance 仍 0.1、仍 Active。
+    let off = get_mem(&general, "offanchor");
+    assert_eq!(off.level, Level::L1, "pinned L1 不应被移动");
+    assert!(off.pinned, "pinned 标记不应被改");
+    assert!(
+        (off.importance - 0.1).abs() < 1e-12,
+        "偏锚 importance 绝不能被自动改"
+    );
+    assert_eq!(off.status, Status::Active, "偏锚记忆状态不应被改");
+    // (b) 悬空 superseded_by——dangling 仍在、status 仍 Superseded、指针原样、未被删。
+    let dang = get_mem(&general, "dangling");
+    assert_eq!(
+        dang.status,
+        Status::Superseded,
+        "悬空指针记忆 status 不应被改"
+    );
+    assert_eq!(
+        dang.superseded_by.as_deref(),
+        Some("ghost-x"),
+        "悬空指针不应被自动清除/改写"
+    );
+
+    // 无任何记忆被删除（10 条全在）。
+    {
+        let db = store::open(&general).expect("应能打开库");
+        let all = store::all(&db).expect("all 应成功");
+        assert_eq!(all.len(), 10, "迁移绝不删除任何记忆，应仍为 10 条");
+        drop(db);
+    }
+
+    // stdout：报告含备份目录 + 三类语义问题标记。
+    assert!(
+        stdout.contains("备份目录"),
+        "报告应含备份目录，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("语义性问题")
+            && stdout.contains("offanchor")
+            && stdout.contains("层锚偏离"),
+        "报告应标记 offanchor 层锚偏离，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("dangling") && stdout.contains("悬空指针"),
+        "报告应标记 dangling 悬空指针，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("疑似重复") && stdout.contains("dup_a") && stdout.contains("dup_b"),
+        "报告应标记 dup_a/dup_b 疑似重复，实得：{stdout}"
+    );
+
+    // 备份目录生成且内容完整：10 个 JSON，且备份保存的是**迁移前**原状（spike 仍 L2）。
+    let backup_sub = backup_root.join(format!("pre-migrate-v1-to-v2-{}", MIG_NOW as u64));
+    assert!(
+        backup_sub.is_dir(),
+        "备份子目录应存在：{}",
+        backup_sub.display()
+    );
+    let json_count = std::fs::read_dir(&backup_sub)
+        .expect("应能读备份目录")
+        .filter(|e| {
+            e.as_ref()
+                .ok()
+                .map(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(json_count, 10, "备份应含全部 10 条记忆的 JSON");
+    let spike_backup =
+        std::fs::read_to_string(backup_sub.join("spike_l2.json")).expect("应能读 spike_l2 备份");
+    let spike_orig: Memory = serde_json::from_str(&spike_backup).expect("备份 JSON 应可解析");
+    assert_eq!(
+        spike_orig.level,
+        Level::L2,
+        "备份应保存迁移前原状（spike 仍在 L2）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// M2. migrate --if-needed 幂等：迁移后再跑一次应跳过（版本标记生效），库不再变动。
+#[test]
+fn migrate_if_needed_is_idempotent_after_version_bump() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("mig_idem");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &dirty_fixture()).expect("灌库应成功");
+        drop(db);
+    }
+    // 首次迁移。
+    let out1 = run_migrate_raw(
+        &general,
+        &[
+            "--if-needed",
+            "--backup-dir",
+            &dir.join("bk1").to_string_lossy(),
+        ],
+    );
+    assert!(out1.status.success(), "首次 migrate 应成功");
+    assert_eq!(read_version(&general), 2, "首次迁移后应为 v2");
+    let spike_level_after_first = get_mem(&general, "spike_l2").level;
+
+    // 再跑一次 --if-needed → 跳过。
+    let out2 = run_migrate_raw(
+        &general,
+        &[
+            "--if-needed",
+            "--backup-dir",
+            &dir.join("bk2").to_string_lossy(),
+        ],
+    );
+    assert!(out2.status.success(), "二次 migrate 应成功");
+    let stdout2 = String::from_utf8(out2.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout2.contains("已是最新") || stdout2.contains("跳过"),
+        "二次 --if-needed 应跳过，实得：{stdout2}"
+    );
+    // 二次不应生成新备份目录（跳过前即返回）。
+    assert!(!dir.join("bk2").exists(), "跳过时不应创建二次备份目录");
+    // 库保持不变。
+    assert_eq!(read_version(&general), 2, "版本仍应为 2");
+    assert_eq!(
+        get_mem(&general, "spike_l2").level,
+        spike_level_after_first,
+        "幂等：二次跳过后 spike 层级不应再变"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// M3. migrate --dry-run 不写库、不备份，但报告将做什么 + 语义问题。
+#[test]
+fn migrate_dry_run_does_not_write_or_backup() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("mig_dry");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &dirty_fixture()).expect("灌库应成功");
+        drop(db);
+    }
+    let out = run_migrate_raw(
+        &general,
+        &[
+            "--dry-run",
+            "--backup-dir",
+            &dir.join("bk").to_string_lossy(),
+        ],
+    );
+    assert!(out.status.success(), "dry-run 应成功");
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(stdout.contains("dry-run"), "应标注 dry-run，实得：{stdout}");
+    assert!(
+        stdout.contains("层锚偏离") && stdout.contains("offanchor"),
+        "dry-run 也应报语义问题，实得：{stdout}"
+    );
+
+    // 不写库：版本仍 1、spike 仍 L2、schema 仍 0。
+    assert_eq!(read_version(&general), 1, "dry-run 不应写版本");
+    assert_eq!(
+        get_mem(&general, "spike_l2").level,
+        Level::L2,
+        "dry-run 不应重分层"
+    );
+    assert_eq!(
+        get_mem(&general, "legacy_schema").schema_version,
+        0,
+        "dry-run 不应改 schema_version"
+    );
+    // 不备份。
+    assert!(!dir.join("bk").exists(), "dry-run 不应创建备份目录");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// M4. doctor 只读体检：报告准确、且绝不写库。
+#[test]
+fn doctor_reports_accurately_and_is_read_only() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("doc_ro");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &dirty_fixture()).expect("灌库应成功");
+        drop(db);
+    }
+
+    let exe = env!("CARGO_BIN_EXE_engram");
+    let out = Command::new(exe)
+        .arg("doctor")
+        .arg("--general-db")
+        .arg(&general)
+        .arg("--now")
+        .arg(MIG_NOW.to_string())
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(
+        out.status.success(),
+        "doctor 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    // 报告要点：需迁移、坏行 0、悬空指针、层锚偏离、未来时间戳、疑似重复、超预算层。
+    assert!(stdout.contains("需迁移: 是"), "应报需迁移，实得：{stdout}");
+    assert!(stdout.contains("dangling"), "应报悬空指针，实得：{stdout}");
+    assert!(stdout.contains("offanchor"), "应报层锚偏离，实得：{stdout}");
+    assert!(
+        stdout.contains("future_ts"),
+        "应报未来时间戳，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("重复的一句话"),
+        "应报疑似重复，实得：{stdout}"
+    );
+    assert!(
+        stdout.contains("超字符预算的层"),
+        "应含超预算层小节，实得：{stdout}"
+    );
+
+    // JSON 模式可解析、needs_migration=true。
+    let out_json = Command::new(exe)
+        .arg("doctor")
+        .arg("--general-db")
+        .arg(&general)
+        .arg("--now")
+        .arg(MIG_NOW.to_string())
+        .arg("--json")
+        .output()
+        .expect("运行 engram 二进制失败");
+    let js = String::from_utf8(out_json.stdout).expect("stdout 非 UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(js.trim()).expect("doctor --json 应可解析");
+    assert_eq!(
+        parsed.get("needs_migration").and_then(|v| v.as_bool()),
+        Some(true),
+        "JSON needs_migration 应为 true"
+    );
+    assert_eq!(parsed.get("total").and_then(|v| v.as_u64()), Some(10));
+
+    // doctor 绝不写库：版本仍 1、spike 仍 L2。
+    assert_eq!(read_version(&general), 1, "doctor 不应写版本");
+    assert_eq!(
+        get_mem(&general, "spike_l2").level,
+        Level::L2,
+        "doctor 不应重分层"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 调用 `engram session-start --project-dir P --general-db G --now MIG_NOW`，返回 Output。
+fn run_session_start_mig(project_dir: &Path, general_db: &Path) -> std::process::Output {
+    let exe = env!("CARGO_BIN_EXE_engram");
+    Command::new(exe)
+        .arg("session-start")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .arg("--general-db")
+        .arg(general_db)
+        .arg("--now")
+        .arg(MIG_NOW.to_string())
+        .output()
+        .expect("运行 engram 二进制失败")
+}
+
+// M5. session-start 对旧库触发迁移（迁移后 v2、尖峰降回），热索引照常注入。
+#[test]
+fn session_start_triggers_migration_on_old_lib() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("ss_old");
+    let general = dir.join("general.redb");
+    let project_dir = unique_project_dir("ss_old_proj");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &dirty_fixture()).expect("灌库应成功");
+        drop(db);
+    }
+    assert_eq!(read_version(&general), 1, "前置：旧库版本 1");
+
+    let out = run_session_start_mig(&project_dir, &general);
+    assert!(
+        out.status.success(),
+        "session-start 应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    // 热索引照常注入。
+    assert!(stdout.contains("热索引"), "应注入热索引，实得：{stdout}");
+    // 迁移已触发：版本升到 2、尖峰降回 L3。
+    assert_eq!(read_version(&general), 2, "session-start 应触发迁移到 v2");
+    assert_eq!(
+        get_mem(&general, "spike_l2").level,
+        Level::L3,
+        "尖峰应已降回 L3"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// M6. session-start 对已是最新（v2）的库不触发迁移，库保持不变、热索引照常注入。
+#[test]
+fn session_start_does_not_trigger_on_current_lib() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("ss_new");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        // 干净的一条 L2（in-band），并显式标记为最新版本 2。
+        let clean = make(
+            "clean_l2",
+            Level::L2,
+            None,
+            Status::Active,
+            0.6,
+            MIG_NOW - 1.0 * MIG_DAY,
+            vec![MIG_NOW - 0.5 * MIG_DAY],
+        );
+        store::put_many(&db, &[clean]).expect("灌库应成功");
+        store::write_data_version(&db, 2).expect("写版本应成功");
+        drop(db);
+    }
+    let project_dir = unique_project_dir("ss_new_proj");
+
+    let out = run_session_start_mig(&project_dir, &general);
+    assert!(out.status.success(), "session-start 应成功");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("已迁移"),
+        "已是最新的库不应触发迁移，stderr={stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(stdout.contains("热索引"), "应注入热索引，实得：{stdout}");
+    // 库未被迁移改动：版本仍 2、clean_l2 仍在 L2、未生成备份。
+    assert_eq!(read_version(&general), 2);
+    assert_eq!(get_mem(&general, "clean_l2").level, Level::L2);
+    assert!(!dir.join("backups").exists(), "已最新不应产生备份目录");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// M7. session-start 迁移失败（备份目录被文件占位而无法创建）不阻断热索引注入。
+#[test]
+fn session_start_migration_failure_does_not_block_hot_index() {
+    let _guard = test_guard();
+    let dir = dedicated_dir("ss_fail");
+    let general = dir.join("general.redb");
+    {
+        let db = store::open(&general).expect("应能创建库");
+        store::put_many(&db, &dirty_fixture()).expect("灌库应成功");
+        drop(db);
+    }
+    // 在默认备份根路径 <general 父目录>/backups 处放一个**文件**占位，
+    // 使 create_dir_all(backups/pre-migrate-...) 失败 → 迁移中止报错。
+    std::fs::write(dir.join("backups"), b"block").expect("应能写占位文件");
+    let project_dir = unique_project_dir("ss_fail_proj");
+
+    let out = run_session_start_mig(&project_dir, &general);
+    // session-start 自身仍成功（迁移是 best-effort，绝不阻断注入）。
+    assert!(
+        out.status.success(),
+        "迁移失败也不应让 session-start 失败，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout.contains("热索引"),
+        "迁移失败时热索引仍应注入，实得：{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("迁移失败"),
+        "应在 stderr 留失败痕迹，stderr={stderr}"
+    );
+    // 迁移未标记完成：版本仍 1、尖峰仍 L2。
+    assert_eq!(read_version(&general), 1, "迁移失败不应写版本");
+    assert_eq!(
+        get_mem(&general, "spike_l2").level,
+        Level::L2,
+        "迁移失败不应改动库"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&project_dir);
 }
