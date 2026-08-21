@@ -165,6 +165,18 @@ engram supersede --general-db G [--project-db n=p ...] --id <旧> --by <新>
 ```
 这会无视层级/floor 把旧记忆移出热层（转 superseded，留负知识痕迹）。**这是唯一能把错误从 L1 拽出来的手段。**
 
+### 3.2b 改写 cue（内容没错、只是 cue 写太长）
+
+`supersede` 是给**内容被推翻**用的。若一条记忆内容仍然成立、只是当初把整段结论塞进了 cue（违反「cue 是一句话检索线索」），用 `reword` **原地改**：
+
+```
+engram reword --general-db G [--project-db n=p ...] --id <id>   --cue "收成一句话的检索线索" --pointer-detail "从 cue 里搬出来的细节正文"
+```
+
+**它只改 cue / pointer，`access_log`（使用历史）、`created_at`、层级、importance、pinned、status、tags 全部原样保留**——这正是它存在的理由：`write --overwrite` 和「write 新条 + supersede 旧条」都会把加固历史清零，那等于让「守 cue 纪律」和「保住加固资产」二选一。**改写超长 cue 一律走 `reword`，别走 write+supersede。**
+
+写 cue 时记住：超过约 240 字符 engram 会警告并算给你看它占了该层字符预算的百分之多少。cue 越长，consolidate 装箱时越容易轮到它装不下而被下推一层，并压缩同层其它记忆的额度——细节放 `--pointer-detail`，不占热索引。
+
 ### 3.3 合并（一簇相关记忆冷掉时，并成粗 gist）
 ```
 engram merge --general-db G [--project-db n=p ...] \
