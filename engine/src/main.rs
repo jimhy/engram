@@ -48,9 +48,10 @@ use engram::commands::{
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::health::{self, HealthReport};
 use engram::model::{
-    EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION, MEMORY_SCHEMA_VERSION,
+    params, EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION,
+    MEMORY_SCHEMA_VERSION,
 };
-use engram::render::{load_store_entries, render};
+use engram::render::{load_store_entries, render, HOT_INDEX_PREAMBLE};
 use engram::serve::{self, ServeConfig};
 use engram::session::{self, Pending};
 use engram::store::{self, StoreError};
@@ -88,7 +89,7 @@ enum Command {
         /// 项目库映射 `name=path`，可重复给 0..N 个。
         #[arg(long = "project-db")]
         project_db: Vec<String>,
-        /// 查询串（按空白分词、小写后做子串匹配）。
+        /// 查询串（英文按空白分词、中文按二字 ngram 切分，小写后做子串匹配；中文可直接写自然语句）。
         #[arg(long)]
         query: String,
         /// 最多返回的候选数。
@@ -217,6 +218,27 @@ enum Command {
         /// 源 JSON 目录（包含若干 `*.json` 记忆文件）。
         #[arg(long)]
         from_json_dir: PathBuf,
+    },
+    /// 原地改写 cue / 指针：**只**改这几个字段，使用历史与层级状态原样保留。
+    Reword {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 要改写的记忆 id。
+        #[arg(long)]
+        id: String,
+        /// 新 cue（一句话检索线索）；不给则保持原值。
+        #[arg(long)]
+        cue: Option<String>,
+        /// 新指针 reference（ground truth 位置）；不给则保持原值。
+        #[arg(long = "pointer-reference")]
+        pointer_reference: Option<String>,
+        /// 新指针 detail（安放从 cue 里搬出来的细节正文）；不给则保持原值。
+        #[arg(long = "pointer-detail")]
+        pointer_detail: Option<String>,
     },
     /// 确认真使用：给候选记忆追加一次真使用时间戳（加固）；若为 Cold 则复活。
     ConfirmUse {
@@ -915,6 +937,21 @@ fn dispatch() -> ExitCode {
             project_db,
             from_json_dir,
         } => run_import(&general_db, &project_db, &from_json_dir),
+        Command::Reword {
+            general_db,
+            project_db,
+            id,
+            cue,
+            pointer_reference,
+            pointer_detail,
+        } => run_reword(RewordArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            id: &id,
+            cue: cue.as_deref(),
+            pointer_reference: pointer_reference.as_deref(),
+            pointer_detail: pointer_detail.as_deref(),
+        }),
         Command::ConfirmUse {
             general_db,
             project_db,
@@ -1315,7 +1352,7 @@ struct SessionStartArgs<'a> {
 /// `session-start` 的输出格式（由 `--emit` 解析而来）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmitFormat {
-    /// 逐行打到 stdout（前言行 + render 热索引），与历史行为一致。
+    /// 逐行打到 stdout（前言（多行）+ render 热索引）。
     Text,
     /// 把整段文本塞进 Claude Code SessionStart hook 的 `additionalContext`，打成一行 JSON。
     Json,
@@ -1339,7 +1376,7 @@ fn parse_emit_format(s: &str) -> Result<EmitFormat, String> {
 /// 用 [`serde_json`] 序列化保证转义与 UTF-8 正确（不手拼字符串）。
 ///
 /// # 参数
-/// - `context`：要注入的整段文本（前言行 + render 热索引）。
+/// - `context`：要注入的整段文本（前言（多行）+ render 热索引）。
 ///
 /// # Errors
 /// 序列化失败（理论上不会发生，字符串与字面量结构均可序列化）时返回其错误说明。
@@ -1421,7 +1458,8 @@ fn scope_kind_str(kind: ScopeKind) -> &'static str {
 /// 若给了 `--log` 则追加一行调试记录（失败静默忽略）。
 ///
 /// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。空库渲染为空索引（不报错）。
-/// `--emit text`（缺省）的 stdout 与历史行为逐字节一致。
+/// `--emit text`（缺省）的 stdout = 前言（多行，见 [`engram::render::HOT_INDEX_PREAMBLE`]）
+/// + render 热索引；前言自扩写起**不再**与历史输出逐字节一致。
 fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
     let emit = match parse_emit_format(args.emit) {
         Ok(e) => e,
@@ -1455,22 +1493,25 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
         }
     };
 
-    // 前言（一行）+ 热索引。前言提示按指针查 ground truth、勿凭印象。
-    // 注意：text 分支在预算内时须与历史输出逐字节一致（println! 前言 + print! render）。
+    // 前言（多行，唯一真源见 engram::render::HOT_INDEX_PREAMBLE）+ 热索引。前言除历史那句
+    // 「按指针查 ground truth、勿凭印象」外，还声明常驻层范围（L1/L2/L4.1/L4.2）与 recall
+    // 的调用方式——L3/L4.3 退出常驻后，它是模型得知「还有按需层、怎么取」的唯一入口。
     // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
-    const PREAMBLE: &str = "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」";
+    // 注意：前言**不计入** --budget（预算只钳 render 产物）。宿主对注入文本有硬上限
+    // （Claude Code 的 additionalContext 为 10000 字符，超出即整段落盘、上下文只留前 2000
+    // 字符），故 --budget 须按「前言 277 字符 + 预算」之和留余量（hooks.json 取 9000）。
     let rendered = engram::render::render_budgeted(&merged, now, &[], args.budget);
 
     let status = match emit {
         EmitFormat::Text => {
-            println!("{PREAMBLE}");
+            println!("{HOT_INDEX_PREAMBLE}");
             print!("{rendered}");
             ExitCode::SUCCESS
         }
         EmitFormat::Json => {
-            // additionalContext = 「前言行 + 换行 + render 输出」整段文本。
+            // additionalContext = 「前言 + 换行 + render 输出」整段文本。
             // 与 text 分支语义对齐：println! 的前言后带一个换行，render 自带其换行。
-            let context = format!("{PREAMBLE}\n{rendered}");
+            let context = format!("{HOT_INDEX_PREAMBLE}\n{rendered}");
             match build_hook_json(&context) {
                 Ok(json) => {
                     println!("{json}");
@@ -2650,8 +2691,14 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         }
     }
 
-    // 7. 渲染。前言后若作用域是项目管理目录，追加一行提示（勿在此直接写项目记忆）。
-    const PREAMBLE: &str = "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」";
+    // 7. 渲染。前言（多行，唯一真源见 engram::render::HOT_INDEX_PREAMBLE）之后，若作用域是
+    //    项目管理目录，再追加一行提示（勿在此直接写项目记忆）。
+    //    注入总量 = 前言 + WORKSPACE_NOTE（仅管理目录）+ 渲染产物，三者合计须留在宿主
+    //    additionalContext 硬上限（Claude Code 10000 字符）之内。前缀开销在下面按实际
+    //    字符数**实扣**后再交给 render_budgeted，而不是靠预算常量里预留一个魔数余量——
+    //    前言将来再扩写也不会悄悄吃掉余量（本次把前言从 56 扩到 277 字符时就差点踩到：
+    //    HOT_INDEX_CHAR_BUDGET 的 400 字符余量当场只剩 123）。WORKSPACE_NOTE 只此一处
+    //    使用、且属「作用域判定的副产品」而非渲染文案，故不随前言上提到 render.rs。
     const WORKSPACE_NOTE: &str = "（注意：当前目录是 engram 项目管理目录，不要直接在此写项目记忆；请在其下的具体项目目录里工作，项目记忆写到该项目的库。）";
     // 当前作用域是具体项目时，即使其 L4 为空也显式渲染 [<项目名>] L4.x 段，
     // 作为「该项目已识别/挂载」的可视确认（空项目否则会在热索引里完全隐身）。
@@ -2660,14 +2707,30 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         // 管理目录 / 无项目作用域都不渲染任何具体项目段（无项目时连伪项目库都不挂）。
         ScopeKind::Workspace | ScopeKind::None => Vec::new(),
     };
-    // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
-    let rendered = engram::render::render_budgeted(&merged, now, &active_projects, args.budget);
     let is_workspace = scope.kind == ScopeKind::Workspace;
+    // 前缀（前言 + 可选的管理目录提示行，各自后面跟一个换行）在注入体里与渲染产物同占额度，
+    // 故从预算里实扣；`--budget 0`（不限）保持不限。saturating_sub 兜住「预算比前缀还小」
+    // 的极端取值：此时渲染预算为 0，即不限——与其静默产出超额注入，不如让 0 保持原语义，
+    // 这类取值本就不该出现在注入路径上。
+    let prefix_cost = HOT_INDEX_PREAMBLE.chars().count()
+        + 1
+        + if is_workspace {
+            WORKSPACE_NOTE.chars().count() + 1
+        } else {
+            0
+        };
+    let render_budget = if args.budget == 0 {
+        0
+    } else {
+        args.budget.saturating_sub(prefix_cost)
+    };
+    // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
+    let rendered = engram::render::render_budgeted(&merged, now, &active_projects, render_budget);
 
     // 8. 输出。
     let status = match emit {
         EmitFormat::Text => {
-            println!("{PREAMBLE}");
+            println!("{HOT_INDEX_PREAMBLE}");
             if is_workspace {
                 println!("{WORKSPACE_NOTE}");
             }
@@ -2677,9 +2740,9 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         EmitFormat::Json => {
             // additionalContext = 前言（+ 管理目录提示行）+ render 输出。
             let context = if is_workspace {
-                format!("{PREAMBLE}\n{WORKSPACE_NOTE}\n{rendered}")
+                format!("{HOT_INDEX_PREAMBLE}\n{WORKSPACE_NOTE}\n{rendered}")
             } else {
-                format!("{PREAMBLE}\n{rendered}")
+                format!("{HOT_INDEX_PREAMBLE}\n{rendered}")
             };
             match build_hot_index_json(args.hook_event, &context) {
                 Ok(json) => {
@@ -3203,7 +3266,7 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
                 json_str(&m.id),
                 json_str(level_repr(m.level)),
                 json_str(status_repr(m.status)),
-                c.score,
+                json_f64(c.score),
                 json_f64(c.effective),
                 json_str(&m.cue),
                 json_pointer(&m.pointer),
@@ -3221,7 +3284,7 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
             let m = c.memory;
             let reference = m.pointer.reference.as_deref().unwrap_or("-");
             println!(
-                "  {} | {} | {} | score={} | eff={} | {} | {}",
+                "  {} | {} | {} | score={:.2} | eff={} | {} | {}",
                 m.id,
                 level_repr(m.level),
                 status_repr(m.status),
@@ -3245,13 +3308,30 @@ const CUE_WARN_CHARS: usize = 240;
 /// 若 cue 超长（字符数 > [`CUE_WARN_CHARS`]）则向 stderr 打警告（不拒绝）。
 ///
 /// write（含 --overwrite）/ merge / graduate 等所有产生新 cue 的路径共用。
-fn warn_long_cue(cue: &str) {
+///
+/// 警告里**量化**该 cue 占目标层字符预算的比例：光说「超长」写入方（多为 LLM）
+/// 不会当回事——2026-08-21 现场就有 583 与 1082 字符的 cue 一路写进 L1/L2，前者
+/// 独占 L1 预算近半、后者把一条 11 字符的全局铁律挤下两层。把代价算出来给它看，
+/// 比一句抽象劝告有效。
+fn warn_long_cue(cue: &str, level: Level) {
     let n = cue.chars().count();
-    if n > CUE_WARN_CHARS {
-        eprintln!(
-            "警告：cue 应是一句话检索线索（当前 {n} 字符），细节请放指针/detail——超长 cue 会挤占该层字符预算"
-        );
+    if n <= CUE_WARN_CHARS {
+        return;
     }
+    let budget = params(level).char_budget;
+    if budget == 0 {
+        eprintln!("警告：cue 应是一句话检索线索（当前 {n} 字符），细节请放指针 / detail。");
+        return;
+    }
+    // 只按 cue 本身算，未计渲染行的 `#<tok>`、指针、imp/eff 等格式开销，故为下界。
+    let share = n.saturating_mul(100) / budget;
+    // 分两条打印而非字符串内换行：`\` 续行不吃全角空白，源码缩进会漏进 stderr。
+    eprintln!(
+        "警告：cue 应是一句话检索线索，当前 {n} 字符，至少占 {level:?} 层字符预算（{budget}）的 {share}%。"
+    );
+    eprintln!(
+        "　　　细节请放指针 / detail。consolidate 溢出步按字符预算装箱：cue 越长越容易在轮到它时装不下而被下推一层，并压缩同层其它记忆的可用额度。"
+    );
 }
 
 /// `write` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
@@ -3396,7 +3476,7 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：超长仅警告（不拒绝），覆盖普通写入与 --overwrite 路径。
-    warn_long_cue(args.cue);
+    warn_long_cue(args.cue, memory.level);
 
     println!("{id}");
     ExitCode::SUCCESS
@@ -3950,6 +4030,104 @@ fn parse_id_list(s: &str) -> Vec<String> {
 /// - 未命中：记 stderr 并继续处理后续 id。
 ///
 /// 逐 id 打印结果（追加使用 / 复活 / 未找到 / 无法路由）。
+/// `reword` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
+struct RewordArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    id: &'a str,
+    cue: Option<&'a str>,
+    pointer_reference: Option<&'a str>,
+    pointer_detail: Option<&'a str>,
+}
+
+/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针，**其余字段一律保留**。
+///
+/// 保留清单（这是本命令存在的全部理由，改动时必须逐条守住）：`access_log`（使用
+/// 历史 = 记忆的加固资产）、`created_at`、`level`、`importance`、`pinned`、
+/// `status`、`tags`、`project`、`superseded_by`、`schema_version`。
+///
+/// **为什么需要它**：cue 纪律（cue 是一句话检索线索、细节放指针，见
+/// [`CUE_WARN_CHARS`]）要能被执行，修正一条已写入的超长 cue 就不能以丢历史为代价。
+/// 在本命令之前，改 cue 只有两条路——`write --overwrite`（整条 `store::put` 覆盖）
+/// 与 `write` 新条 + `supersede` 旧条——**两条都会把 access_log 清零**，等于让
+/// 「守纪律」和「保住加固资产」二选一，结果就是没人改，长 cue 越积越多：2026-08-21
+/// 公共库里 cue 超 240 字符的 active 记忆有 19 条，最长 1370 字符。
+///
+/// 三个改写参数都不给则报错退出（避免一次无意义的读写）。新 cue 照常过
+/// [`warn_long_cue`] 的长度警告。
+fn run_reword(args: RewordArgs) -> ExitCode {
+    if args.cue.is_none() && args.pointer_reference.is_none() && args.pointer_detail.is_none() {
+        eprintln!(
+            "reword 失败：--cue / --pointer-reference / --pointer-detail 至少给一个，否则无事可做"
+        );
+        return ExitCode::FAILURE;
+    }
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let dbs = match DbSet::open(args.general_db, &project_dbs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let merged = match dbs.read_all() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(mut m) = merged.iter().find(|m| m.id == args.id).cloned() else {
+        eprintln!("reword 失败：未找到 id {}", args.id);
+        return ExitCode::FAILURE;
+    };
+
+    let old_cue_chars = m.cue.chars().count();
+    if let Some(c) = args.cue {
+        if c.trim().is_empty() {
+            eprintln!("reword 失败：--cue 不能为空白");
+            return ExitCode::FAILURE;
+        }
+        m.cue = c.to_string();
+    }
+    if let Some(r) = args.pointer_reference {
+        m.pointer.reference = Some(r.to_string());
+    }
+    if let Some(d) = args.pointer_detail {
+        m.pointer.detail = Some(d.to_string());
+    }
+
+    match dbs.route(m.project.as_deref()) {
+        Some(db) => {
+            if let Err(e) = store::put(db, &m) {
+                eprintln!("reword: 写回 {} 失败：{e}", args.id);
+                return ExitCode::FAILURE;
+            }
+        }
+        None => {
+            let pname = m.project.as_deref().unwrap_or("-");
+            eprintln!(
+                "reword 失败：{} 所属项目 {pname} 不在 --project-db 映射中",
+                args.id
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    warn_long_cue(&m.cue, m.level);
+    println!(
+        "reword: {} cue {} → {} 字符；使用历史 {} 次、created_at、层级 {} 与状态均保留",
+        args.id,
+        old_cue_chars,
+        m.cue.chars().count(),
+        m.access_log.len(),
+        level_repr(m.level)
+    );
+    ExitCode::SUCCESS
+}
+
 fn run_confirm_use(
     general_db: &Path,
     project_db_raw: &[String],
@@ -4311,7 +4489,7 @@ fn run_graduate(args: GraduateArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：对毕业后新通用记忆实际采用的 cue（--cue 覆盖或沿用源 cue）警告。
-    warn_long_cue(&graduated.cue);
+    warn_long_cue(&graduated.cue, graduated.level);
 
     println!(
         "graduate: {} ({:?}) → 毕业为通用记忆 {new_id} ({:?})；原记忆已转 superseded 留作已上浮指针",
@@ -4460,6 +4638,8 @@ fn run_merge(args: MergeArgs<'_>) -> ExitCode {
         batch.push(s);
     }
     let merged_count = batch.len();
+    // Level 是 Copy，在 merged_mem 被 move 进 batch 前留一份给下面的 cue 长度警告。
+    let merged_level = merged_mem.level;
     batch.push(merged_mem);
 
     if let Err(e) = store::put_many(db, &batch) {
@@ -4468,7 +4648,7 @@ fn run_merge(args: MergeArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：合并生成的新 cue 同样受源头警告约束。
-    warn_long_cue(args.cue);
+    warn_long_cue(args.cue, merged_level);
 
     println!("merge: 新记忆 {new_id} 合并了 {merged_count} 条源（源已转 Tombstone）");
     ExitCode::SUCCESS
