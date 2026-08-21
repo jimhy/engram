@@ -48,7 +48,8 @@ use engram::commands::{
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::health::{self, HealthReport};
 use engram::model::{
-    EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION, MEMORY_SCHEMA_VERSION,
+    params, EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION,
+    MEMORY_SCHEMA_VERSION,
 };
 use engram::render::{load_store_entries, render, HOT_INDEX_PREAMBLE};
 use engram::serve::{self, ServeConfig};
@@ -217,6 +218,27 @@ enum Command {
         /// 源 JSON 目录（包含若干 `*.json` 记忆文件）。
         #[arg(long)]
         from_json_dir: PathBuf,
+    },
+    /// 原地改写 cue / 指针：**只**改这几个字段，使用历史与层级状态原样保留。
+    Reword {
+        /// 公共库 redb 文件路径（必填）。
+        #[arg(long)]
+        general_db: PathBuf,
+        /// 项目库映射 `name=path`，可重复给 0..N 个。
+        #[arg(long = "project-db")]
+        project_db: Vec<String>,
+        /// 要改写的记忆 id。
+        #[arg(long)]
+        id: String,
+        /// 新 cue（一句话检索线索）；不给则保持原值。
+        #[arg(long)]
+        cue: Option<String>,
+        /// 新指针 reference（ground truth 位置）；不给则保持原值。
+        #[arg(long = "pointer-reference")]
+        pointer_reference: Option<String>,
+        /// 新指针 detail（安放从 cue 里搬出来的细节正文）；不给则保持原值。
+        #[arg(long = "pointer-detail")]
+        pointer_detail: Option<String>,
     },
     /// 确认真使用：给候选记忆追加一次真使用时间戳（加固）；若为 Cold 则复活。
     ConfirmUse {
@@ -915,6 +937,21 @@ fn dispatch() -> ExitCode {
             project_db,
             from_json_dir,
         } => run_import(&general_db, &project_db, &from_json_dir),
+        Command::Reword {
+            general_db,
+            project_db,
+            id,
+            cue,
+            pointer_reference,
+            pointer_detail,
+        } => run_reword(RewordArgs {
+            general_db: &general_db,
+            project_db: &project_db,
+            id: &id,
+            cue: cue.as_deref(),
+            pointer_reference: pointer_reference.as_deref(),
+            pointer_detail: pointer_detail.as_deref(),
+        }),
         Command::ConfirmUse {
             general_db,
             project_db,
@@ -3271,13 +3308,30 @@ const CUE_WARN_CHARS: usize = 240;
 /// 若 cue 超长（字符数 > [`CUE_WARN_CHARS`]）则向 stderr 打警告（不拒绝）。
 ///
 /// write（含 --overwrite）/ merge / graduate 等所有产生新 cue 的路径共用。
-fn warn_long_cue(cue: &str) {
+///
+/// 警告里**量化**该 cue 占目标层字符预算的比例：光说「超长」写入方（多为 LLM）
+/// 不会当回事——2026-08-21 现场就有 583 与 1082 字符的 cue 一路写进 L1/L2，前者
+/// 独占 L1 预算近半、后者把一条 11 字符的全局铁律挤下两层。把代价算出来给它看，
+/// 比一句抽象劝告有效。
+fn warn_long_cue(cue: &str, level: Level) {
     let n = cue.chars().count();
-    if n > CUE_WARN_CHARS {
-        eprintln!(
-            "警告：cue 应是一句话检索线索（当前 {n} 字符），细节请放指针/detail——超长 cue 会挤占该层字符预算"
-        );
+    if n <= CUE_WARN_CHARS {
+        return;
     }
+    let budget = params(level).char_budget;
+    if budget == 0 {
+        eprintln!("警告：cue 应是一句话检索线索（当前 {n} 字符），细节请放指针 / detail。");
+        return;
+    }
+    // 只按 cue 本身算，未计渲染行的 `#<tok>`、指针、imp/eff 等格式开销，故为下界。
+    let share = n.saturating_mul(100) / budget;
+    // 分两条打印而非字符串内换行：`\` 续行不吃全角空白，源码缩进会漏进 stderr。
+    eprintln!(
+        "警告：cue 应是一句话检索线索，当前 {n} 字符，至少占 {level:?} 层字符预算（{budget}）的 {share}%。"
+    );
+    eprintln!(
+        "　　　细节请放指针 / detail。consolidate 溢出步按字符预算装箱：cue 越长越容易在轮到它时装不下而被下推一层，并压缩同层其它记忆的可用额度。"
+    );
 }
 
 /// `write` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
@@ -3422,7 +3476,7 @@ fn run_write(args: WriteArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：超长仅警告（不拒绝），覆盖普通写入与 --overwrite 路径。
-    warn_long_cue(args.cue);
+    warn_long_cue(args.cue, memory.level);
 
     println!("{id}");
     ExitCode::SUCCESS
@@ -3976,6 +4030,104 @@ fn parse_id_list(s: &str) -> Vec<String> {
 /// - 未命中：记 stderr 并继续处理后续 id。
 ///
 /// 逐 id 打印结果（追加使用 / 复活 / 未找到 / 无法路由）。
+/// `reword` 命令的全部参数（聚成一个结构体，规避过多函数形参）。
+struct RewordArgs<'a> {
+    general_db: &'a Path,
+    project_db: &'a [String],
+    id: &'a str,
+    cue: Option<&'a str>,
+    pointer_reference: Option<&'a str>,
+    pointer_detail: Option<&'a str>,
+}
+
+/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针，**其余字段一律保留**。
+///
+/// 保留清单（这是本命令存在的全部理由，改动时必须逐条守住）：`access_log`（使用
+/// 历史 = 记忆的加固资产）、`created_at`、`level`、`importance`、`pinned`、
+/// `status`、`tags`、`project`、`superseded_by`、`schema_version`。
+///
+/// **为什么需要它**：cue 纪律（cue 是一句话检索线索、细节放指针，见
+/// [`CUE_WARN_CHARS`]）要能被执行，修正一条已写入的超长 cue 就不能以丢历史为代价。
+/// 在本命令之前，改 cue 只有两条路——`write --overwrite`（整条 `store::put` 覆盖）
+/// 与 `write` 新条 + `supersede` 旧条——**两条都会把 access_log 清零**，等于让
+/// 「守纪律」和「保住加固资产」二选一，结果就是没人改，长 cue 越积越多：2026-08-21
+/// 公共库里 cue 超 240 字符的 active 记忆有 19 条，最长 1370 字符。
+///
+/// 三个改写参数都不给则报错退出（避免一次无意义的读写）。新 cue 照常过
+/// [`warn_long_cue`] 的长度警告。
+fn run_reword(args: RewordArgs) -> ExitCode {
+    if args.cue.is_none() && args.pointer_reference.is_none() && args.pointer_detail.is_none() {
+        eprintln!(
+            "reword 失败：--cue / --pointer-reference / --pointer-detail 至少给一个，否则无事可做"
+        );
+        return ExitCode::FAILURE;
+    }
+    let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
+        return ExitCode::FAILURE;
+    };
+    let dbs = match DbSet::open(args.general_db, &project_dbs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let merged = match dbs.read_all() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(mut m) = merged.iter().find(|m| m.id == args.id).cloned() else {
+        eprintln!("reword 失败：未找到 id {}", args.id);
+        return ExitCode::FAILURE;
+    };
+
+    let old_cue_chars = m.cue.chars().count();
+    if let Some(c) = args.cue {
+        if c.trim().is_empty() {
+            eprintln!("reword 失败：--cue 不能为空白");
+            return ExitCode::FAILURE;
+        }
+        m.cue = c.to_string();
+    }
+    if let Some(r) = args.pointer_reference {
+        m.pointer.reference = Some(r.to_string());
+    }
+    if let Some(d) = args.pointer_detail {
+        m.pointer.detail = Some(d.to_string());
+    }
+
+    match dbs.route(m.project.as_deref()) {
+        Some(db) => {
+            if let Err(e) = store::put(db, &m) {
+                eprintln!("reword: 写回 {} 失败：{e}", args.id);
+                return ExitCode::FAILURE;
+            }
+        }
+        None => {
+            let pname = m.project.as_deref().unwrap_or("-");
+            eprintln!(
+                "reword 失败：{} 所属项目 {pname} 不在 --project-db 映射中",
+                args.id
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    warn_long_cue(&m.cue, m.level);
+    println!(
+        "reword: {} cue {} → {} 字符；使用历史 {} 次、created_at、层级 {} 与状态均保留",
+        args.id,
+        old_cue_chars,
+        m.cue.chars().count(),
+        m.access_log.len(),
+        level_repr(m.level)
+    );
+    ExitCode::SUCCESS
+}
+
 fn run_confirm_use(
     general_db: &Path,
     project_db_raw: &[String],
@@ -4337,7 +4489,7 @@ fn run_graduate(args: GraduateArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：对毕业后新通用记忆实际采用的 cue（--cue 覆盖或沿用源 cue）警告。
-    warn_long_cue(&graduated.cue);
+    warn_long_cue(&graduated.cue, graduated.level);
 
     println!(
         "graduate: {} ({:?}) → 毕业为通用记忆 {new_id} ({:?})；原记忆已转 superseded 留作已上浮指针",
@@ -4486,6 +4638,8 @@ fn run_merge(args: MergeArgs<'_>) -> ExitCode {
         batch.push(s);
     }
     let merged_count = batch.len();
+    // Level 是 Copy，在 merged_mem 被 move 进 batch 前留一份给下面的 cue 长度警告。
+    let merged_level = merged_mem.level;
     batch.push(merged_mem);
 
     if let Err(e) = store::put_many(db, &batch) {
@@ -4494,7 +4648,7 @@ fn run_merge(args: MergeArgs<'_>) -> ExitCode {
     }
 
     // cue 长度源头治理：合并生成的新 cue 同样受源头警告约束。
-    warn_long_cue(args.cue);
+    warn_long_cue(args.cue, merged_level);
 
     println!("merge: 新记忆 {new_id} 合并了 {merged_count} 条源（源已转 Tombstone）");
     ExitCode::SUCCESS

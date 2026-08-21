@@ -6800,3 +6800,91 @@ fn hot_index_injection_never_exceeds_host_context_limit() {
     let _ = std::fs::remove_dir_all(&ws);
     println!("注入体实测：项目作用域 {n_proj} 字符 / 管理目录作用域 {n_ws} 字符（上限 {HOST_CONTEXT_LIMIT}）");
 }
+
+// 56. reword：原地改 cue / 指针，**其余字段一律保留**。
+//     这条测试就是 reword 存在的理由：在它之前，改一条超长 cue 只有
+//     `write --overwrite`（整条覆盖）或 `write` 新条 + `supersede` 旧条两条路，
+//     两条都会把 access_log 清零——于是「守 cue 纪律」与「保住加固资产」二选一，
+//     结果是没人改，2026-08-21 公共库里 cue 超 240 字符的 active 记忆积到 19 条。
+//     故保留清单里的每一个字段都要逐条断言，任何一条丢了这个命令就失去意义。
+#[test]
+fn reword_rewrites_cue_but_preserves_use_history() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let mut original = make(
+        "rw_keep",
+        Level::L2,
+        None,
+        Status::Active,
+        0.66,
+        now - 5000.0,
+        vec![now - 900.0, now - 500.0, now - 100.0],
+    );
+    original.pinned = true;
+    original.tags = vec!["pitfall".to_string(), "windows".to_string()];
+    let general_path = seed_db("reword_g", std::slice::from_ref(&original));
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_subcommand_raw(
+        "reword",
+        &[
+            "--general-db",
+            &g,
+            "--id",
+            "rw_keep",
+            "--cue",
+            "一句话线索：Windows 路径坑",
+            "--pointer-detail",
+            "从 cue 里搬出来的细节正文",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "reword 应 exit 0，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = store::open(&general_path).expect("应能打开库");
+    let got = store::get(&db, "rw_keep")
+        .expect("读库应成功")
+        .expect("记忆应还在");
+
+    // 改动生效
+    assert_eq!(got.cue, "一句话线索：Windows 路径坑", "cue 应已改写");
+    assert_eq!(
+        got.pointer.detail.as_deref(),
+        Some("从 cue 里搬出来的细节正文"),
+        "细节应落进 pointer.detail"
+    );
+    // 保留清单——逐条守
+    assert_eq!(
+        got.access_log, original.access_log,
+        "使用历史必须原样保留（这是 reword 存在的全部理由）"
+    );
+    assert_eq!(got.created_at, original.created_at, "created_at 应保留");
+    assert_eq!(got.level, original.level, "层级应保留");
+    assert_eq!(got.importance, original.importance, "importance 应保留");
+    assert!(got.pinned, "pinned 应保留");
+    assert_eq!(got.status, original.status, "status 应保留");
+    assert_eq!(got.tags, original.tags, "tags 应保留");
+    assert_eq!(got.project, original.project, "project 应保留");
+    assert_eq!(
+        got.schema_version, original.schema_version,
+        "schema_version 应保留"
+    );
+    // 未给的字段不动：本次没传 --pointer-reference。
+    assert_eq!(
+        got.pointer.reference, original.pointer.reference,
+        "未给的指针字段不应被清空"
+    );
+
+    // 三个改写参数都不给 → 拒绝，且不产生写入。
+    let noop = run_subcommand_raw("reword", &["--general-db", &g, "--id", "rw_keep"]);
+    assert!(
+        !noop.status.success(),
+        "不给任何改写参数应失败，实得 stdout={}",
+        String::from_utf8_lossy(&noop.stdout)
+    );
+
+    cleanup_file(&general_path);
+}
