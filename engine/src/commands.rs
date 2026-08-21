@@ -6,7 +6,7 @@
 //! - [`parse_project_dbs`]：把可重复的 `--project-db name=path` 解析为名称→路径映射；
 //! - [`generate_id`]：无外部依赖（不引入 uuid/rand）的唯一 id 生成；
 //! - [`parse_tags`]：逗号分隔标签解析；
-//! - [`score_query`] / [`tokenize_query`]：recall 词法打分；
+//! - [`score_query`] / [`tokenize_query`]：recall 词法打分（中文二字 ngram 分词 + 归一化命中率）；
 //! - [`recall_candidates`]：把一批记忆按 query 打分、过滤、排序、截断；
 //! - [`list_visible`]：把一批记忆按 status/level/project 过滤后排序；
 //! - [`revived_level`]：confirm-use 复活冷记忆时的重入层（通用→L3 / 项目→L4.3）；
@@ -315,42 +315,112 @@ pub fn parse_tags(tags: Option<&str>) -> Vec<String> {
     }
 }
 
-/// 把 query 按空白分词并小写化，返回去重后的词列表。
+/// 判断一个字符是否属于**书写时不靠空格断词**的东亚文字。
 ///
-/// 用于 recall 打分：分词后逐词在记忆文本里做大小写不敏感子串匹配。
+/// 收录：CJK 基本区 / 扩展 A / 兼容表意文字 / 扩展 B，以及日文平假名与片假名。
+/// 刻意**不收**两类：CJK 标点（`U+3000..=U+303F`，如 `、。「」`）——它们应当
+/// 充当分隔符；韩文音节（`U+AC00..=U+D7AF`）——韩语本就用空格断词，走原有的
+/// 空白分词更准。
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF          // 日文平假名 / 片假名
+            | 0x3400..=0x4DBF    // CJK 扩展 A
+            | 0x4E00..=0x9FFF    // CJK 基本区
+            | 0xF900..=0xFAFF    // CJK 兼容表意文字
+            | 0x2_0000..=0x2_A6DF // CJK 扩展 B
+    )
+}
+
+/// 把一个**不含空白**的片段切成词元：CJK 段出二元 ngram，非 CJK 段原样保留。
+///
+/// 片段先按「是否 [`is_cjk`]」切成交替的连续段，再分别处理：
+/// - CJK 段长度 ≥ 2 → 逐个相邻二元组（`怎么办` → `怎么` / `么办`）；
+/// - CJK 段长度 = 1 → 取该字本身（如 `坑`），避免整段被丢掉；
+/// - 非 CJK 段 → 原样保留（`redb,` 仍是 `redb,`，与旧行为一致），但
+///   **不含任何字母数字**的纯标点段（如 `，` / `？`）直接丢弃——它们几乎命中
+///   所有中文 cue，只会污染打分。
+///
+/// 返回的词元均已小写化、未去重（去重在 [`tokenize_query`] 里做）。
+fn segment_field(field: &str) -> Vec<String> {
+    let chars: Vec<char> = field.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let cjk = is_cjk(chars[i]);
+        let start = i;
+        while i < chars.len() && is_cjk(chars[i]) == cjk {
+            i += 1;
+        }
+        let seg = &chars[start..i];
+        if cjk {
+            if seg.len() < 2 {
+                out.push(seg.iter().collect::<String>().to_lowercase());
+            } else {
+                for pair in seg.windows(2) {
+                    out.push(pair.iter().collect::<String>().to_lowercase());
+                }
+            }
+        } else if seg.iter().any(|c| c.is_alphanumeric()) {
+            out.push(seg.iter().collect::<String>().to_lowercase());
+        }
+    }
+    out
+}
+
+/// 把 query 分词、小写化，返回按首次出现序去重的词元列表。
+///
+/// 分词规则（recall 是纯词法子串匹配，故**只切 query、不切被匹配文本**）：
+/// 先按空白切片段，片段内再按 [`segment_field`] 切词元——**中文走二字 ngram、
+/// 英文仍按空白分词**。
+///
+/// 之所以必须给中文加 ngram：中文自然语句没有空白，旧的 `split_whitespace`
+/// 会把整句当成**一个**词去做子串匹配，几乎永远零命中（真实库实测「我是谁」
+/// 「海风哥的偏好」「热索引过长怎么办」三句全部 0 命中，而手工空格分词后的
+/// 「海风哥 偏好」却有 3 命中）。二元 ngram 是零依赖的通用兜底，与知识库
+/// sidecar 的 FTS `ngram(2,2)` 同策略。
 ///
 /// # 参数
 /// - `query`：原始查询串。
 pub fn tokenize_query(query: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
-    for w in query.split_whitespace() {
-        let lw = w.to_lowercase();
-        if !lw.is_empty() && !seen.contains(&lw) {
-            seen.push(lw);
+    for field in query.split_whitespace() {
+        for token in segment_field(field) {
+            if !token.is_empty() && !seen.contains(&token) {
+                seen.push(token);
+            }
         }
     }
     seen
 }
 
-/// 计算一条记忆对一组 query 词的命中分。
+/// 计算一条记忆对一组 query 词元的**归一化命中率**。
 ///
-/// 分数 = 在该记忆的 `cue + tags(空格连接)`（统一小写）里，
-/// **命中的不同 query 词数**（大小写不敏感子串匹配）。词已由
-/// [`tokenize_query`] 去重，故每词至多贡献 1 分。
+/// 分数 = 在该记忆的 `cue + tags(空格连接)`（统一小写）里命中的**不同词元数**
+/// ÷ **query 词元总数**，落在 `[0.0, 1.0]`（大小写不敏感子串匹配）。词元已由
+/// [`tokenize_query`] 去重，故每个词元至多贡献一次；`tokens` 为空时恒为 `0.0`。
+///
+/// 归一化是为了让分数**跨 query 可比**：二字 ngram 让长 query 天然拥有更多词元，
+/// 若沿用「命中词数」这种绝对计数，长 query 的候选会仅凭词元多而虚高。注意
+/// **同一次 query 内分母是常数**，故归一化只改变分数量纲、不改变排序。
 ///
 /// # 参数
 /// - `m`：被打分的记忆。
-/// - `tokens`：已分词、已小写、已去重的 query 词。
-pub fn score_query(m: &Memory, tokens: &[String]) -> usize {
+/// - `tokens`：已由 [`tokenize_query`] 分词、小写、去重的 query 词元。
+pub fn score_query(m: &Memory, tokens: &[String]) -> f64 {
+    if tokens.is_empty() {
+        return 0.0;
+    }
     let mut haystack = m.cue.to_lowercase();
     if !m.tags.is_empty() {
         haystack.push(' ');
         haystack.push_str(&m.tags.join(" ").to_lowercase());
     }
-    tokens
+    let hits = tokens
         .iter()
         .filter(|t| haystack.contains(t.as_str()))
-        .count()
+        .count();
+    hits as f64 / tokens.len() as f64
 }
 
 /// 一条 recall 候选：记忆引用 + 算出的分数与 effective。
@@ -358,8 +428,8 @@ pub fn score_query(m: &Memory, tokens: &[String]) -> usize {
 pub struct Candidate<'a> {
     /// 命中的记忆。
     pub memory: &'a Memory,
-    /// 命中的不同 query 词数。
-    pub score: usize,
+    /// 归一化命中率（命中词元数 ÷ query 词元总数），落在 `(0.0, 1.0]`。
+    pub score: f64,
     /// 该记忆在 `now` 时刻的 effective（用于同分排序）。
     pub effective: f64,
 }
@@ -378,14 +448,14 @@ fn recallable(status: Status, active_only: bool) -> bool {
 
 /// 在一批记忆里按 query 检索候选：过滤状态 → 打分 → 去零分 → 排序 → 截断。
 ///
-/// 排序规则：先按 `score` 降序，同分再按 `effective(now)` 降序。
-/// `score == 0`（一个 query 词都没命中）的记忆不进候选。
+/// 排序规则：先按 `score`（[`score_query`] 的归一化命中率）降序，同分再按
+/// `effective(now)` 降序。`score` 为 0（一个 query 词元都没命中）的记忆不进候选。
 ///
 /// 本函数**不修改任何记忆、不做任何 IO**。
 ///
 /// # 参数
 /// - `mems`：候选记忆集合（通常是 general+project 合并集）。
-/// - `tokens`：已由 [`tokenize_query`] 处理的 query 词。
+/// - `tokens`：已由 [`tokenize_query`] 处理的 query 词元。
 /// - `active_only`：为真时只搜 active；否则 active+cold 都搜。
 /// - `limit`：最多返回的候选数。
 /// - `now`：当前时间（unix 秒）。
@@ -401,7 +471,7 @@ pub fn recall_candidates<'a>(
         .filter(|m| recallable(m.status, active_only))
         .filter_map(|m| {
             let score = score_query(m, tokens);
-            if score == 0 {
+            if score <= 0.0 {
                 None
             } else {
                 Some(Candidate {
@@ -415,11 +485,14 @@ pub fn recall_candidates<'a>(
 
     // 先 score 降序，同分按 effective 降序；NaN（不会出现）视作相等。
     cands.sort_by(|a, b| {
-        b.score.cmp(&a.score).then_with(|| {
-            b.effective
-                .partial_cmp(&a.effective)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.effective
+                    .partial_cmp(&a.effective)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     cands.truncate(limit);
     cands
@@ -1259,12 +1332,55 @@ mod tests {
     }
 
     #[test]
-    fn score_counts_distinct_hits() {
+    fn tokenize_cjk_into_bigrams() {
+        // 纯中文自然句：整句切二字 ngram（旧行为是整句一个词、几乎必然零命中）。
+        assert_eq!(
+            tokenize_query("热索引过长怎么办"),
+            vec!["热索", "索引", "引过", "过长", "长怎", "怎么", "么办"]
+        );
+        // 中英混排：非 CJK 段原样保留，单字中文段取该字本身，纯标点段丢弃。
+        assert_eq!(
+            tokenize_query("engram的坑，怎么办？"),
+            vec!["engram", "的坑", "怎么", "么办"]
+        );
+        assert_eq!(
+            tokenize_query("windows 路径 坑"),
+            vec!["windows", "路径", "坑"]
+        );
+        // 纯标点 / 纯空白不产生任何词元（不会因此命中全库）。
+        assert!(tokenize_query("，。？").is_empty());
+        assert!(tokenize_query("   ").is_empty());
+    }
+
+    #[test]
+    fn score_is_normalized_hit_rate() {
         let mut m = mem("x", Level::L3, None, Status::Active, "redb 文件锁问题");
         m.tags = vec!["lock".to_string()];
-        // query: "redb lock missing" → 命中 redb（cue）、lock（tag）= 2。
+        // query: "redb lock missing" → 3 词元，命中 redb（cue）、lock（tag）= 2/3。
         let tokens = tokenize_query("redb lock missing");
-        assert_eq!(score_query(&m, &tokens), 2);
+        let score = score_query(&m, &tokens);
+        assert!(
+            (score - 2.0 / 3.0).abs() < 1e-12,
+            "应为归一化命中率 2/3，实得 {score}"
+        );
+        // 空 query（如全是标点）不得给出正分。
+        assert!(score_query(&m, &tokenize_query("，。")).abs() < 1e-12);
+    }
+
+    #[test]
+    fn score_cjk_sentence_hits_by_bigram() {
+        let m = mem(
+            "p",
+            Level::L3,
+            None,
+            Status::Active,
+            "海风哥的协作偏好：被工具拦住时先停下请他开权限",
+        );
+        // "海风哥的偏好" → 海风/风哥/哥的/的偏/偏好 共 5 词元，cue 命中 4 个（缺 的偏）。
+        let tokens = tokenize_query("海风哥的偏好");
+        assert_eq!(tokens.len(), 5);
+        let score = score_query(&m, &tokens);
+        assert!((score - 0.8).abs() < 1e-12, "应命中 4/5，实得 {score}");
     }
 
     #[test]
@@ -1278,7 +1394,11 @@ mod tests {
         let cands = recall_candidates(&mems, &tokens, false, 10, now);
         assert_eq!(cands.len(), 2, "命中 2 条，miss 不进候选");
         assert_eq!(cands[0].memory.id, "a", "命中词多者排前");
-        assert_eq!(cands[0].score, 2);
+        assert!(
+            (cands[0].score - 1.0).abs() < 1e-12,
+            "两词元全中应为 1.0，实得 {}",
+            cands[0].score
+        );
         assert_eq!(cands[1].memory.id, "b");
     }
 

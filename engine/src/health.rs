@@ -45,7 +45,12 @@ pub const FUTURE_SKEW_SECS: f64 = 60.0;
 /// `doctor` / `migrate` 用来标识「通用作用域」的作用域标签（区别于具体项目名）。
 pub const GENERAL_SCOPE_LABEL: &str = "(general)";
 
-/// 一层「常驻字符累计超出该层字符预算」的报告项（容量治理视角）。
+/// 一层「Active 条目渲染字符累计超出该层字符预算」的报告项（容量治理视角）。
+///
+/// 解读按层分流（见 [`crate::model::TierParams::char_budget`]）：常驻层
+/// （L1/L2/L4.1/L4.2）超标意味着**注入体量超配额**，下次 consolidate 会把
+/// 超出者下推；按需层（L3/L4.3）正文本就不进注入，超标意味着**底层 Active
+/// 留存超边界**，下次 consolidate 会把超出者转 `Cold`（此后只能显式 recall）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverBudgetLayer {
     /// 作用域标签：[`GENERAL_SCOPE_LABEL`] 或项目名。
@@ -421,7 +426,7 @@ mod tests {
     fn detects_over_budget_layer() {
         let now = 1_000_000_000.0;
         let mut big = make("big", Level::L2, Status::Active, 0.6);
-        big.cue = "字".repeat(8000); // 远超 L2 char_budget=6000
+        big.cue = "字".repeat(8000); // 远超 L2 char_budget（无论怎么整定）
         let rep = scan(&[big], &EngramConfig::default(), now);
         assert_eq!(rep.over_budget_layers.len(), 1);
         assert_eq!(rep.over_budget_layers[0].level, Level::L2);

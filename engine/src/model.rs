@@ -207,25 +207,44 @@ pub struct Memory {
 pub struct TierParams {
     /// 该层容量上限（条目数）。
     pub capacity: usize,
-    /// 该层字符预算：本层全部常驻条目的**累计渲染字符数**上限（计量单位见
+    /// 该层字符预算：本层 Active 条目的**累计渲染字符数**上限（计量单位见
     /// [`crate::render::memory_render_cost`]，即热索引渲染行的 `char` 数；
     /// 换算参考：中文约 1.5~2 字符/token，英文约 4 字符/token）。
     ///
-    /// 与 `capacity` 构成**双约束**：consolidate 溢出步按保留优先序取前缀，
-    /// 直到「条数 ≤ capacity 且 累计渲染字符 ≤ char_budget」双满足，先触发者
-    /// 生效；每层至少保留 1 条（防饿死）。`0` 表示不设字符预算（仅条数约束）。
+    /// 与 `capacity` 构成**双约束**：consolidate 溢出步按保留优先序**装箱**
+    /// （首次适应——装不下的跳过、继续试后面的），直到「条数 ≤ capacity 且
+    /// 累计渲染字符 ≤ char_budget」双满足；每层至少保留 1 条（防饿死）。
+    /// `0` 表示不设字符预算（仅条数约束）。装箱而非取前缀，是为了不让一条撑爆
+    /// 预算的长记忆把排在它后面的短记忆一并挤掉（见 `consolidate::step_overflow`）。
     ///
-    /// **分工**：容量治理管根源——consolidate 把每层常驻记忆的注入体量钳在
-    /// 预算内，超出者级联下推/转 Cold（状态真的改变）；渲染预算
-    /// [`crate::render::HOT_INDEX_CHAR_BUDGET`]（24000 字符）是保险丝——只截
-    /// 显示、不动状态，仅在复盘者停摆、堆积未及巩固时兜底。
+    /// # 两种语义，按 `resident` 分流
     ///
-    /// **默认值推导**（见 [`EngramConfig::default`]）：L1=2000 / L2=6000 /
-    /// L3=4000 / L4.1=2000 / L4.2=5000 / L4.3=3000，合计 22000 字符
-    /// ≈ 8k~14k token，略低于渲染兜底预算 24000——正常状态下保险丝永不熔断。
-    /// 记忆功能是要省 token 的：条数上限从此只是理论天花板，实际常驻规模由
-    /// 字符预算按 token 治理（如 L3 名义 150 条，按典型 cue 行 60~90 字符
-    /// 实际约容 45~65 条；L4.3 名义 200 条，实际约容 35~50 条）。
+    /// 自「宿主 additionalContext 有 10000 字符硬上限」定案（见
+    /// [`crate::render::HOT_INDEX_CHAR_BUDGET`]）后，本字段对两类层含义**不同**，
+    /// 读它之前必须先看 `resident`：
+    ///
+    /// - **常驻层**（`resident = true`，即 L1/L2/L4.1/L4.2）——**token 治理**。
+    ///   这些层的正文逐行进注入，预算即该层能占用的注入配额；四层合计
+    ///   （1200 + 3600 + 700 + 2500 = 8000）加渲染固定开销后必须留在渲染保险丝
+    ///   [`crate::render::HOT_INDEX_CHAR_BUDGET`] 之内，进而不越宿主硬上限——
+    ///   这条链由测试 `char_budget_defaults_fit_host_context_limit` 钉死。
+    /// - **按需层**（`resident = false`，即 L3/L4.3）——**Active/Cold 边界治理**。
+    ///   这些层在热索引里只出一行目录、正文一个字都不注入，其预算因此**不再
+    ///   消耗任何注入 token**；它治的是「多少条底层记忆留在 Active 热层（继续
+    ///   参与升降级、被 recall 优先命中），多少条被挤成 Cold」。放大它只让底层
+    ///   留得更久，不会让注入变大——故其取值（L3=12000 / L4.3=9000）**刻意**
+    ///   远高于常驻层：底层是 recall 的检索面，过早转 Cold 等于自断检索面。
+    ///
+    /// **与保险丝的分工**：容量治理管根源（consolidate 真改状态：级联下推 /
+    /// 转 Cold）；渲染预算 [`crate::render::HOT_INDEX_CHAR_BUDGET`] 只截显示、
+    /// 不动状态，仅在复盘者停摆、堆积未及巩固时兜底。
+    ///
+    /// **默认值**（见 [`EngramConfig::default`]）：L1=1200 / L2=3600 /
+    /// L3=12000 / L4.1=700 / L4.2=2500 / L4.3=9000。条数上限只是理论天花板，
+    /// 实际规模由字符预算定：按典型 cue 行 60~90 字符，L3 名义 150 条实际约容
+    /// 130~150 条、L4.3 名义 200 条实际约容 100~140 条；数百字符一行的长 cue
+    /// 会让实际容量骤降到十几条——这正是 cue 长度源头治理（`main.rs` 的
+    /// `CUE_WARN_CHARS`）的动机。
     pub char_budget: usize,
     /// 衰减率 d，越大衰减越快。
     pub d: f64,
@@ -233,6 +252,20 @@ pub struct TierParams {
     pub floor: f64,
     /// 是否全文常驻（`true` 显示细节，`false` 仅显示 cue）。
     pub load_full: bool,
+    /// 是否**常驻热索引正文**（`true` 逐条渲进注入；`false` 只渲一行目录）。
+    ///
+    /// 与 `load_full`（**详略**：这一行显示什么）正交——本字段管的是**在不在**：
+    /// `resident = false` 的层（L3/L4.3）在热索引里只留一行
+    /// 「按需层目录 + 检索指引」，正文一个字都不注入，须由 agent 显式
+    /// `engram recall` 取回。设此轴的唯一目的，是把常驻注入压进宿主
+    /// additionalContext 的硬上限（见 [`crate::render::HOT_INDEX_CHAR_BUDGET`]），
+    /// 同时不牺牲底层的 Active 留存量（见 `char_budget` 的「两种语义」一节）。
+    ///
+    /// **纪律**：当前六层里 `resident` 与 `load_full` 恰好同真同假，这是**巧合
+    /// 而非同义**。二者是独立两轴（「进不进注入」×「进了显示多详」），将来完全
+    /// 可能出现 `resident = true, load_full = false` 的「只注入 cue 的常驻层」。
+    /// 判定「要不要渲进注入」请一律读本字段，**禁止**复用 `load_full` 代替。
+    pub resident: bool,
 }
 
 /// 全部可整定参数的运行时配置（设计文档 §14 #1 列的待整定项汇成一处）。
@@ -309,49 +342,61 @@ impl Default for EngramConfig {
     /// 历来硬编码的实测候选值（设计文档 §14 列为待整定项，此处取本指令给定值）。
     fn default() -> Self {
         EngramConfig {
-            // char_budget 默认值合计 22000 字符 ≈ 8k~14k token（推导与分工见
-            // TierParams::char_budget 的 rustdoc），与渲染兜底预算 24000 对齐。
+            // char_budget 默认值分两种语义（推导见 TierParams::char_budget 与
+            // TierParams::resident 的 rustdoc）：
+            // - 常驻四层 L1/L2/L4.1/L4.2 = 注入配额，合计
+            //   1200+3600+700+2500 = 8000 字符；加渲染固定开销后须留在渲染
+            //   保险丝 HOT_INDEX_CHAR_BUDGET(9600) 内，进而不越宿主 10000 硬上限。
+            // - 按需两层 L3/L4.3 = Active/Cold 边界，正文不进注入、不花 token，
+            //   故取值（12000 / 9000）刻意远大于常驻层：只影响底层留在 Active
+            //   多久，是 recall 的检索面，收紧它等于自断检索面。
             l1: TierParams {
                 capacity: 7,
-                char_budget: 2000,
+                char_budget: 1200,
                 d: 0.10,
                 floor: 4.5,
                 load_full: true,
+                resident: true,
             },
             l2: TierParams {
                 capacity: 30,
-                char_budget: 6000,
+                char_budget: 3600,
                 d: 0.25,
                 floor: 1.0,
                 load_full: true,
+                resident: true,
             },
             l3: TierParams {
                 capacity: 150,
-                char_budget: 4000,
+                char_budget: 12000,
                 d: 0.50,
                 floor: -10.0,
                 load_full: false,
+                resident: false,
             },
             l4_1: TierParams {
                 capacity: 10,
-                char_budget: 2000,
+                char_budget: 700,
                 d: 0.15,
                 floor: 3.0,
                 load_full: true,
+                resident: true,
             },
             l4_2: TierParams {
                 capacity: 50,
-                char_budget: 5000,
+                char_budget: 2500,
                 d: 0.30,
                 floor: 0.5,
                 load_full: true,
+                resident: true,
             },
             l4_3: TierParams {
                 capacity: 200,
-                char_budget: 3000,
+                char_budget: 9000,
                 d: 0.50,
                 floor: -10.0,
                 load_full: false,
+                resident: false,
             },
             promote_l2: PROMOTE_L2,
             promote_l1: PROMOTE_L1,
@@ -370,7 +415,8 @@ impl Default for EngramConfig {
 }
 
 impl EngramConfig {
-    /// 取指定层级的 [`TierParams`]（容量 / 字符预算 / d / floor / 加载详略）。
+    /// 取指定层级的 [`TierParams`]（容量 / 字符预算 / d / floor / 加载详略 /
+    /// 是否常驻注入）。
     pub fn tier(&self, level: Level) -> TierParams {
         match level {
             Level::L1 => self.l1,
@@ -457,15 +503,17 @@ mod tests {
     fn params_values() {
         let p = params(Level::L1);
         assert_eq!(p.capacity, 7);
-        assert_eq!(p.char_budget, 2000);
+        assert_eq!(p.char_budget, 1200);
         assert!((p.d - 0.10).abs() < 1e-12);
         assert!((p.floor - 4.5).abs() < 1e-12);
         assert!(p.load_full);
+        assert!(p.resident, "L1 是常驻层，正文逐条进热索引");
 
         let p3 = params(Level::L3);
         assert_eq!(p3.capacity, 150);
-        assert_eq!(p3.char_budget, 4000);
+        assert_eq!(p3.char_budget, 12000);
         assert!(!p3.load_full);
+        assert!(!p3.resident, "L3 是按需层，热索引里只出一行目录");
     }
 
     #[test]
@@ -497,19 +545,60 @@ mod tests {
     }
 
     #[test]
-    fn char_budget_defaults_align_with_render_fuse() {
-        // 各层字符预算合计 22000，须低于渲染兜底预算 24000（容量治理管根源、
-        // 渲染预算是保险丝——正常状态下保险丝永不熔断）。
+    fn char_budget_defaults_fit_host_context_limit() {
+        // 宿主（Claude Code）对 hook 返回的 additionalContext 有 **10000 字符硬
+        // 上限**：这是宿主二进制内的编译期常量，无任何配置项可覆盖。超出后整段
+        // additionalContext 被落盘、真正进上下文的只剩前 2000 字符——即注入被
+        // 静默截断。它是本系统全部字符预算的最终外部约束，故在此显式常量化。
+        const HOST_ADDITIONAL_CONTEXT_LIMIT: usize = 10_000;
+        // 前言额度：main.rs 的 PREAMBLE（内联检索协议）与管理目录提示行由
+        // main.rs 打印在 render_budgeted 输出**之外**，不受 HOT_INDEX_CHAR_BUDGET
+        // 约束，却照样计入 additionalContext，故必须在此为它们留额度。
+        const HOOK_PREAMBLE_RESERVE: usize = 400;
+        // 渲染固定开销：热索引标题行、各层节标题（通用 3 节 + 每项目 3 节）、
+        // 按需层目录与主题词表片段、预算截断提示行——正文之外的那部分。
+        const RENDER_FIXED_OVERHEAD_RESERVE: usize = 1_600;
+
         let cfg = EngramConfig::default();
-        let total: usize = [cfg.l1, cfg.l2, cfg.l3, cfg.l4_1, cfg.l4_2, cfg.l4_3]
+        let all = [cfg.l1, cfg.l2, cfg.l3, cfg.l4_1, cfg.l4_2, cfg.l4_3];
+        let fuse = crate::render::HOT_INDEX_CHAR_BUDGET;
+
+        // ① 只有常驻层（resident=true）占注入额度。按需层（L3/L4.3）正文不进
+        //    热索引，其 char_budget 治的是 Active/Cold 边界，与注入量无关，不计入。
+        let resident_total: usize = all
             .iter()
+            .filter(|t| t.resident)
             .map(|t| t.char_budget)
             .sum();
-        assert_eq!(total, 22000, "各层默认字符预算合计应为 22000");
-        assert!(
-            total < crate::render::HOT_INDEX_CHAR_BUDGET,
-            "容量治理预算合计（{total}）应低于渲染兜底预算（{}）",
-            crate::render::HOT_INDEX_CHAR_BUDGET
+        assert_eq!(
+            resident_total, 8000,
+            "常驻四层（L1/L2/L4.1/L4.2）字符预算合计应为 8000"
         );
+
+        // ② 常驻额度 + 渲染固定开销 ≤ 渲染保险丝：保险丝在正常状态下永不熔断。
+        assert!(
+            resident_total + RENDER_FIXED_OVERHEAD_RESERVE <= fuse,
+            "常驻预算合计（{resident_total}）+ 渲染固定开销（{RENDER_FIXED_OVERHEAD_RESERVE}）应不超过渲染保险丝（{fuse}）"
+        );
+
+        // ③ 渲染保险丝 + 前言额度 ≤ 宿主硬上限——这一条才是「注入不会被宿主
+        //    静默截断」的最终保证。链条上任一环放宽，热索引都会重新掉回
+        //    「落盘 + 只留前 2000 字符」的路径，注入形同虚设。
+        assert!(
+            fuse + HOOK_PREAMBLE_RESERVE <= HOST_ADDITIONAL_CONTEXT_LIMIT,
+            "渲染保险丝（{fuse}）+ 前言额度（{HOOK_PREAMBLE_RESERVE}）应不超过宿主硬上限（{HOST_ADDITIONAL_CONTEXT_LIMIT}）"
+        );
+
+        // ④ 按需层预算**故意**高于常驻层：它不花注入 token，只决定底层记忆留在
+        //    Active（可被 recall 优先命中）多久。若将来有人「顺手把 L3 也调小以
+        //    省 token」，这条会拦下——省错了地方，那只会砍掉 recall 的检索面。
+        for t in [cfg.l3, cfg.l4_3] {
+            assert!(!t.resident, "L3/L4.3 应为按需层（resident=false）");
+            assert!(
+                t.char_budget > resident_total / 4,
+                "按需层预算（{}）不应被按常驻层的量级收紧",
+                t.char_budget
+            );
+        }
     }
 }

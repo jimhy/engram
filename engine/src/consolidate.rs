@@ -18,8 +18,12 @@
 //!   见 [`EngramConfig::importance_gate`]。
 //! - **迟滞**：升级阈值明显高于降级阈值，中间留死区，杜绝边界乒乓。
 //! - **容量双约束**：溢出下推同时受「条数 ≤ capacity」与「累计渲染字符 ≤
-//!   char_budget」约束，先触发者生效（token 治理管根源，渲染预算只是保险丝）。
-//!   计量与热索引渲染行同源（[`crate::render::memory_render_cost`]）。
+//!   char_budget」约束，先触发者生效；计量与热索引渲染行同源
+//!   （[`crate::render::memory_render_cost`]）。**预算含义按层分流**：常驻层
+//!   （L1/L2/L4.1/L4.2）是 token 治理（管注入配额，渲染预算只是保险丝）；
+//!   按需层（L3/L4.3，`resident = false`）正文根本不进注入，其预算治的是
+//!   **Active/Cold 边界**——留多少条在热层供 recall 命中。详见
+//!   [`crate::model::TierParams::char_budget`]。
 //! - **逐级**：一次最多移动一层。
 //! - **只处理 `status == Active` 的记忆**；Cold/Superseded/Tombstone 一律不动。
 
@@ -237,12 +241,24 @@ fn scope_key(m: &Memory) -> ScopeKey {
 /// 双满足，**先触发者生效**；其余**下推一层**。下推可能令下一层再超约束，
 /// 故自上而下处理使其传播。从底层（L3/L4.3）挤出的记忆转 `status = Cold`。
 ///
-/// **字符预算**（token 治理，见 [`crate::model::TierParams::char_budget`]）：
-/// 每条的成本用 [`memory_render_cost`] 计量——与热索引渲染行逐字节同源，
-/// 全系统唯一计数。`char_budget = 0` 表示不设预算（仅条数约束）。
+/// **字符预算**（见 [`crate::model::TierParams::char_budget`]）：每条的成本用
+/// [`memory_render_cost`] 计量——与热索引渲染行逐字节同源，全系统唯一计数。
+/// `char_budget = 0` 表示不设预算（仅条数约束）。**预算的含义按层分流**：
+/// 常驻层（`resident = true`：L1/L2/L4.1/L4.2）的预算是**注入配额**，钳它就是
+/// 省 token；按需层（`resident = false`：L3/L4.3）的正文不进热索引，钳它省不到
+/// 任何 token，钳的是 **Active/Cold 边界**——被挤出底层的记忆直接转 `Cold`，
+/// 从此只能被显式 recall 搜到、不再参与升降级。故按需层预算取值远高于常驻层：
+/// 底层是 recall 的检索面，收紧它等于自断检索面，而非省 token。
 /// **每层至少保留 1 条**：保留优先序首条即便单独超预算也保留，防止长 cue
 /// 把整层饿死。pinned 恒排最前（effective=INF），自然优先占预算——这是正确
 /// 行为：用户显式置顶的记忆理应最后才被字符预算挤出。
+///
+/// **字符预算按「首次适应装箱」执行，不是取保留前缀**：按下面的优先序逐条尝试，
+/// 装不下的跳过（下推）、继续试后面的条目，故保留集不一定是优先序的前缀。这样
+/// 一条撑爆预算的长记忆只淘汰它自己，不会连坐排在它后面、只要十几个字符的高价值
+/// 短记忆——取前缀语义下曾把一条 11 字符、importance 0.85 的全局铁律从 L1 一路
+/// 挤到 L3，而同层一条 583 字符的条目安然无恙。副作用是「写长 cue」的成本回到了
+/// 写它的那条记忆头上，与 SKILL 里「cue 要写成线索」的纪律同向。
 ///
 /// **保留优先序（文档化的平局规则）**：显式比较链
 /// 1. `effective` 降序（主判据）；
@@ -332,24 +348,37 @@ fn step_overflow(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
-            // 取保留前缀：直到「条数 ≤ capacity 且 累计渲染字符 ≤ char_budget」
-            // 双满足，先触发者生效。首条无条件保留（每层至少 1 条，防饿死）；
-            // pinned 经排序恒在最前，自然优先占预算（见本函数 rustdoc）。
+            // 选保留集：按上面的保留优先序逐条尝试装箱（首次适应），直到「条数 ≤ capacity
+            // 且 累计渲染字符 ≤ char_budget」双满足。装不下的**跳过**（下推），继续看后面
+            // 的条目能否装下。首条无条件保留（每层至少 1 条，防饿死）；pinned 经排序恒在
+            // 最前，仍优先占预算（见本函数 rustdoc）。
+            //
+            // **为什么是装箱而不是取前缀**：前缀语义下，一条撑爆预算的长记忆会把排在它后面
+            // 的条目一并挤掉，哪怕那些只要十几个字符——高价值短记忆被低价值长记忆挡住，与
+            // 预算治理的本意相反。2026-08-21 实测现场：L1 里一条 1082 字符的记忆，把
+            // 「所有文档一律用中文编写」（cue 仅 11 字符、importance 0.85）一路挤到 L3，
+            // 而排序更靠前的 583 字符条目安然留下。装箱下短条目可以搭便车，长条目自己承担
+            // 被下推的代价——这也顺带把「写长 cue」的成本还给写它的人。
+            let mut keep = vec![false; idxs.len()];
             let mut kept = 0usize;
             let mut cost_acc = 0usize;
-            for &i in idxs.iter() {
+            for (slot, &i) in idxs.iter().enumerate() {
                 if kept >= capacity {
                     break;
                 }
                 let cost = memory_render_cost(&memories[i], tier.load_full);
                 if kept > 0 && char_budget > 0 && cost_acc + cost > char_budget {
-                    break;
+                    continue;
                 }
                 cost_acc += cost;
                 kept += 1;
+                keep[slot] = true;
             }
-            // 前 kept 条保留，其余下推。
-            for &i in idxs.iter().skip(kept) {
+            // 没被装进保留集的下推。
+            for (slot, &i) in idxs.iter().enumerate() {
+                if keep[slot] {
+                    continue;
+                }
                 let from = memories[i].level;
                 match level_down(from) {
                     Some(to) => {
@@ -1015,13 +1044,15 @@ mod tests {
     }
 
     // 18. 字符预算触发下推：L2 仅 3 条（条数远未满 capacity=30），但每条 cue
-    //     约 2500 字符，累计渲染字符超出 L2 char_budget=6000 → 保留优先序前
-    //     2 条（effective 较高者）留下，最低 effective 者被挤到 L3。
+    //     长到累计渲染字符超出 L2 char_budget → 保留优先序前 2 条（effective
+    //     较高者）留下，最低 effective 者被挤到 L3。
     #[test]
     fn overflow_char_budget_pushes_down_despite_count_ok() {
         let now = 1_000_000_000.0;
         let p2 = params(Level::L2);
-        let long_cue = "记".repeat(2500);
+        // cue 长度按预算推导（B/2 − 100），不写死数字：构造保证 2 条累计 ≤ B、
+        // 3 条累计 > B，改整定值也不会误伤本题（与 tuning INV-20 同一构造）。
+        let long_cue = "记".repeat((p2.char_budget / 2).saturating_sub(100).max(50));
         let mut mems = Vec::new();
         // importance 3.0/2.9/2.8 拉开 effective 排序；近期访问保证不触发阈值
         // 降级，也不够格升 L1（虚拟视界下 promotion_score < 5.0）。
@@ -1066,8 +1097,8 @@ mod tests {
     }
 
     // 19. 条数触发（预算未满）——既有行为回归：8 条短 cue L1（cap=7、累计
-    //     字符远低于 char_budget=2000）→ 双约束里条数先触发，行为与纯条数
-    //     约束时代完全一致：恰好挤出 effective 最低的 1 条。
+    //     字符约 320，远低于 char_budget=1200）→ 双约束里条数先触发，行为与
+    //     纯条数约束时代完全一致：恰好挤出 effective 最低的 1 条。
     #[test]
     fn overflow_count_triggers_when_budget_unfilled() {
         let now = 1_000_000_000.0;
@@ -1102,13 +1133,14 @@ mod tests {
         assert!(find(&ts, "s7", TransitionKind::Overflow).is_some());
     }
 
-    // 20. 首条超预算仍保留（每层至少 1 条，防饿死）：单条 cue 7000 字符的 L2
-    //     远超 char_budget=6000，但作为保留优先序首条必须留下；再加一条短 cue
-    //     次条时，预算已被首条吃穿，次条被挤出。
+    // 20. 首条超预算仍保留（每层至少 1 条，防饿死）：单条 cue 超出 L2
+    //     char_budget（按预算推导为 B+500 字符）的记忆，作为保留优先序首条
+    //     必须留下；再加一条短 cue 次条时，预算已被首条吃穿，次条被挤出。
     #[test]
     fn overflow_keeps_first_even_over_budget() {
         let now = 1_000_000_000.0;
-        let huge = "忆".repeat(7000);
+        // 按预算推导，不写死数字（与 tuning INV-20 (b) 同构）。
+        let huge = "忆".repeat(params(Level::L2).char_budget + 500);
         // 场景 A：单条超预算 → 仍保留，不产生任何变迁。
         let mut solo_m = make("h0", Level::L2, 3.0, now - 1.0 * DAY, vec![now - 0.5 * DAY]);
         solo_m.cue = huge.clone();
@@ -1140,16 +1172,19 @@ mod tests {
         assert!(find(&ts_b, "h2", TransitionKind::Overflow).is_some());
     }
 
-    // 21. pinned 优先占预算：L1 里 pinned 长 cue（≈1985 字符，接近吃满
-    //     char_budget=2000）+ 一条高 importance 的普通短 cue → pinned 恒排
-    //     最前（effective=INF）自然先占预算，普通条目被字符预算挤到 L2。
+    // 21. pinned 优先占预算：L1 里 pinned 长 cue（按预算推导为 B−50 字符，
+    //     接近吃满 L1 char_budget）+ 一条高 importance 的普通短 cue → pinned
+    //     恒排最前（effective=INF）自然先占预算，普通条目被字符预算挤到 L2。
     //     这是正确行为：用户显式置顶的记忆理应最后才被预算挤出。
     #[test]
     fn overflow_char_budget_pinned_takes_priority() {
         let now = 1_000_000_000.0;
+        // 预算在前、cue 长度由它推导：渲染行固定开销约 35 字符，故 B−50 的 cue
+        // 恒在预算内、再加任一短 cue 必超预算——改整定值也不会误伤本题。
+        let budget = params(Level::L1).char_budget;
         let mut p = make("pin", Level::L1, 0.0, now - 100.0 * DAY, vec![]);
         p.pinned = true;
-        p.cue = "钉".repeat(1950);
+        p.cue = "钉".repeat(budget.saturating_sub(50).max(50));
         let n = make(
             "norm",
             Level::L1,
@@ -1158,7 +1193,6 @@ mod tests {
             vec![now - 0.5 * DAY],
         );
         // 前置：pinned 单条在预算内，加上普通条即超。
-        let budget = params(Level::L1).char_budget;
         let c_p = memory_render_cost(&p, true);
         let c_n = memory_render_cost(&n, true);
         assert!(
@@ -1179,6 +1213,67 @@ mod tests {
         assert!(
             find(&ts, "norm", TransitionKind::Overflow).is_some(),
             "norm 应有 Overflow 变迁"
+        );
+    }
+
+    // 字符预算按「首次适应装箱」执行，不是取保留前缀：一条撑爆预算的长记忆只淘汰它
+    // 自己，排在它后面、装得下的短记忆必须留下。
+    //
+    // 这条测试是有来历的：取前缀语义下，L1 里一条 1082 字符的记忆把「所有文档一律用
+    // 中文编写」（cue 仅 11 字符、importance 0.85）连坐挤到 L3，而排序更靠前的 583
+    // 字符条目安然无恙。改成装箱时全套测试一条都没红——说明这个行为差异当时无人覆盖，
+    // 故补此测试，防止有人日后把 continue 改回 break 而无人察觉。
+    #[test]
+    fn overflow_char_budget_packs_instead_of_truncating_prefix() {
+        let now = 1_000_000_000.0;
+        let mut cfg = EngramConfig::default();
+        // 只测字符预算这一维：把条数上限放宽，避免 capacity 先触发。
+        cfg.l1.capacity = 10;
+        cfg.l1.char_budget = 1200;
+
+        // cue = "cue-{id}"，故用 id 长度控制渲染开销。importance 降序 ⇒ 保留优先序即 a→b→c。
+        let long_a = "a".repeat(560);
+        let long_b = "b".repeat(660);
+        let mut mems = vec![
+            make(&long_a, Level::L1, 0.9, now, vec![now]),
+            make(&long_b, Level::L1, 0.8, now, vec![now]),
+            make("c", Level::L1, 0.7, now, vec![now]),
+        ];
+        // 前置断言：a 装得下、a+b 超预算、a+c 装得下——否则本测试测不到装箱与前缀的差异。
+        let cost = |m: &Memory| memory_render_cost(m, cfg.l1.load_full);
+        let (ca, cb, cc) = (cost(&mems[0]), cost(&mems[1]), cost(&mems[2]));
+        assert!(ca <= cfg.l1.char_budget, "a 应单独装得下（实得 {ca}）");
+        assert!(
+            ca + cb > cfg.l1.char_budget,
+            "a+b 应超预算，否则 b 不会被跳过（实得 {}）",
+            ca + cb
+        );
+        assert!(
+            ca + cc <= cfg.l1.char_budget,
+            "a+c 应装得下，否则 c 留不下来（实得 {}）",
+            ca + cc
+        );
+
+        let transitions = consolidate_with(&mut mems, now, &cfg);
+
+        let level_of =
+            |id: &str, mems: &[Memory]| mems.iter().find(|m| m.id == id).expect("记忆应还在").level;
+        assert_eq!(level_of(&long_a, &mems), Level::L1, "a 装得下，应留在 L1");
+        assert_eq!(
+            level_of(&long_b, &mems),
+            Level::L2,
+            "b 撑爆预算，应被下推——它只淘汰自己"
+        );
+        assert_eq!(
+            level_of("c", &mems),
+            Level::L1,
+            "c 排在 b 之后但装得下，必须留在 L1（取前缀语义下这里会连坐掉层）"
+        );
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.id == long_b && t.kind == TransitionKind::Overflow),
+            "b 的下推应记为 Overflow 变迁"
         );
     }
 }

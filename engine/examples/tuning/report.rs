@@ -113,6 +113,7 @@ pub fn config_json(cfg: &EngramConfig) -> serde_json::Value {
             "d": t.d,
             "floor": t.floor,
             "load_full": t.load_full,
+            "resident": t.resident,
         })
     };
     serde_json::json!({

@@ -2924,7 +2924,7 @@ fn session_start_log_appends_record_and_creates_parent() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
-// 28. 不传 --emit / --log 时行为与之前完全一致：stdout = 前言行 + 热索引，
+// 28. 不传 --emit / --log 时结构不变：stdout = 前言（多行）+ 热索引，
 //     退出 0（回归保护：默认路径不受新选项影响）。
 #[test]
 fn session_start_default_unchanged() {
@@ -2951,12 +2951,11 @@ fn session_start_default_unchanged() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
-    // 第一行恰为前言，随后是热索引表头。
-    let mut lines = stdout.lines();
-    assert_eq!(
-        lines.next(),
-        Some("「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth；不要凭印象。」"),
-        "首行应为前言，实得：\n{stdout}"
+    // 开头恰为整段前言（多行），随后是热索引表头。前言文本以引擎常量为唯一真源，
+    // 测试不再复制一份字面量——改文案时无需同步改断言。
+    assert!(
+        stdout.starts_with(engram::render::HOT_INDEX_PREAMBLE),
+        "stdout 应以前言开头，实得：\n{stdout}"
     );
     assert!(
         stdout.contains("== Engram 热索引"),
@@ -5574,7 +5573,14 @@ fn dedicated_dir(tag: &str) -> PathBuf {
 /// 未来时间戳、悬空 superseded_by、importance 偏离层锚、疑似同 cue 重复。全部通用
 /// 作用域（project=None）。
 fn dirty_fixture() -> Vec<Memory> {
-    let long_cue = "记".repeat(2500);
+    // cue 长度按 L2 字符预算推导（B/2 − 100），不写死数字：构造保证 2 条累计
+    // ≤ B、3 条累计 > B，于是「恰 2 条留 L2、over3 被挤到 L3」的断言不随整定
+    // 值漂移（与 consolidate 单测 18 / tuning INV-20 同一构造）。
+    let long_cue = "记".repeat(
+        (engram::model::params(Level::L2).char_budget / 2)
+            .saturating_sub(100)
+            .max(50),
+    );
     let mut out = Vec::new();
 
     // 1) 旧近因尖峰升上来的 L2（importance 低、单次访问已远去）→ 迁移应降回 L3 Active。
@@ -6376,7 +6382,7 @@ fn no_project_scope_when_anchor_is_engram_home_dir() {
             &db,
             &[make(
                 "np_gen",
-                Level::L3,
+                Level::L2,
                 None,
                 Status::Active,
                 0.5,
@@ -6544,7 +6550,7 @@ fn real_project_still_anchors_and_accepts_l4() {
         "real_proj_g",
         &[make(
             "rp_gen",
-            Level::L3,
+            Level::L2,
             None,
             Status::Active,
             0.5,
@@ -6658,4 +6664,139 @@ fn real_project_still_anchors_and_accepts_l4() {
 
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 55. 注入体总额必须守住宿主硬上限：无论库里堆多少常驻层记忆，`hot-index --emit json`
+//     的 additionalContext 都不得超过 10000 字符——这是 Claude Code 编译进二进制的
+//     常量（无配置项可覆盖），超出会把整段落盘、上下文里只留前 2000 字符，等于记忆
+//     系统当场失效。注入体 = 前言 + 可选的管理目录提示行 + 渲染产物，三者合计受限，
+//     故本测试直接量 additionalContext 本身，而不是量 render 的产物——历史教训：
+//     把前缀开销当作预算常量里预留的魔数余量时，前言一扩写（56 → 277 字符）余量就被
+//     悄悄吃到只剩 123 字符，而当时没有任何测试会因此变红。
+//     两个场景都覆盖，管理目录场景多一行 WORKSPACE_NOTE，是最坏情况。
+#[test]
+fn hot_index_injection_never_exceeds_host_context_limit() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    // 宿主 Claude Code 对 hook additionalContext 的硬上限（见 render::HOT_INDEX_CHAR_BUDGET）。
+    const HOST_CONTEXT_LIMIT: usize = 10_000;
+
+    // 每条 cue 约 190 字符：灌满两个常驻通用层的容量并大幅溢出，逼渲染预算真正生效。
+    let filler = "记忆内容填充".repeat(30);
+    let mut mems = Vec::new();
+    for i in 0..10 {
+        mems.push(make(
+            &format!("l1_{i}_{filler}"),
+            Level::L1,
+            None,
+            Status::Active,
+            0.9,
+            now,
+            vec![now],
+        ));
+    }
+    for i in 0..60 {
+        mems.push(make(
+            &format!("l2_{i}_{filler}"),
+            Level::L2,
+            None,
+            Status::Active,
+            0.6,
+            now,
+            vec![now],
+        ));
+    }
+    let general_path = seed_db("host_limit_g", &mems);
+    // 写好库级 data_version：否则 hot-index 的 maybe_migrate_on_session_start 会把这个
+    // 「没有版本 = 老库」重洗一遍（重分层 + 容量治理），灌进去的量当场被压回预算内，
+    // 本测试就压不到渲染保险丝了。本测试要验的是保险丝，容量治理另有测试覆盖。
+    {
+        let db = store::open(&general_path).expect("应能打开公共库");
+        store::write_data_version(&db, engram::model::ENGRAM_DATA_VERSION).expect("写版本应成功");
+    }
+    let g = general_path.to_string_lossy().to_string();
+
+    let check = |label: &str, root: &str, expect_note: bool| {
+        let hi = run_hot_index_raw(&[
+            "--general-db",
+            &g,
+            "--workspace-root",
+            root,
+            "--now",
+            "1000000000",
+            "--emit",
+            "json",
+        ]);
+        assert!(
+            hi.status.success(),
+            "{label}: hot-index --emit json 应 exit 0，stderr={}",
+            String::from_utf8_lossy(&hi.stderr)
+        );
+        let stdout = String::from_utf8(hi.stdout).expect("stdout 非 UTF-8");
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("应为一行可解析 JSON");
+        let ctx = parsed
+            .get("hookSpecificOutput")
+            .and_then(|h| h.get("additionalContext"))
+            .and_then(|v| v.as_str())
+            .expect("应含 additionalContext 字符串")
+            .to_string();
+        let n = ctx.chars().count();
+        assert!(
+            n <= HOST_CONTEXT_LIMIT,
+            "{label}: additionalContext {n} 字符 > 宿主硬上限 {HOST_CONTEXT_LIMIT}，             整段会被落盘、只剩前 2000 字符进上下文。实得：
+{ctx}"
+        );
+        // 断言预算确实咬住了——否则本测试可能因为数据不够多而空跑。
+        assert!(
+            ctx.contains("另有"),
+            "{label}: 灌了 70 条长 cue 却没触发预算截断，测试失去意义。实得：
+{ctx}"
+        );
+        assert_eq!(
+            ctx.contains("项目管理目录"),
+            expect_note,
+            "{label}: 管理目录提示行的出现与否不符预期。实得：
+{ctx}"
+        );
+        n
+    };
+
+    // ① 具体项目作用域。
+    let proj = unique_workspace_root("host_limit_proj");
+    let proj_name = last_segment(&proj);
+    let proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "hl_l4",
+            Level::L4_2,
+            Some(&proj_name),
+            Status::Active,
+            0.6,
+            now,
+            vec![now],
+        )],
+    );
+    {
+        let db = store::open(&proj_db).expect("应能打开项目库");
+        store::write_data_version(&db, engram::model::ENGRAM_DATA_VERSION).expect("写版本应成功");
+    }
+    let n_proj = check("项目作用域", &proj.to_string_lossy(), false);
+
+    // ② 项目管理目录作用域：注入体额外多一行 WORKSPACE_NOTE，是最坏情况。
+    let ws = unique_workspace_root("host_limit_ws");
+    // seed_workspace 返回的是 .engram 目录，库文件是它下面的 engram.redb。
+    let ws_db = seed_workspace(&ws).join("engram.redb");
+    // 同上：作用域库若无版本，migrate 会连带把公共库一起重洗，公共库那 70 条当场被压回
+    // 预算内，本场景就压不到保险丝了。
+    {
+        let db = store::open(&ws_db).expect("应能打开管理目录库");
+        store::write_data_version(&db, engram::model::ENGRAM_DATA_VERSION).expect("写版本应成功");
+    }
+    let n_ws = check("管理目录作用域", &ws.to_string_lossy(), true);
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_dir_all(&ws);
+    println!("注入体实测：项目作用域 {n_proj} 字符 / 管理目录作用域 {n_ws} 字符（上限 {HOST_CONTEXT_LIMIT}）");
 }
