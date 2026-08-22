@@ -43,6 +43,7 @@ use engram::commands::{
     self, build_merged_memory, gc_should_delete, generate_id, home_dir, last_touch, list_visible,
     oneline_status_with_health, parse_level, parse_project_dbs, parse_status_filter, parse_tags,
     recall_candidates, resolve_project_scope, revived_level, tokenize_query, validate_merge_scope,
+    RecallQuery, Scorer,
     MergeScope, ProjectScope, ScopeKind, ENGRAM_DB_FILE, ENGRAM_DIR, WORKSPACE_MARKER,
 };
 use engram::consolidate::{consolidate, Transition, TransitionKind};
@@ -89,7 +90,7 @@ enum Command {
         /// 项目库映射 `name=path`，可重复给 0..N 个。
         #[arg(long = "project-db")]
         project_db: Vec<String>,
-        /// 查询串（英文按空白分词、中文按二字 ngram 切分，小写后做子串匹配；中文可直接写自然语句）。
+        /// 查询串（英文按空白分词、中文按二字 ngram 自动切分，无需手工加空格；中文可直接写自然语句）。
         #[arg(long)]
         query: String,
         /// 最多返回的候选数。
@@ -104,6 +105,18 @@ enum Command {
         /// 以 JSON 数组输出候选（默认输出可读表格）。
         #[arg(long)]
         json: bool,
+        /// 只搜带此标签的记忆（精确匹配）；缺省不过滤。
+        #[arg(long)]
+        tag: Option<String>,
+        /// 只搜此层级：L1|L2|L3|L4.1|L4.2|L4.3；缺省不过滤。
+        #[arg(long)]
+        level: Option<String>,
+        /// 只搜此项目的 L4 记忆；缺省不过滤。
+        #[arg(long)]
+        project: Option<String>,
+        /// 改用旧的子串命中率打分器（对拍 / 回滚用；缺省走 BM25）。
+        #[arg(long)]
+        lexical_legacy: bool,
     },
     /// 写入新记忆：按层级路由到正确的库（L1-3 → 公共库，L4 → 对应项目库），打印新 id。
     Write {
@@ -364,7 +377,7 @@ enum Command {
         /// （父目录不存在会先创建）。写日志失败被静默忽略，不影响主输出。
         #[arg(long)]
         log: Option<PathBuf>,
-        /// 渲染字符预算（0=不限）；缺省 24000 字符 ≈ 8k token，见
+        /// 渲染字符预算（0=不限）；缺省 9600 字符（宿主 additionalContext 硬上限 10000 的安全余量），见
         /// [`engram::render::HOT_INDEX_CHAR_BUDGET`]。
         #[arg(long, default_value_t = engram::render::HOT_INDEX_CHAR_BUDGET)]
         budget: usize,
@@ -426,7 +439,7 @@ enum Command {
         /// 可选调试日志文件路径；给定时向其追加一行本次调用记录（失败静默忽略）。
         #[arg(long)]
         log: Option<PathBuf>,
-        /// 渲染字符预算（0=不限）；缺省 24000 字符 ≈ 8k token，见
+        /// 渲染字符预算（0=不限）；缺省 9600 字符（宿主 additionalContext 硬上限 10000 的安全余量），见
         /// [`engram::render::HOT_INDEX_CHAR_BUDGET`]。
         #[arg(long, default_value_t = engram::render::HOT_INDEX_CHAR_BUDGET)]
         budget: usize,
@@ -735,14 +748,35 @@ fn resolve_project_dbs(raw: &[String]) -> Option<BTreeMap<String, PathBuf>> {
     }
 }
 
-/// 打开一个库并读出其全部记忆。
+/// 打开一个库并读出其全部记忆（用指定的打开策略）。
+///
+/// 打开策略决定撞上 redb 跨进程排他锁时等多久，三档的对照见 [`store::open_for_hook`]。
+fn open_and_read_with(
+    path: &Path,
+    opener: fn(&Path) -> Result<Database, StoreError>,
+) -> Result<(Database, Vec<Memory>), StoreError> {
+    let db = opener(path)?;
+    let mems = store::all(&db)?;
+    Ok((db, mems))
+}
+
+/// 打开一个库并读出其全部记忆——**交互式命令**用（撞锁最多等约 3 秒）。
 ///
 /// # Errors
 /// - [`StoreError`] —— 打开或读取库失败。
 fn open_and_read(path: &Path) -> Result<(Database, Vec<Memory>), StoreError> {
-    let db = store::open(path)?;
-    let mems = store::all(&db)?;
-    Ok((db, mems))
+    open_and_read_with(path, store::open)
+}
+
+/// 打开一个库并读出其全部记忆——**hook 热路径**用（撞锁最多等约 100ms 即放弃）。
+///
+/// 见 [`store::open_for_hook`]：hook 挂在每条用户消息上，等 3 秒再告诉用户
+/// 「记忆缺席」是最差的组合——既卡了人又没拿到记忆。
+///
+/// # Errors
+/// - [`StoreError`] —— 打开或读取库失败。调用方应当**降级注入**而非报错退出。
+fn open_and_read_for_hook(path: &Path) -> Result<(Database, Vec<Memory>), StoreError> {
+    open_and_read_with(path, store::open_for_hook)
 }
 
 /// 读取公共库 + 所有挂载项目库，并把全部记忆合并为一个 `Vec`。
@@ -856,15 +890,35 @@ fn dispatch() -> ExitCode {
             active_only,
             now,
             json,
-        } => run_recall(RecallArgs {
-            general_db: &general_db,
-            project_db: &project_db,
-            query: &query,
-            limit,
-            active_only,
-            now,
-            json,
-        }),
+            tag,
+            level,
+            project,
+            lexical_legacy,
+        } => {
+            // 层级串在这里就解析掉：拼错了要当场报错退出，
+            // 而不是静默当作「不过滤」——那会让用户以为筛过了、其实没筛。
+            let level = match level.as_deref().map(parse_level) {
+                Some(Ok(l)) => Some(l),
+                Some(Err(e)) => {
+                    eprintln!("recall 失败：{e}");
+                    return ExitCode::FAILURE;
+                }
+                None => None,
+            };
+            run_recall(RecallArgs {
+                general_db: &general_db,
+                project_db: &project_db,
+                query: &query,
+                limit,
+                active_only,
+                now,
+                json,
+                tag: tag.as_deref(),
+                level,
+                project: project.as_deref(),
+                lexical_legacy,
+            })
+        }
         Command::Write {
             general_db,
             project_db,
@@ -1540,7 +1594,10 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
 /// # Errors
 /// 任一库打开或读取失败时，返回带库类别说明的错误字符串。
 fn read_merged_scope(general_db: &Path, scope: &ProjectScope) -> Result<Vec<Memory>, String> {
-    let (_gdb, mut merged) = open_and_read(general_db)
+    // 走 hook 专用的快速失败打开策略：本函数只服务 session-start / hot-index 两个
+    // hook 路径（见下方调用点），它们挂在用户每条消息上，撞锁时宁可 100ms 就降级，
+    // 也不能拿 3 秒预算把用户卡住再告诉他「记忆缺席」。
+    let (_gdb, mut merged) = open_and_read_for_hook(general_db)
         .map_err(|e| format!("读取公共库 {} 失败：{e}", general_db.display()))?;
     // 作用域(项目)库：**仅当文件已存在才读，不存在则当空、绝不创建**。只读 hook
     // (hot-index / session-start) 不该在子目录里凭空建出杂散锚点把一个项目碎片化成
@@ -1548,7 +1605,7 @@ fn read_merged_scope(general_db: &Path, scope: &ProjectScope) -> Result<Vec<Memo
     // 无项目作用域（锚点落到 engram 主目录本身）时 `scope.db` 是伪项目库（= general.redb
     // 旁的 engram.redb），即便文件存在也**不挂载**，只留公共库——避免家目录话题污染。
     if !scope.is_none() && scope.db.is_file() {
-        let (_sdb, mut smems) = open_and_read(&scope.db).map_err(|e| {
+        let (_sdb, mut smems) = open_and_read_for_hook(&scope.db).map_err(|e| {
             format!(
                 "读取作用域库 {}（{}）失败：{e}",
                 scope.name,
@@ -2414,6 +2471,7 @@ fn append_hot_index_log(log_path: &Path, now: f64, hook_event: &str, scope: &Pro
         scope.name,
         scope.root.display(),
     );
+    rotate_log_if_oversized(log_path);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2421,6 +2479,32 @@ fn append_hot_index_log(log_path: &Path, now: f64, hook_event: &str, scope: &Pro
     {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// hook 日志超过 [`HOOK_LOG_MAX_BYTES`] 时轮转一次：`hook.log` → `hook.log.1`（覆盖旧的）。
+///
+/// 只保留一代备份——这是**诊断日志**不是审计日志，留一代足够回溯最近一次异常，
+/// 留更多只是把磁盘占用翻倍。
+///
+/// # 全程 best-effort，绝不影响 hook 主流程
+///
+/// 本函数挂在**每条用户消息**都会跑的 hot-index 路径上，所以任何一步失败
+/// （文件被另一进程占用、磁盘满、权限不足）都必须静默返回，让调用方照常追加——
+/// 大不了这次没轮转成、日志继续长，下次再试。日志轮转失败而拖垮记忆注入，
+/// 是彻头彻尾的本末倒置。
+fn rotate_log_if_oversized(log_path: &Path) {
+    let Ok(meta) = std::fs::metadata(log_path) else {
+        return; // 文件还不存在（首次写）或读不到元数据——都无需轮转
+    };
+    if meta.len() <= HOOK_LOG_MAX_BYTES {
+        return;
+    }
+    let mut backup = log_path.as_os_str().to_os_string();
+    backup.push(".1");
+    // rename 在目标已存在时于 Windows 上会失败，故先删旧备份；两步都 best-effort。
+    let backup = PathBuf::from(backup);
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::rename(log_path, &backup);
 }
 
 /// hot-index 打库失败时的**降级注入**：stderr 报错、hook.log 留痕，stdout 按
@@ -3210,6 +3294,13 @@ fn status_repr(status: Status) -> &'static str {
     }
 }
 
+/// hook 日志（`~/.engram/hook.log`）触发轮转的大小上限（字节）。
+///
+/// 取 1 MiB：实测该文件在没有任何轮转机制的情况下已长到 795 KB / 6050 行，
+/// 而它每条用户消息都要追加一行、只增不减。1 MiB 够放最近几万条诊断行，
+/// 又不至于让一个纯诊断文件无限占盘。见 [`rotate_log_if_oversized`]。
+const HOOK_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 /// 把 `effective` 格式化为稳定字符串（处理无穷大），供文本输出用。
 fn fmt_eff(eff: f64) -> String {
     if eff == f64::INFINITY {
@@ -3230,6 +3321,14 @@ struct RecallArgs<'a> {
     active_only: bool,
     now: Option<f64>,
     json: bool,
+    /// 标签过滤；`None` 不过滤。
+    tag: Option<&'a str>,
+    /// 层级过滤；`None` 不过滤。
+    level: Option<Level>,
+    /// 项目过滤；`None` 不过滤。
+    project: Option<&'a str>,
+    /// 走旧的子串命中率打分器（对拍 / 回滚用）。
+    lexical_legacy: bool,
 }
 
 /// 执行 `recall` 子命令：合并多库 → 词法打分检索 → 打印候选（不写任何库）。
@@ -3251,18 +3350,42 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
     };
 
     let tokens = tokenize_query(args.query);
-    let cands = recall_candidates(&merged, &tokens, args.active_only, args.limit, now);
+    let query = RecallQuery {
+        tokens: &tokens,
+        active_only: args.active_only,
+        limit: args.limit,
+        now,
+        scorer: if args.lexical_legacy {
+            Scorer::LexicalLegacy
+        } else {
+            Scorer::Bm25
+        },
+        tag: args.tag,
+        level: args.level,
+        project: args.project,
+    };
+    let outcome = recall_candidates(&merged, &query);
+    let cands = &outcome.candidates;
 
     if args.json {
         // 手工拼 JSON 数组：避免为输出额外引入序列化辅助类型。
+        // 顶层仍是数组（**向后兼容**：已有脚本按数组读它），
+        // 弃权信息挂在一个 id 为 null 的哨兵对象上追加在末尾，老读者会忽略它。
         let mut buf = String::from("[");
         for (i, c) in cands.iter().enumerate() {
             if i > 0 {
                 buf.push(',');
             }
             let m = c.memory;
+            let idf_top = c
+                .hits
+                .iter()
+                .take(3)
+                .map(|h| format!(r#"{{"token":{},"idf":{}}}"#, json_str(&h.token), json_f64(h.idf)))
+                .collect::<Vec<_>>()
+                .join(",");
             buf.push_str(&format!(
-                r#"{{"id":{},"level":{},"status":{},"score":{},"effective":{},"cue":{},"pointer":{}}}"#,
+                r#"{{"id":{},"level":{},"status":{},"score":{},"effective":{},"cue":{},"pointer":{},"idf_top":[{}]}}"#,
                 json_str(&m.id),
                 json_str(level_repr(m.level)),
                 json_str(status_repr(m.status)),
@@ -3270,17 +3393,42 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
                 json_f64(c.effective),
                 json_str(&m.cue),
                 json_pointer(&m.pointer),
+                idf_top,
+            ));
+        }
+        if let Some(reason) = &outcome.abstain {
+            if !cands.is_empty() {
+                buf.push(',');
+            }
+            let sugg = outcome
+                .suggestions
+                .iter()
+                .map(|s| json_str(s))
+                .collect::<Vec<_>>()
+                .join(",");
+            buf.push_str(&format!(
+                r#"{{"id":null,"abstained":true,"reason":{},"suggestions":[{}]}}"#,
+                json_str(&reason.explain()),
+                sugg,
             ));
         }
         buf.push(']');
         println!("{buf}");
+    } else if let Some(reason) = &outcome.abstain {
+        // 弃权就是弃权：**一条候选都不打印**。
+        // 旧实现「返回一串低分噪音」正是要治的病——它会诱导读它的 agent 把噪音当答案。
+        println!("== recall (now={now}, query=\"{}\") ==", args.query);
+        println!("  {}", reason.explain());
+        if !outcome.suggestions.is_empty() {
+            println!("  本库的主题词（可换用这些词再查）：{}", outcome.suggestions.join(" / "));
+        }
     } else {
         println!(
             "== recall (now={now}, query=\"{}\") == 共 {} 条候选",
             args.query,
             cands.len()
         );
-        for c in &cands {
+        for c in cands {
             let m = c.memory;
             let reference = m.pointer.reference.as_deref().unwrap_or("-");
             println!(
@@ -5683,5 +5831,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&general_home);
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// hook 日志轮转：超限才轮转、只留一代、失败绝不影响主流程。
+    ///
+    /// 这条守护的是 rotate_log_if_oversized 的三个关键性质。把
+    /// HOOK_LOG_MAX_BYTES 调到极大（等于关掉轮转），第二段断言会立刻变红。
+    #[test]
+    fn hook_log_rotates_only_when_oversized() {
+        let mut dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dir.push(format!("engram_logrot_{}_{nanos}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("hook.log");
+        let backup = dir.join("hook.log.1");
+
+        // 1. 文件不存在时不该 panic、也不该凭空造出备份。
+        rotate_log_if_oversized(&log);
+        assert!(!backup.exists(), "文件不存在时不该产生备份");
+
+        // 2. 未超限不轮转。
+        let _ = std::fs::write(&log, b"small");
+        rotate_log_if_oversized(&log);
+        assert!(log.exists(), "未超限时原日志应原样保留");
+        assert!(!backup.exists(), "未超限时不该轮转");
+
+        // 3. 超限则轮转：原文件让位给新文件，旧内容进 .1。
+        let big = vec![b'x'; (HOOK_LOG_MAX_BYTES + 1) as usize];
+        let _ = std::fs::write(&log, &big);
+        rotate_log_if_oversized(&log);
+        assert!(
+            backup.exists(),
+            "超过 {HOOK_LOG_MAX_BYTES} 字节应轮转出 .1 备份"
+        );
+        assert!(!log.exists(), "轮转后原路径应空出来给新日志");
+        assert_eq!(
+            std::fs::metadata(&backup).map(|m| m.len()).unwrap_or(0),
+            HOOK_LOG_MAX_BYTES + 1,
+            "备份应当是轮转前的那份完整内容"
+        );
+
+        // 4. 只留一代：再轮转一次，旧备份被覆盖而不是堆积成 .2。
+        let _ = std::fs::write(&log, &big);
+        rotate_log_if_oversized(&log);
+        assert!(backup.exists(), "第二次轮转仍应有 .1");
+        assert!(
+            !dir.join("hook.log.2").exists(),
+            "只保留一代备份，不该出现 .2"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

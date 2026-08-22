@@ -1,0 +1,18 @@
+# ── 私人数据：绝不进公开仓库 ──
+# corpus.json 是**真实记忆库的快照**，含个人/项目私密内容（服务器地址、账号、
+# 内部决策等）。本仓库是 public，这类数据一律留在本地。
+# 用 _mkcorpus.py 从自己的库现生成即可，见 README「用法」。
+corpus.json
+_raw_all.json
+_corpus_stats.txt
+
+# memory-golden.jsonl 的题是针对**某一个具体记忆库**出的（gold 是该库的 mem id），
+# 换个库就没有意义，且 gold 定位子串会带出该库的 cue 片段。同样留本地。
+memory-golden.jsonl
+
+# ── 跑出来的报告：含本机绝对路径与记忆片段，且每次跑都会重新生成 ──
+*.txt
+!noise-queries.txt
+
+# ── 杂项 ──
+__pycache__/

@@ -23,10 +23,12 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::activation::effective;
+use crate::retrieval::{self, AbstainReason, TokenHit};
 use crate::model::{Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
 
 /// 判断一个层级是否属于 L4 轨道（项目记忆）。
@@ -342,7 +344,7 @@ fn is_cjk(c: char) -> bool {
 ///   所有中文 cue，只会污染打分。
 ///
 /// 返回的词元均已小写化、未去重（去重在 [`tokenize_query`] 里做）。
-fn segment_field(field: &str) -> Vec<String> {
+pub(crate) fn segment_field(field: &str) -> Vec<String> {
     let chars: Vec<char> = field.chars().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -424,14 +426,91 @@ pub fn score_query(m: &Memory, tokens: &[String]) -> f64 {
 }
 
 /// 一条 recall 候选：记忆引用 + 算出的分数与 effective。
-#[derive(Debug, Clone, Copy)]
+///
+/// **不再是 `Copy`**：`hits` 带了归因用的堆分配字段。调用面很小
+/// （`run_recall` 与本模块测试），改动已逐处核过。
+#[derive(Debug, Clone)]
 pub struct Candidate<'a> {
     /// 命中的记忆。
     pub memory: &'a Memory,
-    /// 归一化命中率（命中词元数 ÷ query 词元总数），落在 `(0.0, 1.0]`。
+    /// 打分器给出的相关性分数。
+    ///
+    /// 量纲取决于 [`Scorer`]：[`Scorer::Bm25`] 下是 BM25 分（无上界）；
+    /// [`Scorer::LexicalLegacy`] 下是归一化命中率（落在 `(0.0, 1.0]`）。
+    /// **跨 query 不可比**——两种打分器都一样，别拿它当绝对置信度用。
     pub score: f64,
     /// 该记忆在 `now` 时刻的 effective（用于同分排序）。
     pub effective: f64,
+    /// 本条命中了哪些 query 词元（按 IDF 降序），供 `--json` 归因。
+    ///
+    /// [`Scorer::LexicalLegacy`] 下为空——旧打分器对文档不分词，没有词频概念。
+    pub hits: Vec<TokenHit>,
+}
+
+/// recall 用哪个打分器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scorer {
+    /// BM25（默认）。带 tf 饱和与文档长度归一，见 [`crate::retrieval`]。
+    #[default]
+    Bm25,
+    /// 旧的子串命中率 [`score_query`]，仅供对拍与回滚（CLI 的 `--lexical-legacy`）。
+    LexicalLegacy,
+}
+
+/// 一次 recall 的完整结果。
+///
+/// 之所以不是裸的 `Vec<Candidate>`：**弃权**（本库没有相关记忆）是一等结果，
+/// 必须能与「有结果」区分开。旧实现只要有一个词元子串命中就返回候选，
+/// 于是查一个库里根本不存在的主题时会返回一串低分噪音，
+/// 诱导调用它的 agent 把噪音当答案。
+#[derive(Debug, Clone, Default)]
+pub struct RecallOutcome<'a> {
+    /// 按分数降序的候选。**弃权时调用方不得展示它**（见 `abstain`）。
+    pub candidates: Vec<Candidate<'a>>,
+    /// 非 `None` 即表示该弃权，值是弃权的具体理由。
+    pub abstain: Option<AbstainReason>,
+    /// 弃权时给调用方的下一步提示：本库里最常见的若干主题词。
+    pub suggestions: Vec<String>,
+}
+
+/// recall 的查询参数。
+///
+/// 单独成结构体而不是长参数列表：过滤维度还会继续加，
+/// 而位置参数一多就极易在调用点写错顺序（两个 `Option<&str>` 挨着尤其危险）。
+#[derive(Debug, Clone, Copy)]
+pub struct RecallQuery<'a> {
+    /// 已由 [`tokenize_query`] 处理的 query 词元。
+    pub tokens: &'a [String],
+    /// 为真时只搜 active；否则 active+cold 都搜。
+    pub active_only: bool,
+    /// 最多返回的候选数。
+    pub limit: usize,
+    /// 当前时间（unix 秒）。
+    pub now: f64,
+    /// 打分器。
+    pub scorer: Scorer,
+    /// 标签过滤；`None` 不过滤。要求该记忆的 `tags` 含有此标签（精确匹配）。
+    pub tag: Option<&'a str>,
+    /// 层级过滤；`None` 不过滤。
+    pub level: Option<Level>,
+    /// 项目过滤；`None` 不过滤。要求 `m.project == Some(project)`。
+    pub project: Option<&'a str>,
+}
+
+impl<'a> RecallQuery<'a> {
+    /// 只给必填项的构造：BM25 打分、不加任何过滤。
+    pub fn new(tokens: &'a [String], active_only: bool, limit: usize, now: f64) -> Self {
+        RecallQuery {
+            tokens,
+            active_only,
+            limit,
+            now,
+            scorer: Scorer::Bm25,
+            tag: None,
+            level: None,
+            project: None,
+        }
+    }
 }
 
 /// 一条记忆在 recall 中是否“可被检索”。
@@ -446,44 +525,80 @@ fn recallable(status: Status, active_only: bool) -> bool {
     }
 }
 
-/// 在一批记忆里按 query 检索候选：过滤状态 → 打分 → 去零分 → 排序 → 截断。
+/// 本库里最常见的若干主题词（取自 tags），弃权时作为「换个词试试」的提示。
 ///
-/// 排序规则：先按 `score`（[`score_query`] 的归一化命中率）降序，同分再按
-/// `effective(now)` 降序。`score` 为 0（一个 query 词元都没命中）的记忆不进候选。
+/// 只统计参与本次检索的记忆（即已过状态/标签/层级/项目过滤的那批），
+/// 这样在加了过滤维度时给出的建议才是该范围内真实存在的主题。
+fn top_topics(pool: &[&Memory], limit: usize) -> Vec<String> {
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    for m in pool {
+        for t in &m.tags {
+            *freq.entry(t.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut v: Vec<(&str, usize)> = freq.into_iter().collect();
+    // 频次降序；同频按字典序，保证输出稳定可测。
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    v.into_iter().take(limit).map(|(t, _)| t.to_string()).collect()
+}
+
+/// 在一批记忆里按 query 检索：过滤 → 打分 → 去零分 → 排序 → 截断 → 判弃权。
+///
+/// 排序规则：先按 `score` 降序，同分再按 `effective(now)` 降序。
+/// `score` 为 0（一个 query 词元都没命中）的记忆不进候选。
+///
+/// 打分器由 [`RecallQuery::scorer`] 决定，默认 [`Scorer::Bm25`]。
+/// BM25 的语料统计（N / df / avgdl）在**已过滤的候选池**上现算——
+/// 这一点很重要：加了 `--tag` 之类的过滤后，IDF 应当相对该子集计算，
+/// 否则「在这个子集里很罕见」的词会被全库统计冲淡。
 ///
 /// 本函数**不修改任何记忆、不做任何 IO**。
-///
-/// # 参数
-/// - `mems`：候选记忆集合（通常是 general+project 合并集）。
-/// - `tokens`：已由 [`tokenize_query`] 处理的 query 词元。
-/// - `active_only`：为真时只搜 active；否则 active+cold 都搜。
-/// - `limit`：最多返回的候选数。
-/// - `now`：当前时间（unix 秒）。
-pub fn recall_candidates<'a>(
-    mems: &'a [Memory],
-    tokens: &[String],
-    active_only: bool,
-    limit: usize,
-    now: f64,
-) -> Vec<Candidate<'a>> {
-    let mut cands: Vec<Candidate<'a>> = mems
+pub fn recall_candidates<'a>(mems: &'a [Memory], q: &RecallQuery<'_>) -> RecallOutcome<'a> {
+    // 1. 先过滤出候选池：状态 + 标签 + 层级 + 项目，全部是「与」关系。
+    let pool: Vec<&'a Memory> = mems
         .iter()
-        .filter(|m| recallable(m.status, active_only))
-        .filter_map(|m| {
-            let score = score_query(m, tokens);
+        .filter(|m| recallable(m.status, q.active_only))
+        .filter(|m| match q.tag {
+            Some(t) => m.tags.iter().any(|x| x == t),
+            None => true,
+        })
+        .filter(|m| match q.level {
+            Some(l) => m.level == l,
+            None => true,
+        })
+        .filter(|m| match q.project {
+            Some(p) => m.project.as_deref() == Some(p),
+            None => true,
+        })
+        .collect();
+
+    // 2. 打分。
+    let corpus = match q.scorer {
+        Scorer::Bm25 => Some(retrieval::Corpus::build(&pool)),
+        Scorer::LexicalLegacy => None,
+    };
+    let mut cands: Vec<Candidate<'a>> = pool
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let (score, hits) = match &corpus {
+                Some(c) => (c.score(i, q.tokens), c.hits(i, q.tokens)),
+                None => (score_query(m, q.tokens), Vec::new()),
+            };
             if score <= 0.0 {
                 None
             } else {
                 Some(Candidate {
                     memory: m,
                     score,
-                    effective: effective(m, now),
+                    effective: effective(m, q.now),
+                    hits,
                 })
             }
         })
         .collect();
 
-    // 先 score 降序，同分按 effective 降序；NaN（不会出现）视作相等。
+    // 3. 先 score 降序，同分按 effective 降序；NaN（不会出现）视作相等。
     cands.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -494,8 +609,33 @@ pub fn recall_candidates<'a>(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
-    cands.truncate(limit);
-    cands
+
+    // 4. 判弃权——必须在 truncate **之前**用全局最高分判，
+    //    truncate 只影响展示条数、不该影响「本库到底有没有相关记忆」这个判断。
+    let abstain = match &corpus {
+        Some(c) => {
+            let best = cands.first().map(|x| x.score).unwrap_or(0.0);
+            let empty: Vec<TokenHit> = Vec::new();
+            let best_hits = cands.first().map(|x| &x.hits).unwrap_or(&empty);
+            retrieval::judge(c, q.tokens, best, best_hits)
+        }
+        // legacy 打分器没有 IDF 概念，判不了弃权；只保留「一条都没命中」这一种。
+        None => {
+            if cands.is_empty() {
+                Some(AbstainReason::NoCandidate)
+            } else {
+                None
+            }
+        }
+    };
+
+    cands.truncate(q.limit);
+    let suggestions = if abstain.is_some() {
+        top_topics(&pool, 8)
+    } else {
+        Vec::new()
+    };
+    RecallOutcome { candidates: cands, abstain, suggestions }
 }
 
 /// 在一批记忆里按 status/level/project 过滤后，按 `effective(now)` 降序排序。
@@ -1385,21 +1525,53 @@ mod tests {
 
     #[test]
     fn recall_orders_by_score_then_effective() {
+        // 守护**排序语义**：命中词元多的排前、没命中的不进候选。
+        // 原版还断言 `score == 1.0`，那是 legacy 归一化命中率的**量纲**、不是排序语义；
+        // BM25 分数无上界，故把量纲那一半拆到 recall_legacy_scorer_keeps_ratio_scale 里
+        // 继续守护（legacy 打分器仍保留供 --lexical-legacy 使用，不能没有测试）。
         let now = 1_000_000_000.0;
         let hit2 = mem("a", Level::L3, None, Status::Active, "redb lock 冲突");
         let hit1 = mem("b", Level::L3, None, Status::Active, "redb 入门");
         let miss = mem("c", Level::L3, None, Status::Active, "无关内容");
         let mems = vec![hit1, hit2, miss];
         let tokens = tokenize_query("redb lock");
-        let cands = recall_candidates(&mems, &tokens, false, 10, now);
+        let out = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        let cands = &out.candidates;
         assert_eq!(cands.len(), 2, "命中 2 条，miss 不进候选");
         assert_eq!(cands[0].memory.id, "a", "命中词多者排前");
         assert!(
-            (cands[0].score - 1.0).abs() < 1e-12,
-            "两词元全中应为 1.0，实得 {}",
-            cands[0].score
+            cands[0].score > cands[1].score,
+            "命中两个词元的分({})必须严格高于只命中一个的({})",
+            cands[0].score,
+            cands[1].score
         );
         assert_eq!(cands[1].memory.id, "b");
+    }
+
+    #[test]
+    fn recall_legacy_scorer_keeps_ratio_scale() {
+        // 守护 legacy 打分器的量纲：归一化命中率落在 (0,1]，两词元全中即 1.0。
+        // --lexical-legacy 的回滚价值全靠它——量纲变了，对拍就没有意义了。
+        let now = 1_000_000_000.0;
+        let hit2 = mem("a", Level::L3, None, Status::Active, "redb lock 冲突");
+        let hit1 = mem("b", Level::L3, None, Status::Active, "redb 入门");
+        let mems = vec![hit1, hit2];
+        let tokens = tokenize_query("redb lock");
+        let q = RecallQuery {
+            scorer: Scorer::LexicalLegacy,
+            ..RecallQuery::new(&tokens, false, 10, now)
+        };
+        let out = recall_candidates(&mems, &q);
+        assert_eq!(out.candidates[0].memory.id, "a");
+        assert!(
+            (out.candidates[0].score - 1.0).abs() < 1e-12,
+            "两词元全中应为 1.0，实得 {}",
+            out.candidates[0].score
+        );
+        assert!(
+            out.candidates.iter().all(|c| c.score > 0.0 && c.score <= 1.0),
+            "legacy 分数必须落在 (0,1]"
+        );
     }
 
     #[test]
@@ -1409,8 +1581,8 @@ mod tests {
             .map(|i| mem(&format!("m{i}"), Level::L3, None, Status::Active, "redb"))
             .collect();
         let tokens = tokenize_query("redb");
-        let cands = recall_candidates(&mems, &tokens, false, 3, now);
-        assert_eq!(cands.len(), 3, "limit=3 应截断到 3 条");
+        let out = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 3, now));
+        assert_eq!(out.candidates.len(), 3, "limit=3 应截断到 3 条");
     }
 
     #[test]
@@ -1421,12 +1593,12 @@ mod tests {
         let mems = vec![cold, active];
         let tokens = tokenize_query("redb");
 
-        let default = recall_candidates(&mems, &tokens, false, 10, now);
-        assert_eq!(default.len(), 2, "默认应搜到 cold + active");
+        let default = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        assert_eq!(default.candidates.len(), 2, "默认应搜到 cold + active");
 
-        let only = recall_candidates(&mems, &tokens, true, 10, now);
-        assert_eq!(only.len(), 1, "active-only 应排除 cold");
-        assert_eq!(only[0].memory.id, "act");
+        let only = recall_candidates(&mems, &RecallQuery::new(&tokens, true, 10, now));
+        assert_eq!(only.candidates.len(), 1, "active-only 应排除 cold");
+        assert_eq!(only.candidates[0].memory.id, "act");
     }
 
     #[test]
@@ -1437,7 +1609,8 @@ mod tests {
         let mems = vec![sup, tomb];
         let tokens = tokenize_query("redb");
         // 即便 active_only=false 也不返回。
-        let cands = recall_candidates(&mems, &tokens, false, 10, now);
+        let out = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        let cands = &out.candidates;
         assert!(
             cands.is_empty(),
             "superseded/tombstone 永不进候选，实得 {} 条",

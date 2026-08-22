@@ -42,10 +42,29 @@ const DEFAULT_DATA_VERSION: u32 = 1;
 /// 打开数据库时，遇到「锁被占用」最多重试的总尝试次数（含首次）。
 ///
 /// 与 [`OPEN_RETRY_DELAY_MS`] 共同决定重试预算：60 × 50ms ≈ 3 秒。
+/// 这是**交互式命令**（recall / list / write）的预算——用户自己敲的命令，
+/// 多等一会儿换成功是划算的。热路径与后台写者另有预算，见 [`open_for_hook`] / [`try_open`]。
 const OPEN_MAX_ATTEMPTS: u32 = 60;
 
 /// 打开数据库每次重试之间的退避间隔（毫秒）。
 const OPEN_RETRY_DELAY_MS: u64 = 50;
+
+/// hook 热路径打开数据库的最大尝试次数（含首次）。
+///
+/// 与 [`HOOK_RETRY_DELAY_MS`] 共同决定预算：5 × 20ms ≈ 100ms。
+///
+/// # 为什么热路径必须比交互式命令激进得多
+///
+/// UserPromptSubmit hook 挂在**每一条用户消息**上。用 3 秒预算去等一把可能等不到的锁，
+/// 实测后果是最差的组合：另一进程持锁时 hot-index 要 **5990ms** 才返回，
+/// 而且返回的还是「⚠ 记忆库暂不可用…本会话记忆缺席」——既卡了用户 6 秒，又没拿到记忆。
+///
+/// 100ms 预算下最坏情况几乎无感，拿不到就直接走降级注入。**降级本身没变**，
+/// 变的只是「多快认输」。
+const HOOK_MAX_ATTEMPTS: u32 = 5;
+
+/// hook 热路径每次重试之间的退避间隔（毫秒）。
+const HOOK_RETRY_DELAY_MS: u64 = 20;
 
 /// 存储层错误。
 ///
@@ -285,6 +304,45 @@ pub fn open(path: &Path) -> Result<Database, StoreError> {
         StoreError::is_lock_contention,
         || open_once(path),
     )
+}
+
+/// 打开数据库——**hook 热路径专用**，快速失败（5 × 20ms ≈ 100ms）。
+///
+/// 与 [`open`]（3 秒，交互式命令）、[`try_open`]（0 重试，后台写者）构成三档预算。
+/// 选哪一档只看一个问题：**让谁等**。
+///
+/// | 变体 | 预算 | 适用 | 理由 |
+/// |---|---|---|---|
+/// | [`open`] | ≈3 秒 | recall / list / write 等用户敲的命令 | 用户在等结果，多等换成功划算 |
+/// | [`open_for_hook`] | ≈100ms | 每条消息都跑的 hook | 卡住用户比缺一次记忆更糟 |
+/// | [`try_open`] | 0 重试 | 复盘者 / catchup 等后台进程 | 抢不到就该让路，不许和 hook 争 |
+///
+/// redb 在 Windows 上是**跨进程整文件排他锁**
+/// （`LockFile(handle, 0, 0, u32::MAX, u32::MAX)`，锁随 `Database` 句柄的生命周期持有，
+/// 不是事务级），所以只要有任何一个进程握着句柄，其余全部挡在门外。
+///
+/// # Errors
+/// 同 [`open`]，只是锁竞争的重试预算小得多。
+pub fn open_for_hook(path: &Path) -> Result<Database, StoreError> {
+    retry_acquire(
+        HOOK_MAX_ATTEMPTS,
+        Duration::from_millis(HOOK_RETRY_DELAY_MS),
+        StoreError::is_lock_contention,
+        || open_once(path),
+    )
+}
+
+/// 打开数据库——**后台进程专用**，一次都不重试，拿不到锁立即返回。
+///
+/// 适用于复盘者、catchup 扫描这类脱管的后台任务：它们没有人在等，
+/// 抢不到锁就该直接让路，绝不能和挂在用户每条消息上的 hook 争锁。
+/// 三档预算的对照表见 [`open_for_hook`]。
+///
+/// # Errors
+/// 同 [`open`]，但锁竞争**不重试**，首次撞锁即返回
+/// [`StoreError::Database`]（调用方应据 [`StoreError::is_lock_contention`] 静默退出）。
+pub fn try_open(path: &Path) -> Result<Database, StoreError> {
+    open_once(path)
 }
 
 /// 把单条记忆写入数据库（写事务 insert + commit）。
@@ -707,6 +765,52 @@ mod tests {
 
     // 8b. open 自动补建缺失的父目录：指向多级尚不存在目录也应成功建库并显示空。
     //     这是「全新安装 ~/.engram/ 尚未创建时，只读命令不该报错退出」的回归测试。
+
+    /// 三档打开策略在**真实锁竞争**下的行为。
+    ///
+    /// 刻意不用闭包注入 retry_acquire：那样测的是重试内核，而这里要守护的是
+    /// 「hook 路径到底会不会把用户卡住」这件事本身，必须真的持一把 redb 锁来测。
+    #[test]
+    fn open_variants_have_distinct_budgets_under_real_contention() {
+        let path = unique_db_path("lock_budget");
+        // 持有句柄不放：redb 在打开时对整个文件加跨进程排他锁，
+        // 锁的生命周期就是这个 Database 句柄的生命周期。
+        let held = open(&path).expect("首次打开应成功");
+
+        // try_open：0 重试，必须立刻失败。
+        let t0 = std::time::Instant::now();
+        let r = try_open(&path);
+        let dt_try = t0.elapsed();
+        assert!(r.is_err(), "锁被占用时 try_open 必须失败");
+        assert!(
+            StoreError::is_lock_contention(&r.expect_err("上一行已断言 is_err")),
+            "失败原因应当是锁竞争"
+        );
+        assert!(
+            dt_try < Duration::from_millis(50),
+            "try_open 不该重试，实测耗时 {dt_try:?}"
+        );
+
+        // open_for_hook：约 5 × 20ms，既要确实重试过、又必须远快于交互式预算。
+        let t1 = std::time::Instant::now();
+        let r2 = open_for_hook(&path);
+        let dt_hook = t1.elapsed();
+        assert!(r2.is_err(), "锁被占用时 open_for_hook 也应失败（但要快）");
+        assert!(
+            dt_hook >= Duration::from_millis(60),
+            "open_for_hook 应当确实重试过几次（预算约 100ms），实测仅 {dt_hook:?}——             若接近 0 说明重试被去掉了"
+        );
+        assert!(
+            dt_hook < Duration::from_millis(600),
+            "open_for_hook 必须远快于交互式的 3 秒预算，实测 {dt_hook:?}——             这条守护的正是「hook 撞锁把用户卡 6 秒」那个回归"
+        );
+
+        drop(held);
+        // 锁释放后应当能正常打开。
+        assert!(open_for_hook(&path).is_ok(), "锁释放后 open_for_hook 应成功");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn open_creates_missing_parent_dirs() {
         let nanos = std::time::SystemTime::now()

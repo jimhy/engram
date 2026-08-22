@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engram::commands::{gc_should_delete, recall_candidates, revived_level, tokenize_query};
+use engram::commands::{
+    gc_should_delete, recall_candidates, revived_level, tokenize_query, RecallQuery,
+};
 use engram::consolidate::{consolidate_with, TransitionKind};
 use engram::model::{EngramConfig, Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
 
@@ -252,8 +254,8 @@ impl Replayer {
             EventKind::Tick => self.apply_tick(ev.t),
             EventKind::Query { query } => {
                 let tokens = tokenize_query(query);
-                let cands = recall_candidates(&self.mems, &tokens, false, 10, ev.t);
-                let hit = cands.iter().any(|c| c.memory.id == ev.id);
+                let out = recall_candidates(&self.mems, &RecallQuery::new(&tokens, false, 10, ev.t));
+                let hit = out.candidates.iter().any(|c| c.memory.id == ev.id);
                 self.stats.query_hits.push((ev.id.clone(), hit));
             }
         }

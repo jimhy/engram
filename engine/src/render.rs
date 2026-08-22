@@ -170,14 +170,19 @@ const ONDEMAND_INDEX_MAX_TAGS: usize = 16;
 /// 1. 按指针查 ground truth、不要凭印象（历史前言的语义，逐字保留）；
 /// 2. 声明常驻层只有 L1/L2/L4.1/L4.2，L3 普通层与 L4.3 项目普通层是按需层；
 /// 3. 三个必须主动检索的时机（易踩坑操作前 / 不可逆决定前 / 用户提「上次」「之前」）；
-/// 4. `recall` 的命令形态，以及「中文必须空格分词」这一硬约束。
+/// 4. `recall` 的命令形态，以及「查不到时它会明说」这一行为承诺。
 ///
 /// 它是**每轮都注入**的常驻成本，任何增补都要按「每个字都要挣得其位」审。
+///
+/// 第 4 行原本写的是「中文必须空格分词」，那是 [`crate::commands::segment_field`]
+/// 引入 CJK 二元 ngram **之前**的约束，早已与实现不符（照它写反而会误导）。
+/// 换成两条今天真实成立、且能改变调用方行为的信息：中文可直接写自然语句；
+/// 查不到时会明确弃权而不是硬凑候选（见 [`crate::retrieval`]）。
 pub const HOT_INDEX_PREAMBLE: &str = concat!(
     "「以下是你的 engram 长期记忆热索引。需要细节时按每条的指针去查 ground truth，不要凭印象。\n",
     "常驻的只有 L1/L2/L4.1/L4.2 四层；L3 普通层与 L4.3 项目普通层是按需层——不在下面、不检索就看不到（末尾[按需层]一行给了条数与主题词）。\n",
     "三种时机务必先检索再动手：① 要做易踩坑的事之前 ② 要做不可逆决定之前 ③ 用户说「上次 / 之前 / 还记得吗」。\n",
-    "检索：engram recall --query \"词1 词2\"（库路径用 engram resolve 拿；词法匹配 cue+tags，中文必须空格分词）」",
+    "检索：engram recall --query \"直接写自然语句，中文会自动切词\"（库路径用 engram resolve 拿；库里没有时它会明说「无相关记忆」，不会硬凑）」",
 );
 
 /// 不参与逐条裁尾的渲染片所用的节组 id（见 [`RenderPiece::group`]）。
@@ -479,7 +484,7 @@ fn render_ondemand_index(memories: &[Memory]) -> Option<String> {
 
     // 2. 固定两行：目录行 + 查法行。
     const HOW: &str =
-        "  查法：engram recall --query \"词1 词2\"（库路径见 engram resolve；词法匹配 cue+tags，中文须空格分词）\n";
+        "  查法：engram recall --query \"直接写自然语句\"（库路径见 engram resolve；匹配 cue+tags，中文自动切词；可加 --tag/--level 缩小范围）\n";
     const TAGS_PREFIX: &str = "  主题词（可直接作查询词）：";
     let mut out = format!("\n[按需层] 未常驻、须显式检索：{}\n", items.join(" · "));
     out.push_str(HOW);
