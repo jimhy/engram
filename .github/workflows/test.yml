@@ -66,10 +66,15 @@ jobs:
         working-directory: kb
         run: cargo test --locked
 
-  # 三端一致性校验：scripts/check-adapter-sync.sh 假定的目录布局是
-  #   <root>/plugin + <root>/adapters/codex + <root>/adapters/opencode
-  # （脚本以自身位置的上上级为 root）。三者各是独立 git 仓库，本仓库的 checkout
-  # 里没有 adapters/，所以这里按该布局把三个仓库拼装出来再跑脚本。
+  # 四端一致性校验：scripts/check-adapter-sync.sh 假定的目录布局是
+  #   <root>/plugin + <root>/adapters/codex + <root>/adapters/opencode + <root>/adapters/kimi
+  # （脚本以自身位置的上上级为 root）。四者各是独立 git 仓库，本仓库的 checkout
+  # 里没有 adapters/，所以这里按该布局把四个仓库拼装出来再跑脚本。
+  #
+  # ⚠ 这里 checkout 的适配器必须与脚本里 prompt_copies / skill_copies 两个数组
+  #   **逐个对齐**：脚本把「副本文件缺失」判定为漂移（不是跳过），少 checkout 一个
+  #   适配器，CI 就会以「文件缺失」失败，而本地因为目录真实存在照样通过。
+  #   往数组里加端时，务必同步在这里加一个 checkout。
   #
   # 另：opencode 的 engram-desktop-bundle/ 是生成物（在其仓库中被 .gitignore，
   # 由 export-desktop-bundle.sh 从 opencode-plugin/ 复制产出），checkout 后必须
@@ -94,6 +99,11 @@ jobs:
           repository: jimhy/engram-opencode
           token: ${{ secrets.ADAPTER_DISPATCH_TOKEN || github.token }}
           path: adapters/opencode
+      - uses: actions/checkout@v4
+        with:
+          repository: jimhy/engram-kimi
+          token: ${{ secrets.ADAPTER_DISPATCH_TOKEN || github.token }}
+          path: adapters/kimi
       - name: 重建 desktop bundle（生成物，不在 opencode 仓库里）
         run: bash adapters/opencode/export-desktop-bundle.sh
       - name: check-adapter-sync

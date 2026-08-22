@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# check-adapter-sync.sh —— 三端一致性校验入口
+# check-adapter-sync.sh —— 四端一致性校验入口
 #
 # 用法（在仓库任意位置执行均可）：
 #   bash plugin/scripts/check-adapter-sync.sh
 #
 # 校验内容：主插件的两份"内核资产"与各适配器副本是否漂移——
 #   1. scripts/reviewer-prompt.md：要求与主版**逐字节一致**
-#      （codex / opencode 的转录格式说明由各自 launcher 在运行时追加，不进模板文件）；
+#      （codex / opencode / kimi 的转录格式说明由各自 launcher 在运行时追加，不进模板文件）；
 #   2. skills/engram/SKILL.md：剔除适配器端特有段后要求与主版一致。
 #      合法的端特有差异只允许放在成对标记
 #      `<!-- adapter:begin ... -->` / `<!-- adapter:end -->` 之间
@@ -14,7 +14,7 @@
 #   3. 各适配器 SKILL.md 副本之间要求逐字节一致（防适配器间互相漂移）。
 #
 # 有任何差异：非零退出并列出漂移文件；全部一致：exit 0。
-# 改了主版 prompt / SKILL 后，跑一次本脚本确认已同步三端（同步方式见各差异行提示）。
+# 改了主版 prompt / SKILL 后，跑一次本脚本确认已同步四端（同步方式见各差异行提示）。
 set -u
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +28,13 @@ prompt_copies=(
   "$root/adapters/codex/plugin/scripts/reviewer-prompt.md"
   "$root/adapters/opencode/opencode-plugin/scripts/reviewer-prompt.md"
   "$root/adapters/opencode/engram-desktop-bundle/engram-data/scripts/reviewer-prompt.md"
+  "$root/adapters/kimi/scripts/reviewer-prompt.md"
 )
 skill_copies=(
   "$root/adapters/codex/plugin/skills/engram/SKILL.md"
   "$root/adapters/opencode/opencode-plugin/skills/engram/SKILL.md"
   "$root/adapters/opencode/engram-desktop-bundle/engram-data/skills/engram/SKILL.md"
+  "$root/adapters/kimi/skills/engram/SKILL.md"
 )
 
 fail=0
@@ -74,8 +76,8 @@ for f in "${skill_copies[@]:1}"; do
 done
 
 if [ "$fail" -ne 0 ]; then
-  echo '结论：三端存在漂移（见上），请同步后重跑。'
+  echo '结论：四端存在漂移（见上），请同步后重跑。'
   exit 1
 fi
-echo '三端一致：reviewer-prompt.md 与 SKILL.md 均无漂移。'
+echo '四端一致：reviewer-prompt.md 与 SKILL.md 均无漂移。'
 exit 0

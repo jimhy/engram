@@ -6,6 +6,8 @@
 
 > **在用 Codex,或 Claude Code 和 Codex 一起用?** 也有 Codex 适配器:**[engram-codex](https://github.com/jimhy/engram-codex)**。同一引擎、**共用记忆库**(`~/.engram` + 各项目 `.engram/`),两个 CLI 的记忆互通。
 
+> **在用 Kimi Code?** 也有 Kimi 适配器:**[engram-kimi](https://github.com/jimhy/engram-kimi)**。同一引擎、**共用记忆库**,多个 CLI 的记忆互通。
+
 ---
 
 ## 为什么

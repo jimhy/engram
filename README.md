@@ -6,6 +6,8 @@
 
 > **Using Codex instead of — or alongside — Claude Code?** There's a Codex adapter too: **[engram-codex](https://github.com/jimhy/engram-codex)**. Same engine, **shared memory store** (`~/.engram` + per-project `.engram/`), so memories are common to both CLIs.
 
+> **Using Kimi Code?** There's a Kimi adapter too: **[engram-kimi](https://github.com/jimhy/engram-kimi)**. Same engine, **shared memory store**, so memories are common to every CLI.
+
 ---
 
 ## Why
