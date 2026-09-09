@@ -70,20 +70,15 @@ install_from() {
   return 0
 }
 
-# ---------- 廉价短路：字节数相同即认定同版本 ----------
-# 本脚本挂在 SessionStart 上，绝大多数情况下公共位置早已是最新，这条路径必须零进程开销。
-# 同版本同平台的 CI 产物字节数一致，所以「大小相同」足以短路掉后面两次 `--version`
-# （各约 20ms）。最坏情况只是漏掉一次同步，不会装错版本。
-size_of() { wc -c < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
-
-if [ "$mode" != "--force" ] && [ -f "$dest" ] && [ -f "$self" ]; then
-  if [ "$(size_of "$dest")" = "$(size_of "$self")" ]; then
-    [ "$mode" = "--check-only" ] && echo "ENGRAM_STATE=ok"
-    echo "ENGRAM_BIN=$dest"
-    exit 0
-  fi
-fi
-
+# ---------- 版本比较：一律实打实地问二进制 ----------
+# ⚠ 这里**曾经**有个「字节数相同即认定同版本」的短路，为的是省掉两次 `--version`
+# （各约 20ms）。它是错的，而且错得很隐蔽：只要某次发版没动 Rust 源码（只改脚本 /
+# 文档 / 清单），四平台二进制字节数就**完全相同**——v1.4.0 与 v1.5.0 的
+# engram-windows-x86_64.exe 都是 3431936 字节，实测撞上。那不是「漏掉一次同步」，
+# 而是此后**永久**判成 ok、收敛器彻底失效，公共位置一直停在旧版。
+# 而「只改脚本不改引擎」恰恰是最常见的发版类型，所以这条短路必须去掉。
+# 代价可以接受：本脚本只挂 SessionStart（每会话一次），而 SessionStart 本来就有
+# hot-index / catchup / kb-digest 三个 hook 各起一次进程，多这 40ms 无关痛痒。
 have="$(bin_version "$dest")"
 want="$(bin_version "$self")"
 
