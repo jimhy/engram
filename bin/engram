@@ -45,6 +45,17 @@ if [ -z "$bin" ]; then
   esac
 fi
 
+# 二进制解析三档（ENGRAM_BIN 覆盖 → 公共位置 → 插件自带的兜底）。
+# 公共位置 ~/.engram/bin/ 是**全机唯一一份**：与记忆库 ~/.engram 同目录、不隶属任何
+# CLI，engram-kb sidecar 本来就装在那儿。各家 CLI 共用一份的好处是版本天然统一——
+# 否则 claude 装 1.5.0、codex 还停在 1.3.0，同一个库被不同版本的引擎读写。
+# 判断只做一次 `-f`（stat 级开销）：这条 shim 每条 hook 都要过，绝不能在这里起子进程。
+if [ -n "${ENGRAM_BIN:-}" ]; then
+  bin="$ENGRAM_BIN"
+elif [ -f "$HOME/.engram/bin/$(basename "$bin")" ]; then
+  bin="$HOME/.engram/bin/$(basename "$bin")"
+fi
+
 if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
   echo "engram: no binary for this platform at $bin (run a tagged release to build it)" >&2
   exit 127

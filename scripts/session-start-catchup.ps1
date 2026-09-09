@@ -12,7 +12,12 @@ $ErrorActionPreference = 'Stop'
 try {
     $root = $env:CLAUDE_PLUGIN_ROOT
     if (-not $root) { exit 0 }
-    $ENGRAM = Join-Path $root 'bin\engram-windows-x86_64.exe'
+    # 二进制解析三档：ENGRAM_BIN 覆盖 → 公共位置（全机一份，与 ~/.engram 库同目录、
+    # 不隶属任何 CLI）→ 插件自带的兜底（离线 / 未装公共位置时）。
+    $shared = Join-Path $env:USERPROFILE '.engram\bin\engram-windows-x86_64.exe'
+    if     ($env:ENGRAM_BIN)   { $ENGRAM = $env:ENGRAM_BIN }
+    elseif (Test-Path $shared) { $ENGRAM = $shared }
+    else                       { $ENGRAM = Join-Path $root 'bin\engram-windows-x86_64.exe' }
     $CLI = if ($env:ENGRAM_REVIEWER_CLI) { $env:ENGRAM_REVIEWER_CLI } else { 'claude' }
 
     $work = Join-Path $env:USERPROFILE '.engram\pending'

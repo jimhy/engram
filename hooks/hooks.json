@@ -1,5 +1,5 @@
 {
-  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
+  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。ensure-engram.sh 把引擎收敛到公共位置 ~/.engram/bin（全机一份、谁新用谁，静默 best-effort）。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
   "hooks": {
     "SessionStart": [
       {
@@ -15,6 +15,10 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/kb-session-digest.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/ensure-engram.sh\" >/dev/null 2>&1 || true"
           }
         ]
       }
