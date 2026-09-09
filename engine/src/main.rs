@@ -30,6 +30,11 @@
 //!   或 `json` 格式打印 general/作用域库路径、作用域名与 kind，供脚本再去调别的命令；
 //! - `root`：把某目录设为 engram「项目管理目录」（在其 `.engram/` 下写 workspace 标记）。
 //!
+//! 另外，[`dispatch`] 在解析命令行**之前**先过一道**宿主接管**判定（见
+//! [`engram::host`]）：被 AIChat 这类「一个客户端里跑多条引擎路」的宿主拉起时，
+//! hook 类子命令静默让路、数据类子命令走文件桥转给宿主执行；判定只认环境变量，
+//! 所以终端里直跑的 CLI 完全不受影响。
+//!
 //! 设计文档参考：§6 升降级、§7 降级去向、§13 交付形态（存储选定 redb、多库分置）。
 
 use std::collections::{BTreeMap, HashSet};
@@ -48,6 +53,7 @@ use engram::commands::{
 };
 use engram::consolidate::{consolidate, Transition, TransitionKind};
 use engram::health::{self, HealthReport};
+use engram::host;
 use engram::model::{
     params, EngramConfig, Level, Memory, Pointer, Status, ENGRAM_DATA_VERSION,
     MEMORY_SCHEMA_VERSION,
@@ -874,7 +880,65 @@ fn main() -> ExitCode {
 }
 
 /// 程序主逻辑（跑在 [`main`] 起的大栈工作线程上）。返回进程退出码。
+///
+/// 先过一道**宿主接管**判定（见 [`engram::host`]）：被 AIChat 这类宿主客户端拉起时，
+/// hook 类子命令静默让路、数据类子命令走文件桥转发；没有那几个环境变量（Windows
+/// Terminal 里直跑的 CLI）就原样走 [`dispatch_direct`]，行为一个字不变。
 fn dispatch() -> ExitCode {
+    // 判定必须发生在 `Cli::parse()` **之前**：转发要的是原样命令行，且模型敲的
+    // `engram recall --query x` 常常缺 `--general-db`——先解析就会在这里报错退出，
+    // 根本轮不到转发。参数含非法 UTF-8 时用 lossy 兜住，不让取参本身 panic。
+    let raw: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    match host::decide(host::subcommand_of(&raw), real_env_lookup) {
+        host::HostAction::Direct => {}
+        // hook 类让路：不输出、不写任何文件、退出 0。热索引与复盘由宿主统一做。
+        host::HostAction::Noop => return ExitCode::SUCCESS,
+        host::HostAction::Forward {
+            dir,
+            timeout_ms,
+            session,
+        } => {
+            // raw 非空才可能判成 Forward（子命令名就取自 raw[0]），这里 split 只是拿走参数。
+            let (cmd, args) = raw.split_first().expect("Forward 判定保证 raw 非空");
+            match host::forward(&dir, cmd, args, session.as_deref(), timeout_ms) {
+                Ok(resp) => return emit_host_response(&resp),
+                // 死规矩：桥不通就退回直连库。绝不能因为宿主没开或桥卡住，
+                // 让记忆命令失败或挂死——所以这里只记诊断，然后落到下面照常执行。
+                Err(e) => {
+                    if host::debug_on(real_env_lookup) {
+                        eprintln!("engram: 宿主转发未成（{e}），退回直连库执行");
+                    }
+                }
+            }
+        }
+    }
+    dispatch_direct()
+}
+
+/// 原样打印宿主回执并按其 `exit_code` 退出。
+///
+/// stdout / stderr **一字不增不减**地写出（不补换行），退出码 0 直接成功；
+/// 非 0 且落在 `u8` 内就原样透传，越界（如 256、负数）统一收敛成 1——
+/// 进程退出码本就只有一个字节，硬转会静默变成别的值。
+fn emit_host_response(resp: &host::HostResponse) -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(resp.stdout.as_bytes());
+    let _ = out.flush();
+    let mut err = std::io::stderr();
+    let _ = err.write_all(resp.stderr.as_bytes());
+    let _ = err.flush();
+    match resp.exit_code {
+        0 => ExitCode::SUCCESS,
+        code => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+    }
+}
+
+/// 直连库执行：解析命令行并分派到各 `run_*`。这是 engram 一贯的行为路径。
+fn dispatch_direct() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Render {

@@ -5,6 +5,7 @@
 //! - [`activation`]：衰减与加固的懒计算；
 //! - [`consolidate`]：升降级状态机（纯算法）；
 //! - [`health`]：`doctor` 体检 / `migrate` 迁移共享的**纯只读**诊断扫描；
+//! - [`host`]：宿主接管协议（`ENGRAM_HOST_*` 让路判定 + 文件桥转发客户端）；
 //! - [`commands`]：write / recall / list 三命令的可测纯逻辑内核；
 //! - [`retrieval`]：BM25 打分与弃权判据（recall 的排序键，取代旧的子串命中率）；
 //! - [`render`]：热索引渲染与 JSON 目录加载（后者现仅服务 `import`）；
@@ -19,6 +20,7 @@ pub mod activation;
 pub mod commands;
 pub mod consolidate;
 pub mod health;
+pub mod host;
 pub mod model;
 pub mod render;
 pub mod retrieval;

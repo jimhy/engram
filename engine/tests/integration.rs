@@ -6888,3 +6888,493 @@ fn reword_rewrites_cue_but_preserves_use_history() {
 
     cleanup_file(&general_path);
 }
+
+// ============================================================================
+// 宿主接管协议（ENGRAM_HOST_*）：让路 no-op、文件桥转发、桥不通退回直连
+// ============================================================================
+
+/// 会影响宿主接管判定的全部环境变量。
+const HOST_ENV_KEYS: &[&str] = &[
+    "ENGRAM_HOST",
+    "ENGRAM_HOST_DIR",
+    "ENGRAM_HOST_SESSION",
+    "ENGRAM_HOST_BYPASS",
+    "ENGRAM_HOST_TIMEOUT_MS",
+    "ENGRAM_HOST_DEBUG",
+];
+
+/// 起一个 engram 子进程命令，并先把全部 `ENGRAM_HOST*` 变量清干净。
+///
+/// 跑测试的这个进程自己就可能待在某个宿主客户端里（AIChat 起的终端），
+/// 不清就会把宿主的环境串进来，把「无宿主」基线用例污染成转发。
+fn engram_cmd(subcommand: &str) -> Command {
+    let exe = env!("CARGO_BIN_EXE_engram");
+    let mut cmd = Command::new(exe);
+    for k in HOST_ENV_KEYS {
+        cmd.env_remove(k);
+    }
+    cmd.arg(subcommand);
+    cmd
+}
+
+/// 在临时目录下构造一个进程内唯一的文件桥目录路径；`create` 为真时顺手建出来。
+fn unique_bridge_dir(tag: &str, create: bool) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    let pid = std::process::id();
+    dir.push(format!("engram_it_rpc_{tag}_{pid}_{}", unique_suffix()));
+    if create {
+        std::fs::create_dir_all(&dir).expect("应能创建临时文件桥目录");
+    }
+    dir
+}
+
+/// 起一个后台「假宿主」：盯着 `req.jsonl`，见到第一条请求就按给定内容写回执。
+///
+/// 返回的句柄 join 后给出那条请求 JSON（`None` 表示到超时都没等到请求），
+/// 供用例断言协议字段。最多盯 10 秒，免得测试挂死。
+fn spawn_fake_host(
+    dir: &Path,
+    stdout: String,
+    stderr: String,
+    exit_code: i64,
+) -> std::thread::JoinHandle<Option<serde_json::Value>> {
+    let req_path = dir.join("req.jsonl");
+    let resp_path = dir.join("resp.jsonl");
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&req_path) {
+                if let Some(line) = raw.lines().find(|l| !l.trim().is_empty()) {
+                    if let Ok(req) = serde_json::from_str::<serde_json::Value>(line) {
+                        let id = req["id"].as_str().unwrap_or_default().to_string();
+                        let resp = serde_json::json!({
+                            "id": id,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": exit_code,
+                        });
+                        let mut body = serde_json::to_string(&resp).expect("回执应可序列化");
+                        body.push('\n');
+                        std::fs::write(&resp_path, body).expect("应能写回执");
+                        return Some(req);
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })
+}
+
+// 宿主 1. 验收口径②：ENGRAM_HOST 置位时 hook 类子命令静默 no-op——
+//         输出为空、退出 0、不产生任何文件写入；同一条命令在没有该变量时照常有输出。
+#[test]
+fn host_takeover_makes_hook_commands_silent_noop() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let proj = unique_workspace_root("host_noop");
+    let proj_name = last_segment(&proj);
+    let _proj_db = seed_engram_db(
+        &proj,
+        &[make(
+            "noop_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let general_path = seed_db(
+        "host_noop_g",
+        &[make(
+            "noop_gen",
+            Level::L1,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+    let root = proj.to_string_lossy().to_string();
+    let state = proj.join("gate.state");
+    let status_dir = proj.join("status");
+    let log = proj.join("hook.log");
+
+    // 先取「没有宿主变量」的基线：照常有热索引输出。
+    let base = engram_cmd("hot-index")
+        .args([
+            "--general-db",
+            &g,
+            "--workspace-root",
+            &root,
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(base.status.success(), "基线 hot-index 应成功");
+    let base_out = String::from_utf8(base.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        base_out.contains("cue-noop_gen"),
+        "基线应注入热索引，实得：\n{base_out}"
+    );
+
+    // 再带上 ENGRAM_HOST：静默 no-op。参数一律给到位，证明让路发生在解析与执行之前。
+    let out = engram_cmd("hot-index")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_SESSION", "s_test")
+        .args([
+            "--general-db",
+            &g,
+            "--workspace-root",
+            &root,
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--status-dir",
+            status_dir.to_string_lossy().as_ref(),
+            "--log",
+            log.to_string_lossy().as_ref(),
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(out.status.success(), "hot-index 让路后应退出 0");
+    assert!(
+        out.stdout.is_empty(),
+        "hot-index 让路后 stdout 应为空，实得：{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "hot-index 让路后 stderr 应为空，实得：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 一个文件都不许写。
+    assert!(!state.exists(), "让路后不应写门控 state");
+    assert!(!status_dir.exists(), "让路后不应建状态栏目录");
+    assert!(!log.exists(), "让路后不应写 hook 日志");
+
+    // 另外三个 hook 类子命令同样让路：连它们各自的必填参数都不给也照样 exit 0，
+    // 说明判定确实在 clap 解析之前。
+    for sub in ["catchup-scan", "review-prepare", "session-start"] {
+        let out = engram_cmd(sub)
+            .env("ENGRAM_HOST", "aichat")
+            .output()
+            .expect("运行 engram 二进制失败");
+        assert!(out.status.success(), "{sub} 让路后应退出 0");
+        assert!(out.stdout.is_empty(), "{sub} 让路后 stdout 应为空");
+        assert!(out.stderr.is_empty(), "{sub} 让路后 stderr 应为空");
+    }
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 宿主 2. 验收口径③：ENGRAM_HOST_DIR 指向不存在的目录 → recall 照常返回正确结果
+//         （退回直连），不报错、不卡住、也不顺手把那个目录建出来。
+#[test]
+fn host_forward_falls_back_when_bridge_dir_missing() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let general_path = seed_db(
+        "host_nodir_g",
+        &[make(
+            "nodir_hit",
+            Level::L3,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+    let missing = unique_bridge_dir("nodir", false);
+
+    let began = std::time::Instant::now();
+    let out = engram_cmd("recall")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_DIR", missing.to_string_lossy().as_ref())
+        .args([
+            "--general-db",
+            &g,
+            "--query",
+            "cue-nodir_hit",
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    let elapsed = began.elapsed();
+
+    assert!(
+        out.status.success(),
+        "桥目录不存在时 recall 仍应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout.contains("nodir_hit"),
+        "应退回直连库并命中，实得：\n{stdout}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "目录不存在应立刻退回、不等超时，实耗 {elapsed:?}"
+    );
+    assert!(!missing.exists(), "不该顺手把桥目录建出来（建了也没人消费）");
+
+    cleanup_file(&general_path);
+}
+
+// 宿主 3. 验收口径④：桥目录真实存在但没人消费 req.jsonl → 等到超时后退回直连返回
+//         正确结果；且请求确实投递过、字段齐全（含 ts/timeout_ms 供宿主判过期）。
+#[test]
+fn host_forward_falls_back_on_timeout() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let general_path = seed_db(
+        "host_timeout_g",
+        &[make(
+            "timeout_hit",
+            Level::L3,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+    let bridge = unique_bridge_dir("timeout", true);
+
+    let out = engram_cmd("recall")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_DIR", bridge.to_string_lossy().as_ref())
+        .env("ENGRAM_HOST_TIMEOUT_MS", "300")
+        .args([
+            "--general-db",
+            &g,
+            "--query",
+            "cue-timeout_hit",
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+
+    assert!(
+        out.status.success(),
+        "超时后应退回直连并成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout.contains("timeout_hit"),
+        "应退回直连库并命中，实得：\n{stdout}"
+    );
+    // 请求投递过：宿主晚点起来也能看懂，并能靠 ts+timeout_ms 判「已被放弃、别再执行」。
+    let req = std::fs::read_to_string(bridge.join("req.jsonl")).expect("应能读 req.jsonl");
+    let line = req.lines().next().expect("应有一行请求");
+    let v: serde_json::Value = serde_json::from_str(line).expect("请求行应是 JSON");
+    assert_eq!(v["cmd"], "recall", "cmd 应为子命令名");
+    assert_eq!(v["args"][0], "--general-db", "args 应是原样命令行参数");
+    assert_eq!(v["timeout_ms"], 300, "timeout_ms 应透传本次超时");
+    assert!(v["ts"].as_u64().is_some_and(|t| t > 0), "ts 应是 unix 毫秒");
+    assert!(v["id"].as_str().is_some_and(|s| !s.is_empty()), "id 不应为空");
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&bridge);
+}
+
+// 宿主 4. 转发主路径：桥另一头有人应答 → 原样打印宿主回执、按其 exit_code 退出，
+//         且**完全不碰库**（连必填的 --general-db 都没给也照跑，证明转发在解析之前）。
+#[test]
+fn host_forward_uses_response_and_skips_local_db() {
+    let _guard = test_guard();
+    let bridge = unique_bridge_dir("answer", true);
+    let host = spawn_fake_host(
+        &bridge,
+        "宿主替你查到了\n".to_string(),
+        "note\n".to_string(),
+        7,
+    );
+
+    let out = engram_cmd("recall")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_SESSION", "s_mttqfar6")
+        .env("ENGRAM_HOST_DIR", bridge.to_string_lossy().as_ref())
+        .args(["--query", "随便问点什么"])
+        .output()
+        .expect("运行 engram 二进制失败");
+
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "宿主替你查到了\n",
+        "stdout 应原样照抄宿主回执"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "note\n",
+        "stderr 应原样照抄宿主回执"
+    );
+    assert_eq!(out.status.code(), Some(7), "退出码应取回执的 exit_code");
+
+    let req = host
+        .join()
+        .expect("假宿主线程不应 panic")
+        .expect("应收到请求");
+    assert_eq!(req["cmd"], "recall");
+    assert_eq!(req["args"][0], "--query");
+    assert_eq!(req["session"], "s_mttqfar6", "ENGRAM_HOST_SESSION 应原样透传");
+    assert_eq!(req["protocol"], 1, "应带协议版本号");
+    assert!(req["cwd"].is_string(), "应带 cwd 供宿主锚定作用域");
+
+    let _ = std::fs::remove_dir_all(&bridge);
+}
+
+// 宿主 5. 防自噬：宿主自己调引擎干活时置 ENGRAM_HOST_BYPASS=1 → 让路与转发全部关闭，
+//         照常直连库执行（否则这次执行又转发回桥，死循环）。
+#[test]
+fn host_bypass_disables_takeover_entirely() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let general_path = seed_db(
+        "host_bypass_g",
+        &[make(
+            "bypass_hit",
+            Level::L1,
+            None,
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+    let bridge = unique_bridge_dir("bypass", true);
+    let ws = unique_workspace_root("host_bypass_ws");
+
+    // 数据类：BYPASS 置位 → 不转发（桥里不该出现请求），直连库拿到真结果。
+    let out = engram_cmd("recall")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_DIR", bridge.to_string_lossy().as_ref())
+        .env("ENGRAM_HOST_BYPASS", "1")
+        .args([
+            "--general-db",
+            &g,
+            "--query",
+            "cue-bypass_hit",
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(out.status.success(), "BYPASS 下 recall 应成功");
+    let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        stdout.contains("bypass_hit"),
+        "应直连库命中，实得：\n{stdout}"
+    );
+    assert!(
+        !bridge.join("req.jsonl").exists(),
+        "BYPASS 下不该往桥里投请求（投了就是自噬死循环）"
+    );
+
+    // hook 类：BYPASS 置位 → 不让路，照常输出热索引（宿主要靠它自己跑注入）。
+    let hi = engram_cmd("hot-index")
+        .env("ENGRAM_HOST", "aichat")
+        .env("ENGRAM_HOST_DIR", bridge.to_string_lossy().as_ref())
+        .env("ENGRAM_HOST_BYPASS", "1")
+        .args([
+            "--general-db",
+            &g,
+            "--workspace-root",
+            ws.to_string_lossy().as_ref(),
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(hi.status.success(), "BYPASS 下 hot-index 应成功");
+    let hi_out = String::from_utf8(hi.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        hi_out.contains("cue-bypass_hit"),
+        "BYPASS 下 hot-index 不应让路，实得：\n{hi_out}"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&bridge);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// 宿主 6. 与直跑 CLI 并存：不带 ENGRAM_HOST* 变量（或显式关闭）时行为与从前一致
+//         ——这是「wt 里直跑的 claude/codex 一个字都不变」在引擎层的守门用例。
+#[test]
+fn without_host_env_behaviour_is_unchanged() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let general_path = seed_db(
+        "host_absent_g",
+        &[make(
+            "absent_hit",
+            Level::L2,
+            None,
+            Status::Active,
+            0.6,
+            now,
+            vec![now],
+        )],
+    );
+    let g = general_path.to_string_lossy().to_string();
+    let ws = unique_workspace_root("host_absent_ws");
+
+    // 空串与 "0"/"false" 都不算置位：误设成空值不该悄悄把人的记忆入口关掉。
+    for host_val in ["", "0", "false"] {
+        let out = engram_cmd("hot-index")
+            .env("ENGRAM_HOST", host_val)
+            .args([
+                "--general-db",
+                &g,
+                "--workspace-root",
+                ws.to_string_lossy().as_ref(),
+                "--now",
+                "1000000000",
+            ])
+            .output()
+            .expect("运行 engram 二进制失败");
+        assert!(out.status.success(), "ENGRAM_HOST={host_val:?} 时应成功");
+        let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+        assert!(
+            stdout.contains("cue-absent_hit"),
+            "ENGRAM_HOST={host_val:?} 不该被当成开启，实得：\n{stdout}"
+        );
+    }
+
+    // 彻底没有这些变量时，recall 照常直连库。
+    let recall = engram_cmd("recall")
+        .args([
+            "--general-db",
+            &g,
+            "--query",
+            "cue-absent_hit",
+            "--now",
+            "1000000000",
+        ])
+        .output()
+        .expect("运行 engram 二进制失败");
+    assert!(recall.status.success(), "无宿主变量时 recall 应成功");
+    assert!(
+        String::from_utf8_lossy(&recall.stdout).contains("absent_hit"),
+        "无宿主变量时 recall 应直连库命中"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&ws);
+}
