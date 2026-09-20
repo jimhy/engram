@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 
 use crate::activation::effective;
 use crate::retrieval::{self, AbstainReason, TokenHit};
-use crate::model::{Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
+use crate::model::{
+    MIN_PLAUSIBLE_CREATED_AT,Level, Memory, Pointer, Status, MEMORY_SCHEMA_VERSION};
 
 /// 判断一个层级是否属于 L4 轨道（项目记忆）。
 ///
@@ -299,6 +300,36 @@ pub fn generate_id(cue: &str, now: f64) -> String {
     format!("mem-{now_nanos:x}-{hash:x}")
 }
 
+/// 从记忆 id 里解出创建时间，[`generate_id`] 的**逆运算**。
+///
+/// id 形如 `mem-<创建纳秒的十六进制>-<cue hash 的十六进制>`，第二段就是创建时刻。
+/// 解不出（格式不符、非法十六进制）或解出的时间不合理
+/// （低于 [`MIN_PLAUSIBLE_CREATED_AT`]、或远在未来）时返回 `None`。
+///
+/// # 用途与可信度
+///
+/// 专供修复 `created_at` 被写成占位值的坏数据（见 [`MIN_PLAUSIBLE_CREATED_AT`]）。
+/// 2026-09-20 在真实库上验过这个回填源的可信度：
+///
+/// - 705 条 `created_at` 正常的记忆里，**96.5% 的 id 解码值与 `created_at` 完全相等**
+///   （差值中位 0 秒）；
+/// - 有差异的 25 条（3.5%）全是解码值**晚于** `created_at`，符合 `merge` / `graduate`
+///   这类「铸了新 id、但刻意保留原始创建时间」的语义——所以**只在 `created_at`
+///   本就是坏数据时才用它回填**，绝不拿它去覆盖正常值；
+/// - 那 59 条坏数据里有真实 `access_log` 的 21 条，解码出的创建时间**无一晚于**
+///   它自己最早一次使用——交叉验证通过。
+pub fn created_at_from_id(id: &str) -> Option<f64> {
+    let nanos_hex = id.strip_prefix("mem-")?.split('-').next()?;
+    let nanos = u128::from_str_radix(nanos_hex, 16).ok()?;
+    let secs = nanos as f64 / 1_000_000_000.0;
+    // 上界给得宽松（比当前时间晚也可能是钟不准），下界才是本函数要防的那一侧。
+    if secs >= MIN_PLAUSIBLE_CREATED_AT && secs.is_finite() {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
 /// 把逗号分隔的标签字符串解析为标签列表。
 ///
 /// 按逗号切分、去除每段首尾空白、丢弃空段。`None` 或空串得到空列表。
@@ -471,6 +502,13 @@ pub struct RecallOutcome<'a> {
     pub abstain: Option<AbstainReason>,
     /// 弃权时给调用方的下一步提示：本库里最常见的若干主题词。
     pub suggestions: Vec<String>,
+    /// 最强候选的**归一化命中强度**（`top1 的 BM25 分 ÷ Corpus::idf_max`）。
+    ///
+    /// 单独暴露出来，是为了让 prompt 级注入
+    /// （[`crate::retrieval::inject_tier`]）判档时**不必重建一次语料**——
+    /// 重建既浪费又会引入「两处各算一遍、悄悄算得不一样」的分叉风险。
+    /// 无候选（或用 legacy 打分器）时为 `0.0`。
+    pub hit_strength: f64,
 }
 
 /// recall 的查询参数。
@@ -495,6 +533,12 @@ pub struct RecallQuery<'a> {
     pub level: Option<Level>,
     /// 项目过滤；`None` 不过滤。要求 `m.project == Some(project)`。
     pub project: Option<&'a str>,
+    /// **排除**这些层级；空切片表示不排除。
+    ///
+    /// 与 `level`（只搜某一层）是互补的两个维度，不能互相替代：prompt 级注入
+    /// 要的是「除常驻层之外的全部」，用单层过滤根本表达不出来。
+    /// 取值见 [`crate::retrieval::INJECT_SKIP_RESIDENT_LEVELS`]。
+    pub exclude_levels: &'a [Level],
 }
 
 impl<'a> RecallQuery<'a> {
@@ -509,6 +553,7 @@ impl<'a> RecallQuery<'a> {
             tag: None,
             level: None,
             project: None,
+            exclude_levels: &[],
         }
     }
 }
@@ -570,6 +615,7 @@ pub fn recall_candidates<'a>(mems: &'a [Memory], q: &RecallQuery<'_>) -> RecallO
             Some(p) => m.project.as_deref() == Some(p),
             None => true,
         })
+        .filter(|m| !q.exclude_levels.contains(&m.level))
         .collect();
 
     // 2. 打分。
@@ -629,13 +675,19 @@ pub fn recall_candidates<'a>(mems: &'a [Memory], q: &RecallQuery<'_>) -> RecallO
         }
     };
 
+    // 命中强度必须在 truncate **之前**按全局 top1 算（与弃权判定同口径）。
+    let hit_strength = match &corpus {
+        Some(c) => cands.first().map(|x| x.score).unwrap_or(0.0) / c.idf_max(),
+        None => 0.0,
+    };
+
     cands.truncate(q.limit);
     let suggestions = if abstain.is_some() {
         top_topics(&pool, 8)
     } else {
         Vec::new()
     };
-    RecallOutcome { candidates: cands, abstain, suggestions }
+    RecallOutcome { candidates: cands, abstain, suggestions, hit_strength }
 }
 
 /// 在一批记忆里按 status/level/project 过滤后，按 `effective(now)` 降序排序。
@@ -1334,6 +1386,36 @@ mod tests {
     }
 
     #[test]
+    fn created_at_from_id_is_the_inverse_of_generate_id() {
+        // 往返一致：generate_id 写进去的时间，created_at_from_id 要能原样取回。
+        // 纳秒取整会丢掉亚纳秒尾数，故允许 1ns 级误差。
+        for secs in [1_600_000_000.0f64, 1_789_000_000.5, 1_800_000_000.25] {
+            let id = generate_id("随便一句 cue", secs);
+            let back = created_at_from_id(&id).expect("应能解出");
+            assert!(
+                (back - secs).abs() < 1e-6,
+                "往返不一致：写入 {secs} 取回 {back}（id={id}）"
+            );
+        }
+    }
+
+    #[test]
+    fn created_at_from_id_rejects_placeholder_and_garbage() {
+        // 占位值本身也是合法十六进制，但解出来早于合理下界，必须拒绝——
+        // 否则「用 id 回填」会把占位值原样填回去，等于没修。
+        let placeholder = generate_id("x", 1_000_000_000.0);
+        assert_eq!(
+            created_at_from_id(&placeholder),
+            None,
+            "解出 2001 年的值必须判为不可信"
+        );
+        assert_eq!(created_at_from_id("not-an-id"), None);
+        assert_eq!(created_at_from_id("mem-zzzz-abcd"), None, "非法十六进制");
+        assert_eq!(created_at_from_id(""), None);
+        assert_eq!(created_at_from_id("mem-"), None);
+    }
+
+    #[test]
     fn parse_project_dbs_builds_map() {
         let raw = vec!["a=/tmp/pa.redb".to_string(), "b=/tmp/pb.redb".to_string()];
         let map = parse_project_dbs(&raw).expect("应能解析");
@@ -1521,6 +1603,92 @@ mod tests {
         assert_eq!(tokens.len(), 5);
         let score = score_query(&m, &tokens);
         assert!((score - 0.8).abs() < 1e-12, "应命中 4/5，实得 {score}");
+    }
+
+    #[test]
+    fn exclude_levels_removes_those_layers_from_the_pool() {
+        // prompt 级注入靠这个维度只捞按需层：常驻层（L1/L2/L4.1/L4.2）已在热索引里，
+        // 再注入一遍纯属重复烧 token。
+        let now = 1_000_000_000.0;
+        let mut mems = vec![
+            mem("hot", Level::L2, None, Status::Active, "复用同一个关键词 甲"),
+            mem("cold", Level::L3, None, Status::Active, "复用同一个关键词 乙"),
+        ];
+        mems[0].importance = 0.9;
+        let tokens = tokenize_query("复用同一个关键词");
+
+        let all = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        assert_eq!(all.candidates.len(), 2, "不排除时两条都在");
+
+        let q = RecallQuery {
+            exclude_levels: &[Level::L2],
+            ..RecallQuery::new(&tokens, false, 10, now)
+        };
+        let out = recall_candidates(&mems, &q);
+        assert_eq!(out.candidates.len(), 1, "L2 应被排除，实得 {:?}",
+                   out.candidates.iter().map(|c| &c.memory.id).collect::<Vec<_>>());
+        assert_eq!(out.candidates[0].memory.id, "cold");
+    }
+
+    #[test]
+    fn exclude_levels_also_reshapes_idf_statistics() {
+        // 排除是在**建语料之前**生效的，所以被排掉的记忆不该再参与 IDF 统计。
+        // 这一点很重要：若先建全量语料再过滤结果，常驻层的词会稀释按需层的 IDF，
+        // 注入判档就会用错的统计量。
+        let now = 1_000_000_000.0;
+        let mut mems: Vec<Memory> = (0..10)
+            .map(|i| mem(&format!("hot{i}"), Level::L2, None, Status::Active, "公共词 常驻内容"))
+            .collect();
+        mems.push(mem("only", Level::L3, None, Status::Active, "公共词 独有内容"));
+        let tokens = tokenize_query("公共词");
+
+        let q = RecallQuery {
+            exclude_levels: &[Level::L2],
+            ..RecallQuery::new(&tokens, false, 10, now)
+        };
+        let out = recall_candidates(&mems, &q);
+        assert_eq!(out.candidates.len(), 1);
+        // 池里只剩 1 条时「公共词」是该条独有的高 IDF 词；若统计仍含那 10 条 L2，
+        // 它会变成烂大街词、强度被压到接近 0。
+        assert!(
+            out.hit_strength > 0.0,
+            "被排除的记忆不该参与 IDF 统计，实得强度 {}",
+            out.hit_strength
+        );
+    }
+
+    #[test]
+    fn hit_strength_is_global_top1_not_post_truncation() {
+        // hit_strength 必须按 truncate **之前**的全局 top1 算：
+        // limit 只该影响展示条数，不该改变「这次检索证据有多强」这个判断——
+        // 注入档位正是拿它判的，被 limit 带偏会让同一个 prompt 在不同 limit 下注入不同。
+        let now = 1_000_000_000.0;
+        let mems = vec![
+            mem("a", Level::L3, None, Status::Active, "目标词 甲"),
+            mem("b", Level::L3, None, Status::Active, "目标词 乙"),
+            mem("c", Level::L3, None, Status::Active, "目标词 丙"),
+        ];
+        let tokens = tokenize_query("目标词");
+        let wide = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        let narrow = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 1, now));
+        assert_eq!(narrow.candidates.len(), 1, "limit=1 只该展示一条");
+        assert!(wide.candidates.len() > 1, "前提：宽 limit 下确实有多条");
+        assert!(
+            (wide.hit_strength - narrow.hit_strength).abs() < 1e-12,
+            "强度不得随 limit 变化：宽 {} vs 窄 {}",
+            wide.hit_strength,
+            narrow.hit_strength
+        );
+    }
+
+    #[test]
+    fn hit_strength_is_zero_when_nothing_matches() {
+        let now = 1_000_000_000.0;
+        let mems = vec![mem("a", Level::L3, None, Status::Active, "毫不相干")];
+        let tokens = tokenize_query("完全另外的查询词");
+        let out = recall_candidates(&mems, &RecallQuery::new(&tokens, false, 10, now));
+        assert!(out.candidates.is_empty());
+        assert_eq!(out.hit_strength, 0.0, "零命中时强度必须是 0，不能是 NaN");
     }
 
     #[test]

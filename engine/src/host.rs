@@ -81,6 +81,10 @@ pub const POLL_INTERVAL_MS: u64 = 20;
 /// 免得老适配器绕过让路又注一遍。
 pub const HOOK_COMMANDS: &[&str] = &[
     "hot-index",
+    // prompt-recall 与 hot-index 同属 UserPromptSubmit 路径：宿主接管时同样让路，
+    // 由宿主统一决定注入什么。漏登记的后果是**双份注入**——宿主注一份、
+    // 子进程再注一份，而且两份可能来自不同版本的引擎。
+    "prompt-recall",
     "catchup-scan",
     "review-prepare",
     "session-start",

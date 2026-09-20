@@ -122,6 +122,24 @@ pub const MEMORY_SCHEMA_VERSION: u32 = 1;
 /// 读取约定：老库无 meta 表 → 视为版本 `1`（见 [`crate::store::read_data_version`]）。
 pub const ENGRAM_DATA_VERSION: u32 = 2;
 
+/// 记忆 `created_at` 的**合理下界**（2020-01-01 UTC，1577836800）。
+///
+/// 低于它的时间戳一律判为**占位值 / 坏数据**，而不是「很老的记忆」——
+/// engram 本身 2026 年才有，不可能存在 2020 年之前创建的记忆。
+///
+/// # 为什么需要这道判据
+///
+/// 2026-09-20 真实库体检查出 **59 条记忆的 `created_at` 恰好是 `1000000000`**
+/// （2001-09-09，一个典型的占位常量），全是 engram 项目的 L4.x，其中 8 条还在热层、
+/// 最近一次使用就在几天前。后果不是「显示的日期不好看」而是**权重被算错**：
+/// [`crate::activation::effective`] 用 `created_at` 算 grace boost，且 `access_log`
+/// 为空时拿它当隐式首次访问——于是这批记忆的 effective 中位数是 **−3.88**，
+/// 而正常记忆在 **−1** 上下，等于被架在淘汰队列的最前面。
+///
+/// 此前的体检只查**未来**时间戳（见 `health::has_future_timestamp`），
+/// 这类「远在过去的占位值」一条都没报出来。
+pub const MIN_PLAUSIBLE_CREATED_AT: f64 = 1_577_836_800.0;
+
 /// serde 缺省值函数：旧数据行（无 `schema_version` 字段）一律按版本 1 解析。
 fn default_schema_version() -> u32 {
     1

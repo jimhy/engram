@@ -476,6 +476,44 @@ enum Command {
         #[arg(long)]
         now: Option<f64>,
     },
+    /// hook 用（UserPromptSubmit）：拿本轮 prompt 在**按需层**里检索一次，
+    /// 按证据强度分档注入（强 → 贴记忆正文；弱 → 只提醒一句；无 → 完全静默）。
+    ///
+    /// 与 `hot-index` **并列挂、互不影响**：热索引是每轮必须的常驻注入，
+    /// 本命令是增值的按需捞取；本命令失败只该静默，不该拖累热索引。
+    PromptRecall {
+        /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
+        #[arg(long)]
+        general_db: Option<PathBuf>,
+        /// 工作区根目录（作 cwd override）；缺省取 stdin 的 cwd，再缺省取当前工作目录。
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        /// 本轮用户 prompt；缺省从 stdin 的 hook JSON 取（`--from-hook-stdin`）。
+        /// 手工给它即可脱离 hook 单独调试。
+        #[arg(long)]
+        prompt: Option<String>,
+        /// 从 stdin 读取整段 hook JSON（取其 `prompt` 与 `cwd`）。
+        #[arg(long)]
+        from_hook_stdin: bool,
+        /// `--emit json` 时写入的 hookEventName。
+        #[arg(long, default_value = "UserPromptSubmit")]
+        hook_event: String,
+        /// 强证据档最多注入几条记忆。
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
+        /// 注入文本的字符预算上限（防止挤占宿主的 additionalContext 配额）。
+        #[arg(long, default_value_t = 1800)]
+        budget: usize,
+        /// 输出格式：json（缺省，Claude Code hook 契约）或 text（人读，调试用）。
+        #[arg(long, default_value = "json")]
+        emit: String,
+        /// 可选调试日志路径。
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// 当前时间（unix 秒）；缺省取系统时间。
+        #[arg(long)]
+        now: Option<f64>,
+    },
     /// hook 用（SessionEnd）：算 transcript 相对水位线的增量，切片 + 落 pending 标记，
     /// 输出复盘所需单行 JSON（`action`=`review` 带切片/库路径，或 `skip` 表无新增）。
     ReviewPrepare {
@@ -593,7 +631,7 @@ enum Command {
     /// 版本触发的一次性数据迁移：把老库存量记忆按新一代规则重洗。
     ///
     /// 严格顺序：① 备份优先（先把全库完整 JSON 导出到 `--backup-dir`，失败即中止不动库）；
-    /// ② 结构性清洗（补 `schema_version`、钳未来时间戳、`access_log` 去重排序，自动）；
+    /// ② 结构性清洗（补 `schema_version`、钳未来时间戳、**回填占位 `created_at`**、`access_log` 去重排序，自动）；
     /// ③ 重分层 + 容量（跑 consolidate，把旧尖峰升上来的层降回、超预算层挤下去，自动）；
     /// ④ 语义性问题（importance 偏离层锚 / 悬空 `superseded_by` / 疑似重复）**只收进报告、
     /// 绝不自动改**；⑤ 写库级 `data_version`。写库前用 `<general_db>.migrate.lock` 加库级
@@ -1179,6 +1217,29 @@ fn dispatch_direct() -> ExitCode {
             from_hook_stdin,
             log: log.as_deref(),
             budget,
+            now,
+        }),
+        Command::PromptRecall {
+            general_db,
+            workspace_root,
+            prompt,
+            from_hook_stdin,
+            hook_event,
+            limit,
+            budget,
+            emit,
+            log,
+            now,
+        } => run_prompt_recall(PromptRecallArgs {
+            general_db: general_db.as_deref(),
+            workspace_root: workspace_root.as_deref(),
+            prompt: prompt.as_deref(),
+            from_hook_stdin,
+            hook_event: &hook_event,
+            limit,
+            budget,
+            emit: &emit,
+            log: log.as_deref(),
             now,
         }),
         Command::Status {
@@ -2367,6 +2428,11 @@ struct HookStdin {
     session_id: Option<String>,
     /// hook 给的 transcript 路径（活跃会话登记用）。
     transcript_path: Option<String>,
+    /// hook 给的本轮用户 prompt（`UserPromptSubmit` 事件才有）。
+    ///
+    /// `prompt-recall` 的检索输入就是它。空串视作无——
+    /// 没有 prompt 时该命令什么都不做，而不是拿空串去查。
+    prompt: Option<String>,
 }
 
 /// 读取整段 stdin、按 hook JSON 解析出 `cwd`。
@@ -2394,6 +2460,12 @@ fn read_hook_stdin() -> HookStdin {
         None => return HookStdin::default(),
     };
     let cwd = obj.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+    // prompt：UserPromptSubmit 事件专有；空串/纯空白视作无。
+    let prompt = obj
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
     // session_id：状态栏 / 门控按会话分文件用（避免多窗口共用单文件互相覆盖）；空串视作无。
     let session_id = obj
         .get("session_id")
@@ -2410,6 +2482,7 @@ fn read_hook_stdin() -> HookStdin {
         cwd,
         session_id,
         transcript_path,
+        prompt,
     }
 }
 
@@ -2670,6 +2743,229 @@ fn build_hot_index_json(hook_event: &str, context: &str) -> Result<String, Strin
         }
     });
     serde_json::to_string(&value).map_err(|e| format!("序列化 hook JSON 失败：{e}"))
+}
+
+/// `prompt-recall` 的全部参数（聚成结构体，规避过多函数形参）。
+struct PromptRecallArgs<'a> {
+    /// `--general-db` 覆盖；`None` 时走 `<HOME>/.engram/general.redb` 约定。
+    general_db: Option<&'a Path>,
+    /// `--workspace-root`（作 cwd override）；`None` 时取 stdin 的 cwd，再缺省取当前目录。
+    workspace_root: Option<&'a Path>,
+    /// `--prompt`；`None` 时取 stdin 的 `prompt` 字段。
+    prompt: Option<&'a str>,
+    /// 是否从 stdin 读整段 hook JSON。
+    from_hook_stdin: bool,
+    /// `--emit json` 时写入的 hookEventName。
+    hook_event: &'a str,
+    /// 强证据档最多注入几条。
+    limit: usize,
+    /// 注入文本的字符预算上限。
+    budget: usize,
+    /// 输出格式：`json`（缺省）或 `text`。
+    emit: &'a str,
+    /// 可选调试日志路径。
+    log: Option<&'a Path>,
+    /// 当前时间（unix 秒）；`None` 取系统时间。
+    now: Option<f64>,
+}
+
+/// 按**字符**（而非字节）截断，超长时尾部加省略号。
+///
+/// 必须按字符切：cue 全是中文，按字节 `&s[..n]` 会在多字节字符中间切开而 panic。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// 渲染**弱证据档**的注入文本：只有一行，不贴记忆内容。
+///
+/// 刻意不贴内容：这一档的证据强度不足以保证 top1 就是对的
+/// （标定时强度低于 [`engram::retrieval::INJECT_FULL_MIN_STRENGTH`] 的那批，
+/// top-3 命中率只有一半），贴出来反而容易把 agent 带偏。
+/// 给的是**主题词**——让 agent 拿它自己去 `engram_recall`，
+/// 它能换几组角度不同的词多试几轮，比这里一次机械检索强得多。
+///
+/// 这一档才是痛点（「每次都要我提醒才去搜索记忆」）的直接解药：
+/// 它不要求检索**准**，只要求判断出「这儿可能有东西」，
+/// 而把「提醒」这个动作从用户手里挪到了 hook 上。
+fn render_inject_hint(outcome: &engram::commands::RecallOutcome<'_>) -> String {
+    // 主题词取 top-3 候选的 tags 去重——tags 是人工标注的主题名（release / windows …），
+    // 比 BM25 命中的二字 ngram（「先推」「版铁」）更适合当检索词喂回去。
+    let mut topics: Vec<&str> = Vec::new();
+    for c in outcome.candidates.iter().take(3) {
+        for t in &c.memory.tags {
+            if !topics.contains(&t.as_str()) {
+                topics.push(t.as_str());
+            }
+        }
+    }
+    topics.truncate(4);
+    let topic_part = if topics.is_empty() {
+        String::new()
+    } else {
+        format!("（主题：{}）", topics.join(" / "))
+    };
+    format!(
+        "【engram】本轮提问可能与按需层记忆有关{topic_part}。若相关，先用 engram_recall \
+         查一下再动手；不相关就直接忽略本行。"
+    )
+}
+
+/// 渲染**强证据档**的注入文本：贴出 top-N 条记忆正文。
+///
+/// `budget` 是整段的字符上限，按条数均分给各条 cue——
+/// 宿主对 `additionalContext` 有硬上限且**超出部分静默截断**，
+/// 与其被拦腰截断，不如自己先按条截好、每条都留个完整的开头。
+fn render_inject_full(outcome: &engram::commands::RecallOutcome<'_>, budget: usize) -> String {
+    let n = outcome.candidates.len().max(1);
+    // 预留约 200 字符给标题与结尾说明，其余均分到各条。
+    let per_cue = budget.saturating_sub(200) / n;
+    let mut out = String::from(
+        "【engram 按需记忆】本轮提问命中下列既有经验（来自 L3/L4.3/冷库，\
+         **不在**常驻热索引里，所以这里才贴出来）：\n",
+    );
+    for (i, c) in outcome.candidates.iter().enumerate() {
+        let m = c.memory;
+        out.push_str(&format!(
+            "{}. [{}] {}\n   {}\n",
+            i + 1,
+            level_repr(m.level),
+            m.id,
+            truncate_chars(&m.cue, per_cue)
+        ));
+        if let Some(r) = m.pointer.reference.as_deref() {
+            out.push_str(&format!("   指针 → {r}\n"));
+        }
+    }
+    out.push_str("真用上了哪条，用 engram_confirm_use 报**完整 id** 加固；没用上就不必理会。");
+    out
+}
+
+/// 执行 `prompt-recall` 子命令：拿本轮 prompt 在按需层里检索一次，按档位注入。
+///
+/// # 为什么这条命令值得存在
+///
+/// 痛点是「模型经常不知道什么时候去找记忆，每次都要我提醒」。
+/// 靠 agent「记得要检索」必然不稳定——这是结构性的，不是提示词能修的。
+/// 本命令把**「何时检索」这个决策从 agent 手里拿走**：hook 每轮无条件检索
+/// （本地几十毫秒、零 token），再按证据强度决定要不要注入、注入多少。
+///
+/// # 三条刻意的设计
+///
+/// 1. **只搜按需层**（见 [`engram::retrieval::INJECT_SKIP_RESIDENT_LEVELS`]）：
+///    L1/L2/L4.1/L4.2 已由热索引常驻注入，再贴一遍纯属重复烧 token。
+/// 2. **不做「该不该检索」的判定**，只做「该不该注入」的判定：前者要分类器，
+///    后者只要一个阈值，而阈值是在真实库上标定过的。
+/// 3. **失败一律静默**（打库失败、无 prompt、无作用域）：本命令是增量提醒，
+///    每轮 prompt 都喊一次「库挂了」是纯噪声；记忆缺席该由 hot-index 那条路去喊，
+///    它才是会话的唯一记忆来源。
+fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
+    let emit = match parse_emit_format(args.emit) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("prompt-recall 失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(now) = resolve_now(args.now) else {
+        return ExitCode::FAILURE;
+    };
+
+    let hook = if args.from_hook_stdin {
+        read_hook_stdin()
+    } else {
+        HookStdin::default()
+    };
+
+    // prompt：--prompt 优先，其次 stdin。两者都没有就**静默成功退出**——
+    // 没有 prompt 不是错误（hook 可能挂在别的事件上、或 stdin 为空），
+    // 更不该拿空串去检索然后往上下文里塞东西。
+    let prompt = match args.prompt.map(str::to_string).or_else(|| hook.prompt.clone()) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return ExitCode::SUCCESS,
+    };
+
+    let cwd: PathBuf = match args.workspace_root {
+        Some(p) => p.to_path_buf(),
+        None => match hook.cwd.clone() {
+            Some(c) => c,
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return ExitCode::SUCCESS,
+            },
+        },
+    };
+
+    // 锚定作用域失败一律静默（同上：增量提醒不该因为环境问题制造噪声）。
+    let Ok((general_db, scope)) = resolve_scope(&cwd, args.general_db) else {
+        return ExitCode::SUCCESS;
+    };
+    let merged = match read_merged_scope(&general_db, &scope) {
+        Ok(m) => m,
+        Err(e) => {
+            if let Some(path) = args.log.map(Path::to_path_buf).or_else(|| hook_log_path(None)) {
+                append_hook_log(&path, now, &format!("prompt-recall 打库失败（静默跳过）：{e}"));
+            }
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    let tokens = tokenize_query(&prompt);
+    let query = RecallQuery {
+        tokens: &tokens,
+        // 冷库正是要搜的：按需层的价值全在「以前是不是处理过 X」。
+        active_only: false,
+        limit: args.limit,
+        now,
+        scorer: Scorer::Bm25,
+        tag: None,
+        level: None,
+        project: None,
+        exclude_levels: &engram::retrieval::INJECT_SKIP_RESIDENT_LEVELS,
+    };
+    let outcome = recall_candidates(&merged, &query);
+    let tier = engram::retrieval::inject_tier(outcome.abstain.is_some(), outcome.hit_strength);
+
+    let context = match tier {
+        // 静默档：一个字都不输出。这是绝大多数 prompt 的归宿，也正是它该有的样子。
+        engram::retrieval::InjectTier::Silent => return ExitCode::SUCCESS,
+        engram::retrieval::InjectTier::Hint => render_inject_hint(&outcome),
+        engram::retrieval::InjectTier::Full => render_inject_full(&outcome, args.budget),
+    };
+    // 兜底再截一次：render_* 已按预算裁过，这里防的是未来有人改渲染时漏算。
+    let context = truncate_chars(&context, args.budget);
+
+    if let Some(path) = args.log {
+        append_hook_log(
+            path,
+            now,
+            &format!(
+                "prompt-recall tier={tier:?} strength={:.2} cands={} scope={}",
+                outcome.hit_strength,
+                outcome.candidates.len(),
+                scope.name
+            ),
+        );
+    }
+
+    match emit {
+        EmitFormat::Text => println!("{context}"),
+        EmitFormat::Json => match build_hot_index_json(args.hook_event, &context) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("prompt-recall 注入失败：{e}");
+                return ExitCode::SUCCESS;
+            }
+        },
+    }
+    ExitCode::SUCCESS
 }
 
 /// 执行 `hot-index` 子命令：从 cwd 向上锚定作用域（找最近的 `.engram/` 锚点），
@@ -3427,6 +3723,9 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
         tag: args.tag,
         level: args.level,
         project: args.project,
+        // 显式 recall 不排除任何层：用户/agent 主动查就该看到全部。
+        // 只有 prompt-recall（自动注入）才排常驻层。
+        exclude_levels: &[],
     };
     let outcome = recall_candidates(&merged, &query);
     let cands = &outcome.candidates;
@@ -3435,8 +3734,20 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
         // 手工拼 JSON 数组：避免为输出额外引入序列化辅助类型。
         // 顶层仍是数组（**向后兼容**：已有脚本按数组读它），
         // 弃权信息挂在一个 id 为 null 的哨兵对象上追加在末尾，老读者会忽略它。
+        //
+        // ⚠ **弃权时不输出任何候选**，与表格路径同语义。
+        // 2026-09-20 实测：此前 JSON 路径把「全部候选 + 末尾哨兵」一起吐出去，
+        // 于是 `recall --query "今天天气不错啊"` 在表格模式正确报「本库无相关记忆」，
+        // JSON 模式却照样返回 3 条无关候选——消费方（三端适配器、AIChat）如实透传，
+        // 读它的 agent 就把噪音当了答案。`retrieval.rs` 的模块注释白纸黑字写着
+        // 「弃权就是弃权，『但也许你想看这几条』正是要治的病」，JSON 路径一天都没做到。
+        //
+        // 选择「候选清空、保留哨兵」而不是「加顶层 abstain 字段」：后者是 breaking
+        // change，四个消费方都要跟着改；前者数组形状不变，老读者自动得到
+        // 「0 条候选 + 一个弃权说明」，正是它本该看到的东西。
+        let shown = if outcome.abstain.is_some() { &[][..] } else { &cands[..] };
         let mut buf = String::from("[");
-        for (i, c) in cands.iter().enumerate() {
+        for (i, c) in shown.iter().enumerate() {
             if i > 0 {
                 buf.push(',');
             }
@@ -3461,7 +3772,7 @@ fn run_recall(args: RecallArgs<'_>) -> ExitCode {
             ));
         }
         if let Some(reason) = &outcome.abstain {
-            if !cands.is_empty() {
+            if !shown.is_empty() {
                 buf.push(',');
             }
             let sugg = outcome
@@ -5073,6 +5384,18 @@ fn structural_clean(m: &mut Memory, now: f64) -> bool {
         m.schema_version = MEMORY_SCHEMA_VERSION;
         touched = true;
     }
+    // 占位 created_at 回填：低于 MIN_PLAUSIBLE_CREATED_AT 的一律是坏数据
+    // （真实库实测 59 条恰好是 1000000000）。回填源取记忆 id 里编码的创建纳秒
+    // ——那是 generate_id 写进去的，比任何推断都准（可信度实测见 created_at_from_id）。
+    //
+    // ⚠ 只在**本来就是坏数据**时回填，绝不拿 id 去覆盖正常值：merge / graduate
+    // 会铸新 id 但刻意保留原始 created_at，覆盖就把那段历史抹了。
+    if health::has_implausible_created_at(m) {
+        if let Some(ts) = engram::commands::created_at_from_id(&m.id) {
+            m.created_at = ts;
+            touched = true;
+        }
+    }
     // 未来时间戳钳制（复用 import 的 clamp：created_at / access_log > now+60s → now，
     // 并重排升序）。
     if sanitize_future_times(m, now) {
@@ -5381,7 +5704,7 @@ fn print_migration_report(rep: &MigrationReport, dry_run: bool) {
     );
     println!("  记忆总数: {}", rep.total);
     println!(
-        "  结构性清洗: {} 条被修正（schema_version / 未来时间戳 / access_log 去重排序）",
+        "  结构性清洗: {} 条被修正（schema_version / 未来时间戳钳制 / 占位 created_at 回填 / access_log 去重排序）",
         rep.structural_changed
     );
     println!("  重分层+容量: consolidate 产生 {} 条变迁", rep.transitions);
@@ -5587,6 +5910,20 @@ fn print_doctor_text(
         fmt_id_tail(&h.future_timestamps)
     );
 
+    if h.implausible_created_at.is_empty() {
+        println!("可疑创建时间（占位值）: 0 条");
+    } else {
+        // 这类坏数据往往成批出现（真实库一次 59 条），全列出来没法读，只示例前几条。
+        println!(
+            "⚠ 可疑创建时间（占位值）: {} 条{}",
+            h.implausible_created_at.len(),
+            fmt_id_sample(&h.implausible_created_at, 5)
+        );
+        // 说清危害与解法：这类坏数据不显眼，却会把还在用的记忆压向淘汰队列前排。
+        println!("  created_at 早于 2020，多半是占位常量；它经 effective 压低记忆权重，等于把还在用的记忆架到淘汰队列最前面。");
+        println!("  修法：跑一次 `engram migrate`（从记忆 id 里编码的创建时间精确回填，不影响正常记忆）。");
+    }
+
     if h.dangling_superseded.is_empty() {
         println!("悬空 superseded_by: 0 条");
     } else {
@@ -5629,6 +5966,21 @@ fn print_doctor_text(
 }
 
 /// 把一小串 id 格式化成「（id1, id2, ...）」尾巴，空则返回空串。
+/// 同 [`fmt_id_tail`]，但**只列前 `n` 条**、其余折叠成「…另 N 条」。
+///
+/// 给成批出现的问题用：全量 id 铺满一屏反而没人读（真实库一次报 59 条）。
+fn fmt_id_sample(ids: &[String], n: usize) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    let head = ids.iter().take(n).cloned().collect::<Vec<_>>().join(", ");
+    if ids.len() <= n {
+        format!("（{head}）")
+    } else {
+        format!("（{head} …另 {} 条）", ids.len() - n)
+    }
+}
+
 fn fmt_id_tail(ids: &[String]) -> String {
     if ids.is_empty() {
         String::new()
@@ -5711,6 +6063,7 @@ fn print_doctor_json(
         "schema_version_distribution": schema_dist,
         "over_budget_layers": over_budget,
         "future_timestamps": h.future_timestamps,
+        "implausible_created_at": h.implausible_created_at,
         "dangling_superseded": dangling,
         "off_anchor_importance": off_anchor,
         "duplicate_cues": duplicates,
@@ -5854,6 +6207,64 @@ mod tests {
     }
 
     // resolve_scope 核心修复：锚点落到「公共库同目录的 engram.redb」时降级为无项目作用域。
+    #[test]
+    fn structural_clean_backfills_placeholder_created_at_from_id() {
+        // 真实库那 59 条坏数据的修法：从 id 里编码的创建纳秒精确回填。
+        let real = 1_789_000_000.0;
+        let id = engram::commands::generate_id("一条内容", real);
+        let mut m = Memory {
+            id: id.clone(),
+            cue: "一条内容".to_string(),
+            pointer: Pointer { kind: "none".to_string(), reference: None, detail: None },
+            level: Level::L3,
+            project: None,
+            importance: 0.3,
+            pinned: false,
+            access_log: vec![],
+            status: Status::Active,
+            superseded_by: None,
+            // 坏数据：占位常量
+            created_at: 1_000_000_000.0,
+            tags: vec![],
+            schema_version: engram::model::MEMORY_SCHEMA_VERSION,
+        };
+        assert!(structural_clean(&mut m, real + 100.0), "应报告有修改");
+        assert!(
+            (m.created_at - real).abs() < 1e-6,
+            "应回填成 id 里的真实创建时间，实得 {}",
+            m.created_at
+        );
+    }
+
+    #[test]
+    fn structural_clean_never_overwrites_a_sane_created_at() {
+        // merge / graduate 会铸新 id 但**刻意保留**原始 created_at——
+        // 回填若不加条件就会把那段历史抹掉。这条守住「只修坏数据」。
+        let old_real = 1_700_000_000.0;
+        let minted_later = 1_789_000_000.0;
+        let id = engram::commands::generate_id("合并后的内容", minted_later);
+        let mut m = Memory {
+            id,
+            cue: "合并后的内容".to_string(),
+            pointer: Pointer { kind: "none".to_string(), reference: None, detail: None },
+            level: Level::L3,
+            project: None,
+            importance: 0.3,
+            pinned: false,
+            access_log: vec![old_real],
+            status: Status::Active,
+            superseded_by: None,
+            created_at: old_real,
+            tags: vec![],
+            schema_version: engram::model::MEMORY_SCHEMA_VERSION,
+        };
+        structural_clean(&mut m, minted_later + 100.0);
+        assert_eq!(
+            m.created_at, old_real,
+            "created_at 合理时绝不能被 id 覆盖（那会抹掉 merge 保留的历史）"
+        );
+    }
+
     #[test]
     fn resolve_scope_home_engram_dir_is_none() {
         let home = unique_dir("resolve_none");

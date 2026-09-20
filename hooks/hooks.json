@@ -1,5 +1,5 @@
 {
-  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。ensure-engram.sh 把引擎收敛到公共位置 ~/.engram/bin（全机一份、谁新用谁，静默 best-effort）。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
+  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。ensure-engram.sh 把引擎收敛到公共位置 ~/.engram/bin（全机一份、谁新用谁，静默 best-effort）。UserPromptSubmit 上挂两条、职责分离：hot-index 注入常驻热索引（L1/L2/L4.x 高层），prompt-recall 拿本轮 prompt 去按需层（L3/L4.3/冷库）捞一次、按证据强度分档注入（强→贴正文｜弱→只提醒一句去检索｜无→完全静默）。分开挂而不是合并进 hot-index：热索引是每轮必须的，prompt-recall 是增值的，后者出问题不该拖累前者。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
   "hooks": {
     "SessionStart": [
       {
@@ -29,6 +29,10 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event UserPromptSubmit --state \"$HOME/.engram/active.state\" --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" prompt-recall --from-hook-stdin --emit json --hook-event UserPromptSubmit --log \"$HOME/.engram/hook.log\""
           }
         ]
       }

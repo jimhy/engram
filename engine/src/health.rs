@@ -21,7 +21,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::model::{importance_anchor_band, EngramConfig, Level, Memory, Status};
+use crate::model::{
+    MIN_PLAUSIBLE_CREATED_AT,importance_anchor_band, EngramConfig, Level, Memory, Status};
 use crate::render::memory_render_cost;
 
 /// 六个层级的规范顺序（通用轨道 L1-L3 在前、项目轨道 L4.1-L4.3 在后）。
@@ -116,6 +117,15 @@ pub struct HealthReport {
     /// 含未来时间戳（`created_at` 或某 `access_log` 项 `> now + FUTURE_SKEW_SECS`）的
     /// 记忆 id 列表（已按 id 升序）。
     pub future_timestamps: Vec<String>,
+    /// `created_at` **低于** [`MIN_PLAUSIBLE_CREATED_AT`] 的记忆 id（升序）。
+    ///
+    /// 这类值是占位常量 / 坏数据，不是「很老的记忆」。危害见该常量的文档：
+    /// 它会经 `activation::effective` 把记忆权重压到远低于正常水平，
+    /// 等于把一批还在用的记忆架到淘汰队列最前面。
+    ///
+    /// 与 [`HealthReport::future_timestamps`] 是**同一类问题的两侧**——
+    /// 此前只查了未来那一侧，过去这一侧漏了整整一批（真实库实测 59 条）。
+    pub implausible_created_at: Vec<String>,
     /// 超字符预算的层（Active 常驻累计 > `char_budget`）。
     pub over_budget_layers: Vec<OverBudgetLayer>,
     /// 悬空 `superseded_by`（指向库中不存在 id）。
@@ -160,6 +170,16 @@ pub fn has_future_timestamp(m: &Memory, now: f64) -> bool {
     m.created_at > limit || m.access_log.iter().any(|&t| t > limit)
 }
 
+/// 判定一条记忆的 `created_at` 是否**不合理地早**（占位值 / 坏数据）。
+///
+/// 与 [`has_future_timestamp`] 对称：那个查未来，这个查过去。
+/// 判据是绝对下界 [`MIN_PLAUSIBLE_CREATED_AT`]，而不是「比 access_log 早」这类
+/// 相对关系——后者对 `access_log` 为空的记忆无效，而真实库那 59 条坏数据里
+/// 恰恰有 38 条 `access_log` 是空的。
+pub fn has_implausible_created_at(m: &Memory) -> bool {
+    m.created_at < MIN_PLAUSIBLE_CREATED_AT
+}
+
 /// 对一批记忆做**只读**健康体检，产出 [`HealthReport`]。
 ///
 /// 纯函数、不做任何 IO、不修改入参。`cfg` 提供各层字符预算/加载详略（超预算层诊断
@@ -201,6 +221,14 @@ pub fn scan(mems: &[Memory], cfg: &EngramConfig, now: f64) -> HealthReport {
         .map(|m| m.id.clone())
         .collect();
     future_timestamps.sort();
+
+    // ---- 不合理的过去时间戳（全状态）：占位值 / 坏数据 ----
+    let mut implausible_created_at: Vec<String> = mems
+        .iter()
+        .filter(|m| has_implausible_created_at(m))
+        .map(|m| m.id.clone())
+        .collect();
+    implausible_created_at.sort();
 
     // ---- 超字符预算的层（Active，按 (scope, level) 分组）----
     // 键：(作用域标签, 层级下标)；值：(累计渲染字符, 条数)。BTreeMap 保证输出稳定。
@@ -300,6 +328,7 @@ pub fn scan(mems: &[Memory], cfg: &EngramConfig, now: f64) -> HealthReport {
         level_counts,
         schema_versions,
         future_timestamps,
+        implausible_created_at,
         over_budget_layers,
         dangling_superseded,
         off_anchor_importance,
@@ -408,6 +437,41 @@ mod tests {
         assert_eq!(rep.duplicate_cues.len(), 1);
         assert_eq!(rep.duplicate_cues[0].cue, "同一句");
         assert_eq!(rep.duplicate_cues[0].ids, vec!["a", "b"]);
+    }
+
+    // 6b. 不合理的**过去**时间戳（占位值）被识别；正常时间戳不误报。
+    #[test]
+    fn detects_implausible_created_at() {
+        let now = 1_789_000_000.0;
+        // 注意：本模块的 make() 默认就把 created_at 设成 1_000_000_000.0——
+        // 那正是真实库里那批坏数据的原值，所以这里要显式把"正常"那条调回来。
+        let placeholder = make("bad", Level::L3, Status::Active, 0.3);
+        let mut normal = make("ok", Level::L3, Status::Active, 0.3);
+        normal.created_at = now - DAY;
+
+        assert!(has_implausible_created_at(&placeholder));
+        assert!(!has_implausible_created_at(&normal));
+
+        let rep = scan(&[placeholder, normal], &EngramConfig::default(), now);
+        assert_eq!(rep.implausible_created_at, vec!["bad"]);
+        // 与「未来时间戳」是两个独立维度，别互相污染。
+        assert!(
+            rep.future_timestamps.is_empty(),
+            "过去时间戳不该被算进未来那一侧，实得 {:?}",
+            rep.future_timestamps
+        );
+    }
+
+    // 6c. 边界：恰好等于下界算合理，差一秒算不合理。
+    #[test]
+    fn implausible_created_at_boundary_is_inclusive() {
+        let mut at_floor = make("floor", Level::L3, Status::Active, 0.3);
+        at_floor.created_at = MIN_PLAUSIBLE_CREATED_AT;
+        assert!(!has_implausible_created_at(&at_floor), "恰好在下界上算合理");
+
+        let mut below = make("below", Level::L3, Status::Active, 0.3);
+        below.created_at = MIN_PLAUSIBLE_CREATED_AT - 1.0;
+        assert!(has_implausible_created_at(&below));
     }
 
     // 6. 未来时间戳（created_at 或 access_log 超窗口）被识别。

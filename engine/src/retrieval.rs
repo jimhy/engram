@@ -399,6 +399,101 @@ pub fn judge(
     None
 }
 
+/// A 档（直接注入记忆正文）的归一化命中强度下限。
+///
+/// # 这个阈值解决的是什么问题
+///
+/// `UserPromptSubmit` hook 每条 prompt 都会做一次检索，但**注入是有代价的**：
+/// 无关记忆挤占上下文，且每轮都发生。所以不是「查到就注入」，而是分档——
+/// 只有强到「top-3 里几乎肯定有对的」才值得把正文塞进去。
+///
+/// # 标定（2026-09-20，本项目真实库）
+///
+/// 正类取 `engine/eval/memory-golden.jsonl` 的 47 道可用题（gold 是**具体记忆 id**，
+/// 结构上不存在 ground-truth 泄漏），判准是「gold 是否进了 top-3」；
+/// 负类取 `engine/eval/noise-queries.txt` 的 50 条噪声 query。
+/// 检索池按注入口径排除常驻层（见 [`INJECT_SKIP_RESIDENT_LEVELS`]），实得 600 条。
+///
+/// | strength ≥ | 触发的题里 top-3 真有对的 | 漏掉的好题 | 噪声误触发 |
+/// |---|---|---|---|
+/// | 1.2（即弃权线） | 49% | 0 | 14/50 |
+/// | 2.0 | 54% | 3 | 1/50 |
+/// | 3.0 | 80% | 7 | 0/50 |
+/// | **4.0** | **100%** | 10 | **0/50** |
+/// | 8.0 | 100% | 20 | 0/50 |
+///
+/// 取 4.0：**精确率 100%、噪声零误触发**的最低点。再往上只是白白少注入。
+/// 被它挡下的 10 道好题不是丢掉，而是降级到 [`InjectTier::Hint`]——
+/// 那一档只花一行字，由 agent 自己决定要不要查。
+///
+/// # 已知做不到的事（别据此以为痛点已解）
+///
+/// 「发个版」这类**极短口语 prompt** 仍然接不住：实测那条发版铁律记忆在
+/// BM25 下压根未命中（换语义向量也只排到第 108 位）。词法、向量、写入端补措辞
+/// 三条路都实测过，都到不了可注入的水平。本档位机制的价值在**确定性触发**，
+/// 不在「把对的记忆递到嘴边」。
+pub const INJECT_FULL_MIN_STRENGTH: f64 = 4.0;
+
+/// 注入时**跳过**的层级：这些层已由热索引常驻注入，再注入一遍纯属重复烧 token。
+///
+/// 热索引每次会话开始就把 L1/L2/L4.1/L4.2 整个铺进上下文（本项目实测 8152 字符），
+/// 所以 prompt 级注入只该去捞**按需层**（L3 / L4.3 / 冷库）——
+/// 那正是热索引末尾那行「不检索就看不到」所指的部分。
+///
+/// 本项目实测：613 条可召回记忆里常驻层只占 13 条，注入池 600 条。
+pub const INJECT_SKIP_RESIDENT_LEVELS: [crate::model::Level; 4] = [
+    crate::model::Level::L1,
+    crate::model::Level::L2,
+    crate::model::Level::L4_1,
+    crate::model::Level::L4_2,
+];
+
+/// 一次 prompt 级检索该怎么注入。
+///
+/// 分档而非二元判断，是因为**闸门必然有折中**：实测把闸门收紧到能拦住
+/// 「把这段代码格式化一下」这类无需记忆的机械指令，就必然会误拦
+/// 「准备发布新版本」这类真任务意图——两者的词法信号区间重叠。
+/// 与其在一条线上二选一，不如承认折中、让中间档也有用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectTier {
+    /// 强证据：直接把 top-N 条记忆正文注入上下文。
+    Full,
+    /// 弱证据：只注入一行线索，让 agent 自己决定要不要检索。
+    ///
+    /// 这一档才是痛点（「每次都要我提醒才去搜索记忆」）的直接解药——
+    /// 它不要求检索**准**，只要求判断出「这儿可能有东西」，
+    /// 而把「提醒」这个动作从用户手里挪到了 hook 上。
+    Hint,
+    /// 无证据：什么都不注入。
+    Silent,
+}
+
+/// 判定一次 prompt 级检索的注入档位。
+///
+/// - `abstained`：本次检索是否已被 [`judge`] 判为该弃权；
+/// - `hit_strength`：最强候选的归一化命中强度（`top1 分 ÷ idf_max`），
+///   即 [`crate::commands::RecallOutcome::hit_strength`]。
+///
+/// 判定顺序：
+/// 1. `abstained` → [`InjectTier::Silent`]（弃权判据对闲聊很准，实测 10/10 全拦）；
+/// 2. 强度达 [`INJECT_FULL_MIN_STRENGTH`] → [`InjectTier::Full`]；
+/// 3. 其余 → [`InjectTier::Hint`]。
+///
+/// **静默闸刻意直接吃 [`judge`] 的结论**（做成入参而不是在函数里另判），
+/// 这样「注入的静默档 ≡ recall 的弃权」是结构性保证、不可能漂移：
+/// 那套阈值是在真实库上以 50 正 + 50 负、跨五个语料规模标定过的，
+/// 另起炉灶只会多一组没标定过的常数。
+pub fn inject_tier(abstained: bool, hit_strength: f64) -> InjectTier {
+    if abstained {
+        return InjectTier::Silent;
+    }
+    if hit_strength >= INJECT_FULL_MIN_STRENGTH {
+        InjectTier::Full
+    } else {
+        InjectTier::Hint
+    }
+}
+
 /// 便捷入口：对一批记忆按 query 打分并排序，同时给出弃权判定。
 ///
 /// 返回 `(按分数降序的 (下标, 分数) 列表, 弃权理由)`。
@@ -655,6 +750,55 @@ mod tests {
         assert!(c1.score(0, &toks).is_finite(), "单文档语料分数必须有限");
         assert!(c1.score(99, &toks) == 0.0, "越界 idx 返回 0 而不是 panic");
         assert!(c1.query_info(&[]).is_finite());
+    }
+
+    #[test]
+    fn inject_tier_silent_iff_abstained() {
+        // 静默档必须与弃权判据**完全一致**——这里 abstained 是入参，
+        // 所以这条等价关系是结构性的；测试守的是「别有人往里加别的静默条件」。
+        assert_eq!(inject_tier(true, 0.0), InjectTier::Silent);
+        assert_eq!(inject_tier(true, 999.0), InjectTier::Silent, "弃权压过一切强度");
+        assert_ne!(inject_tier(false, 0.0), InjectTier::Silent, "没弃权就不该静默");
+    }
+
+    #[test]
+    fn inject_tier_full_requires_strong_hit() {
+        // 恰好达线要算 Full（闭区间），差一点点就降级到 Hint。
+        assert_eq!(inject_tier(false, INJECT_FULL_MIN_STRENGTH), InjectTier::Full);
+        assert_eq!(
+            inject_tier(false, INJECT_FULL_MIN_STRENGTH - 0.01),
+            InjectTier::Hint
+        );
+        assert_eq!(inject_tier(false, INJECT_FULL_MIN_STRENGTH * 2.0), InjectTier::Full);
+    }
+
+    #[test]
+    fn hint_tier_actually_exists() {
+        // A 档线必须严于弃权线，否则 Hint 档是空的——而 Hint 正是痛点的解药，
+        // 谁把 INJECT_FULL_MIN_STRENGTH 调到 <= 弃权线，这条立刻变红。
+        assert!(
+            INJECT_FULL_MIN_STRENGTH > ABSTAIN_MIN_HIT_STRENGTH,
+            "A 档线 {INJECT_FULL_MIN_STRENGTH} 必须严于弃权线 {ABSTAIN_MIN_HIT_STRENGTH}"
+        );
+        // 取两线之间的一点，必须落 Hint。
+        let mid = (INJECT_FULL_MIN_STRENGTH + ABSTAIN_MIN_HIT_STRENGTH) / 2.0;
+        assert_eq!(inject_tier(false, mid), InjectTier::Hint);
+    }
+
+    #[test]
+    fn resident_levels_are_exactly_the_hot_index_ones() {
+        // 注入跳过的层必须与热索引常驻的层一一对应：多跳会漏掉按需层，
+        // 少跳会把已在上下文里的记忆再注入一遍。
+        // Level 没有实现 Hash（model.rs），故用线性查找而不是 HashSet——
+        // 为一条测试给领域类型加 derive 是本末倒置。
+        let has = |lv: Level| INJECT_SKIP_RESIDENT_LEVELS.iter().any(|x| *x == lv);
+        assert_eq!(INJECT_SKIP_RESIDENT_LEVELS.len(), 4);
+        for lv in [Level::L1, Level::L2, Level::L4_1, Level::L4_2] {
+            assert!(has(lv), "{lv:?} 是常驻层，注入时必须跳过");
+        }
+        for lv in [Level::L3, Level::L4_3] {
+            assert!(!has(lv), "{lv:?} 是按需层，正是注入要捞的");
+        }
     }
 
     #[test]
