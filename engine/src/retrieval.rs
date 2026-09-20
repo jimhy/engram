@@ -776,10 +776,15 @@ mod tests {
     fn hint_tier_actually_exists() {
         // A 档线必须严于弃权线，否则 Hint 档是空的——而 Hint 正是痛点的解药，
         // 谁把 INJECT_FULL_MIN_STRENGTH 调到 <= 弃权线，这条立刻变红。
-        assert!(
-            INJECT_FULL_MIN_STRENGTH > ABSTAIN_MIN_HIT_STRENGTH,
-            "A 档线 {INJECT_FULL_MIN_STRENGTH} 必须严于弃权线 {ABSTAIN_MIN_HIT_STRENGTH}"
-        );
+        // 用 const block 做**编译期**断言：这是两个常量之间的不变式，
+        // 谁把 INJECT_FULL_MIN_STRENGTH 调到 <= 弃权线，代码根本编译不过，
+        // 比等到跑测试才红更早一步（clippy::assertions_on_constants 也要求这么写）。
+        const {
+            assert!(
+                INJECT_FULL_MIN_STRENGTH > ABSTAIN_MIN_HIT_STRENGTH,
+                "A 档线必须严于弃权线，否则 Hint 档是空的"
+            );
+        }
         // 取两线之间的一点，必须落 Hint。
         let mid = (INJECT_FULL_MIN_STRENGTH + ABSTAIN_MIN_HIT_STRENGTH) / 2.0;
         assert_eq!(inject_tier(false, mid), InjectTier::Hint);
@@ -789,9 +794,9 @@ mod tests {
     fn resident_levels_are_exactly_the_hot_index_ones() {
         // 注入跳过的层必须与热索引常驻的层一一对应：多跳会漏掉按需层，
         // 少跳会把已在上下文里的记忆再注入一遍。
-        // Level 没有实现 Hash（model.rs），故用线性查找而不是 HashSet——
-        // 为一条测试给领域类型加 derive 是本末倒置。
-        let has = |lv: Level| INJECT_SKIP_RESIDENT_LEVELS.iter().any(|x| *x == lv);
+        // 用切片的 contains 而不是 HashSet：Level 没实现 Hash（model.rs），
+        // 而切片 contains 只要 PartialEq——为一条测试给领域类型加 derive 是本末倒置。
+        let has = |lv: Level| INJECT_SKIP_RESIDENT_LEVELS.contains(&lv);
         assert_eq!(INJECT_SKIP_RESIDENT_LEVELS.len(), 4);
         for lv in [Level::L1, Level::L2, Level::L4_1, Level::L4_2] {
             assert!(has(lv), "{lv:?} 是常驻层，注入时必须跳过");
