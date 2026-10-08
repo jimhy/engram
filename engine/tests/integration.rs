@@ -4560,6 +4560,389 @@ fn hot_index_state_isolated_per_session() {
     let _ = std::fs::remove_dir_all(&proj);
 }
 
+// 57. 项 3 续：SessionStart 带 --seed-state 照常注入并播种本会话门控，紧随其后的首条
+//     UserPromptSubmit（--state，同一会话）判「未变」不再重注——此前每场会话开场都注
+//     两份同样的热索引。再来一次 SessionStart（/compact、resume 之后）仍照常注入：播种
+//     只写、不判门控。
+#[test]
+fn hot_index_seed_state_prevents_first_prompt_double_injection() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let proj = unique_workspace_root("hi_seed_state");
+    let proj_name = last_segment(&proj);
+    let _db = seed_engram_db(
+        &proj,
+        &[make(
+            "seed_l4",
+            Level::L4_1,
+            Some(&proj_name),
+            Status::Active,
+            0.5,
+            now,
+            vec![now],
+        )],
+    );
+    let general_path = seed_db("hi_seed_state_g", &[]);
+    let g = general_path.to_string_lossy().to_string();
+    let state_base = proj.join("engram-state").join("active.state");
+    let sp = state_base.to_string_lossy().to_string();
+    let stdin = format!(
+        r#"{{"cwd":"{}","session_id":"sid-SEED"}}"#,
+        json_path(&proj)
+    );
+    let session_start = [
+        "--general-db",
+        g.as_str(),
+        "--seed-state",
+        sp.as_str(),
+        "--from-hook-stdin",
+        "--emit",
+        "json",
+        "--hook-event",
+        "SessionStart",
+        "--now",
+        "1000000000",
+    ];
+    let prompt_submit = [
+        "--general-db",
+        g.as_str(),
+        "--state",
+        sp.as_str(),
+        "--from-hook-stdin",
+        "--emit",
+        "json",
+        "--hook-event",
+        "UserPromptSubmit",
+        "--now",
+        "1000000000",
+    ];
+
+    // SessionStart：照常注入，并把作用域根播进本会话的门控文件。
+    let s1 = run_subcommand_with_stdin("hot-index", &session_start, &stdin);
+    assert!(
+        s1.status.success(),
+        "SessionStart 应成功，stderr={}",
+        String::from_utf8_lossy(&s1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&s1.stdout).contains("cue-seed_l4"),
+        "SessionStart 应注入热索引"
+    );
+    let state_path = proj
+        .join("engram-state")
+        .join("active-state")
+        .join("sid-SEED.state");
+    let recorded = std::fs::read_to_string(&state_path).expect("SessionStart 应播种本会话门控");
+    assert_eq!(
+        recorded.trim(),
+        canonicalize_no_verbatim(&proj).to_string_lossy(),
+        "播种内容应为作用域根绝对路径"
+    );
+
+    // 首条 UserPromptSubmit：门控判「未变」，不再重注同一份热索引。
+    let p1 = run_subcommand_with_stdin("hot-index", &prompt_submit, &stdin);
+    assert!(p1.status.success(), "首条 prompt 应 exit 0");
+    assert!(
+        p1.stdout.is_empty(),
+        "首条 prompt 不应重复注入，实得：{}",
+        String::from_utf8_lossy(&p1.stdout)
+    );
+
+    // 再来一次 SessionStart（/compact、resume 之后上下文是新的）：不判门控，仍照常注入。
+    let s2 = run_subcommand_with_stdin("hot-index", &session_start, &stdin);
+    assert!(s2.status.success(), "第二次 SessionStart 应成功");
+    assert!(
+        String::from_utf8_lossy(&s2.stdout).contains("cue-seed_l4"),
+        "SessionStart 不受门控，应再次注入"
+    );
+
+    // --seed-state 与 --state 互斥：同时给是用法错误，而不是悄悄选一个。
+    let both = run_subcommand_with_stdin(
+        "hot-index",
+        &[
+            "--general-db",
+            g.as_str(),
+            "--state",
+            sp.as_str(),
+            "--seed-state",
+            sp.as_str(),
+            "--from-hook-stdin",
+            "--now",
+            "1000000000",
+        ],
+        &stdin,
+    );
+    assert!(
+        !both.status.success(),
+        "--seed-state 与 --state 同时给应报用法错误"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 58. 播种只发生在真注入之后：打库失败降级（只注一句「记忆缺席」）时不播种，
+//     首条 prompt 的门控照常放行、补注真热索引。
+#[test]
+fn hot_index_seed_state_skipped_when_degraded() {
+    let _guard = test_guard();
+    let ws = unique_workspace_root("hi_seed_degrade");
+    // general_db 指向一个**目录**：store::open 必失败（同 43. 项 2 的造法）。
+    let bad_general = ws.join("not-a-db.redb");
+    std::fs::create_dir_all(&bad_general).expect("应能建目录");
+    let bad = bad_general.to_string_lossy().to_string();
+    let state_base = ws.join("engram-state").join("active.state");
+    let sp = state_base.to_string_lossy().to_string();
+    let stdin = format!(r#"{{"cwd":"{}","session_id":"sid-DEG"}}"#, json_path(&ws));
+
+    let out = run_subcommand_with_stdin(
+        "hot-index",
+        &[
+            "--general-db",
+            bad.as_str(),
+            "--seed-state",
+            sp.as_str(),
+            "--from-hook-stdin",
+            "--emit",
+            "json",
+            "--hook-event",
+            "SessionStart",
+            "--now",
+            "1000000000",
+        ],
+        &stdin,
+    );
+    assert!(out.status.success(), "打库失败应降级 exit 0");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("engram 记忆库暂不可用"),
+        "应为降级注入"
+    );
+    assert!(
+        !ws.join("engram-state")
+            .join("active-state")
+            .join("sid-DEG.state")
+            .exists(),
+        "降级时不应播种门控，否则首条 prompt 会被挡掉、整场没有热索引"
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// 59. 受众过滤：公共常驻层（L1/L2）里带 reviewer 标签的复盘者专用条目只注入复盘者会话
+//     （ENGRAM_REVIEWER=1）；普通会话略去并在末尾留一行说明。项目库里带同一标签的条目
+//     是具体项目的知识，照常注入。此前公共 L2 五条全是复盘者方法论，进每场会话的热索引。
+#[test]
+fn hot_index_hides_reviewer_only_entries_outside_reviewer_sessions() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let reviewer_tags = || vec!["engram".to_string(), "reviewer".to_string()];
+    let mut rev_l2 = make(
+        "aud_rev_l2",
+        Level::L2,
+        None,
+        Status::Active,
+        0.6,
+        now,
+        vec![now],
+    );
+    rev_l2.tags = reviewer_tags();
+    let plain_l2 = make(
+        "aud_plain_l2",
+        Level::L2,
+        None,
+        Status::Active,
+        0.6,
+        now,
+        vec![now],
+    );
+    let general_path = seed_db("aud_g", &[rev_l2, plain_l2]);
+    let g = general_path.to_string_lossy().to_string();
+    let proj = unique_workspace_root("aud_proj");
+    let proj_name = last_segment(&proj);
+    let mut rev_l4 = make(
+        "aud_rev_l4",
+        Level::L4_2,
+        Some(&proj_name),
+        Status::Active,
+        0.6,
+        now,
+        vec![now],
+    );
+    rev_l4.tags = reviewer_tags();
+    let _db = seed_engram_db(&proj, &[rev_l4]);
+    let p = proj.to_string_lossy().to_string();
+    let args = [
+        "--general-db",
+        g.as_str(),
+        "--workspace-root",
+        p.as_str(),
+        "--now",
+        "1000000000",
+    ];
+
+    // 普通会话：复盘者专用的公共 L2 略去，留说明行；其余照常。
+    let normal = engram_cmd("hot-index")
+        .env_remove("ENGRAM_REVIEWER")
+        .args(args)
+        .output()
+        .expect("运行 engram 失败");
+    assert!(normal.status.success(), "普通会话 hot-index 应成功");
+    let out = String::from_utf8(normal.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        !out.contains("cue-aud_rev_l2"),
+        "普通会话不应注入复盘者专用条目，实得：\n{out}"
+    );
+    assert!(out.contains("cue-aud_plain_l2"), "无标签的 L2 照常注入");
+    assert!(
+        out.contains("cue-aud_rev_l4"),
+        "项目库里带 reviewer 标签的条目是项目知识，照常注入"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("（另有 1 条复盘者专用的常驻记忆")),
+        "应在末尾自成一行说明略去的条数，实得：\n{out}"
+    );
+
+    // 复盘者会话：全部注入，不出说明行。
+    let reviewer = engram_cmd("hot-index")
+        .env("ENGRAM_REVIEWER", "1")
+        .args(args)
+        .output()
+        .expect("运行 engram 失败");
+    assert!(reviewer.status.success(), "复盘者会话 hot-index 应成功");
+    let out = String::from_utf8(reviewer.stdout).expect("stdout 非 UTF-8");
+    assert!(
+        out.contains("cue-aud_rev_l2"),
+        "复盘者会话应注入复盘者专用条目"
+    );
+    assert!(!out.contains("（另有"), "复盘者会话不应出说明行");
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+// 61. prompt-recall --seen-state：强证据档按会话去重。同一会话里已整段贴过的记忆不再
+//     重贴（候选全贴过 → 只给一行「前文已贴过」的提醒）；别的会话各算各的；SessionStart 的
+//     hot-index --seed-state 清空本会话清单（压缩 / clear 之后要允许重贴）；
+//     不给 --seen-state 则行为不变。此前实测强证据档贴出的正文 71% 是会话内重复。
+#[test]
+fn prompt_recall_dedupes_full_tier_within_a_session() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let cue = "发版前必须先推适配器仓库再推主插件否则一致性检查必挂";
+    let mut target = make(
+        "pr_target",
+        Level::L3,
+        None,
+        Status::Active,
+        0.3,
+        now,
+        vec![now],
+    );
+    target.cue = cue.to_string();
+    let mut mems = vec![target];
+    for (i, other) in ["窗口拖拽时标题栏闪烁的处理", "数据库连接池超时排查记录"]
+        .iter()
+        .enumerate()
+    {
+        let mut m = make(
+            &format!("pr_other{i}"),
+            Level::L3,
+            None,
+            Status::Active,
+            0.3,
+            now,
+            vec![now],
+        );
+        m.cue = other.to_string();
+        mems.push(m);
+    }
+    let general_path = seed_db("pr_dedupe_g", &mems);
+    let g = general_path.to_string_lossy().to_string();
+    let ws = unique_workspace_root("pr_dedupe_ws");
+    std::fs::create_dir_all(&ws).expect("建工作目录");
+    let base = ws.join("engram-state").join("active.state");
+    let b = base.to_string_lossy().to_string();
+    let stdin_for = |sid: &str| {
+        format!(
+            r#"{{"cwd":"{}","session_id":"{sid}","prompt":"{cue}"}}"#,
+            json_path(&ws)
+        )
+    };
+    let recall = |sid: &str, with_seen: bool| {
+        let mut args = vec![
+            "--general-db",
+            g.as_str(),
+            "--from-hook-stdin",
+            "--emit",
+            "text",
+            "--now",
+            "1000000000",
+        ];
+        if with_seen {
+            args.extend(["--seen-state", b.as_str()]);
+        }
+        let out = run_subcommand_with_stdin("prompt-recall", &args, &stdin_for(sid));
+        assert!(out.status.success(), "prompt-recall 应 exit 0");
+        String::from_utf8(out.stdout).expect("stdout 非 UTF-8")
+    };
+
+    // 首轮：强证据档整段贴出目标记忆。
+    let first = recall("sid-R1", true);
+    assert!(
+        first.contains("【engram 按需记忆】") && first.contains("pr_target"),
+        "首轮应进强证据档并贴出目标记忆，实得：\n{first}"
+    );
+    // 同一会话再问一次：唯一命中的那条已贴过 → 不重贴正文，只留一行指明是哪条
+    //（宿主可能已把前文压缩掉，完全静默会丢掉这个信号）。
+    let second = recall("sid-R1", true);
+    assert!(
+        !second.contains("【engram 按需记忆】") && second.contains("前文已整段贴过"),
+        "同一会话里已贴过的记忆不应重贴正文，只该留一行提醒，实得：\n{second}"
+    );
+    assert!(
+        second.contains("#pr_target") && second.chars().count() < 200,
+        "提醒行应指明是哪条、且足够短，实得：\n{second}"
+    );
+    // 另一个会话：各算各的，照常贴。
+    assert!(
+        recall("sid-R2", true).contains("pr_target"),
+        "别的会话不受本会话清单影响"
+    );
+    // 不给 --seen-state：行为与以前一致，每轮都贴。
+    assert!(
+        recall("sid-R1", false).contains("pr_target"),
+        "不给 --seen-state 时不去重"
+    );
+
+    // SessionStart（压缩 / clear 后上下文是新的）：hot-index --seed-state 清空本会话清单。
+    let ss = run_subcommand_with_stdin(
+        "hot-index",
+        &[
+            "--general-db",
+            g.as_str(),
+            "--seed-state",
+            b.as_str(),
+            "--from-hook-stdin",
+            "--emit",
+            "json",
+            "--hook-event",
+            "SessionStart",
+            "--now",
+            "1000000000",
+        ],
+        &stdin_for("sid-R1"),
+    );
+    assert!(ss.status.success(), "SessionStart 应成功");
+    assert!(
+        recall("sid-R1", true).contains("pr_target"),
+        "SessionStart 之后本会话应允许重贴"
+    );
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
 // 45. 项 5：复盘健康面——pending 残留 + last-review-ok 超 48h → oneline 加
 //     ⚠reviewer、full 版输出停摆原因；清掉 pending 后标记消失。
 #[test]
@@ -6885,6 +7268,73 @@ fn reword_rewrites_cue_but_preserves_use_history() {
         "不给任何改写参数应失败，实得 stdout={}",
         String::from_utf8_lossy(&noop.stdout)
     );
+
+    cleanup_file(&general_path);
+}
+
+// 60. reword --tags：整体替换标签（补标 / 纠标），cue 与使用历史等其余字段一律保留；
+//     解析后为空的 --tags 拒绝，免得一个写错的空值把整组标签静默清掉。
+#[test]
+fn reword_replaces_tags_and_preserves_the_rest() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let mut original = make(
+        "rw_tags",
+        Level::L2,
+        None,
+        Status::Active,
+        0.66,
+        now - 5000.0,
+        vec![now - 900.0, now - 100.0],
+    );
+    original.pinned = true;
+    let general_path = seed_db("reword_tags_g", std::slice::from_ref(&original));
+    let g = general_path.to_string_lossy().to_string();
+
+    let out = run_subcommand_raw(
+        "reword",
+        &[
+            "--general-db",
+            &g,
+            "--id",
+            "rw_tags",
+            "--tags",
+            "engram, reviewer ,discipline",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "reword --tags 应 exit 0，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = {
+        let db = store::open(&general_path).expect("应能打开库");
+        store::get(&db, "rw_tags")
+            .expect("读库应成功")
+            .expect("记忆应还在")
+    };
+    assert_eq!(
+        got.tags,
+        vec!["engram", "reviewer", "discipline"],
+        "标签应整体替换（逗号分隔、去空白）"
+    );
+    assert_eq!(got.cue, original.cue, "未给 --cue 时 cue 不动");
+    assert_eq!(got.access_log, original.access_log, "使用历史必须原样保留");
+    assert_eq!(got.level, original.level, "层级应保留");
+    assert!(got.pinned, "pinned 应保留");
+
+    // 解析后为空 → 拒绝，库里标签不变。
+    let empty = run_subcommand_raw(
+        "reword",
+        &["--general-db", &g, "--id", "rw_tags", "--tags", " , "],
+    );
+    assert!(!empty.status.success(), "空 --tags 应失败");
+    let db = store::open(&general_path).expect("应能打开库");
+    let after = store::get(&db, "rw_tags")
+        .expect("读库应成功")
+        .expect("记忆应还在");
+    assert_eq!(after.tags, got.tags, "拒绝时不应改动标签");
+    drop(db);
 
     cleanup_file(&general_path);
 }

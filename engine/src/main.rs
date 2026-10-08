@@ -238,7 +238,7 @@ enum Command {
         #[arg(long)]
         from_json_dir: PathBuf,
     },
-    /// 原地改写 cue / 指针：**只**改这几个字段，使用历史与层级状态原样保留。
+    /// 原地改写 cue / 指针 / 标签：**只**改这几个字段，使用历史与层级状态原样保留。
     Reword {
         /// 公共库 redb 文件路径（必填）。
         #[arg(long)]
@@ -258,6 +258,10 @@ enum Command {
         /// 新指针 detail（安放从 cue 里搬出来的细节正文）；不给则保持原值。
         #[arg(long = "pointer-detail")]
         pointer_detail: Option<String>,
+        /// 新标签（逗号分隔，同 `write --tags`），**整体替换**原标签；不给则保持原值。
+        /// 用来补标 / 纠标而不丢使用历史——例如给漏标的复盘者专用条目补上 `reviewer`。
+        #[arg(long)]
+        tags: Option<String>,
     },
     /// 确认真使用：给候选记忆追加一次真使用时间戳（加固）；若为 Cold 则复活。
     ConfirmUse {
@@ -402,7 +406,7 @@ enum Command {
         format: String,
     },
     /// hook 用：从 cwd 向上找 `.engram/` 锚点定出作用域，挂载「公共库 + 作用域库」并渲染；
-    /// 仅当作用域根相对上次**变化**时才输出（重注入）。
+    /// 带 `--state` 时仅当作用域根相对上次**变化**时才输出（重注入）。
     HotIndex {
         /// 公共库路径覆盖；缺省走 `<HOME>/.engram/general.redb` 约定。
         #[arg(long)]
@@ -423,6 +427,14 @@ enum Command {
         /// 共享一个门控互相翻转、每条 prompt 都全量重注入。
         #[arg(long)]
         state: Option<PathBuf>,
+        /// 只播种、不判门控（SessionStart 用，与 `--state` 互斥）：无论上次是什么都照常
+        /// 注入，注入成功后把本次作用域根写进 `--state` 同一份按会话门控（路径推导相同）。
+        /// 启动 / resume / clear / compact 之后上下文都是新的，SessionStart 必须注；播种
+        /// 是为了让紧随其后的首条 UserPromptSubmit（带 `--state`）判「未变」，不再把同一份
+        /// 热索引重注一遍——此前每场会话开场都注两份。写失败只告警、不影响本次注入。
+        /// 同时清空本会话的按需记忆去重清单（见 `prompt-recall --seen-state`）。
+        #[arg(long, conflicts_with = "state")]
+        seed_state: Option<PathBuf>,
         /// 状态栏小文件路径；给定时每次都把挂载集的一行状态串写入该文件（覆盖），
         /// 供状态栏只读该文件而不必开 redb。即便状态门控判定为「空、不注入」也照常写，
         /// 让状态栏始终最新。写失败静默忽略，不影响注入主流程。
@@ -513,6 +525,14 @@ enum Command {
         /// 当前时间（unix 秒）；缺省取系统时间。
         #[arg(long)]
         now: Option<f64>,
+        /// 会话内去重的基准路径（与 hot-index 的 `--state` / `--seed-state` 同一基准）。
+        /// 给定时，本会话已整段贴过的记忆不再重贴：清单按会话存在
+        /// `<基准父目录>/recall-seen/<session_id>.ids`；强证据档去掉已贴过的候选后一条
+        /// 不剩，本轮只给一行「前文已贴过 #…」的提醒。弱证据档不受影响。SessionStart 的
+        /// `hot-index --seed-state` 会清空本会话清单——压缩 / clear 之后早先贴过的正文
+        /// 已不在上下文里，必须允许重贴。
+        #[arg(long)]
+        seen_state: Option<PathBuf>,
     },
     /// hook 用（SessionEnd）：算 transcript 相对水位线的增量，切片 + 落 pending 标记，
     /// 输出复盘所需单行 JSON（`action`=`review` 带切片/库路径，或 `skip` 表无新增）。
@@ -1100,6 +1120,7 @@ fn dispatch_direct() -> ExitCode {
             cue,
             pointer_reference,
             pointer_detail,
+            tags,
         } => run_reword(RewordArgs {
             general_db: &general_db,
             project_db: &project_db,
@@ -1107,6 +1128,7 @@ fn dispatch_direct() -> ExitCode {
             cue: cue.as_deref(),
             pointer_reference: pointer_reference.as_deref(),
             pointer_detail: pointer_detail.as_deref(),
+            tags: tags.as_deref(),
         }),
         Command::ConfirmUse {
             general_db,
@@ -1196,6 +1218,7 @@ fn dispatch_direct() -> ExitCode {
             transcript,
             prompt,
             state,
+            seed_state,
             status_file,
             status_dir,
             emit,
@@ -1210,6 +1233,7 @@ fn dispatch_direct() -> ExitCode {
             transcript: transcript.as_deref(),
             prompt: prompt.as_deref(),
             state: state.as_deref(),
+            seed_state: seed_state.as_deref(),
             status_file: status_file.as_deref(),
             status_dir: status_dir.as_deref(),
             emit: &emit,
@@ -1230,6 +1254,7 @@ fn dispatch_direct() -> ExitCode {
             emit,
             log,
             now,
+            seen_state,
         } => run_prompt_recall(PromptRecallArgs {
             general_db: general_db.as_deref(),
             workspace_root: workspace_root.as_deref(),
@@ -1241,6 +1266,7 @@ fn dispatch_direct() -> ExitCode {
             emit: &emit,
             log: log.as_deref(),
             now,
+            seen_state: seen_state.as_deref(),
         }),
         Command::Status {
             general_db,
@@ -1679,7 +1705,11 @@ fn run_session_start(args: SessionStartArgs<'_>) -> ExitCode {
     // 注意：前言**不计入** --budget（预算只钳 render 产物）。宿主对注入文本有硬上限
     // （Claude Code 的 additionalContext 为 10000 字符，超出即整段落盘、上下文只留前 2000
     // 字符），故 --budget 须按「前言 277 字符 + 预算」之和留余量（hooks.json 取 9000）。
-    let rendered = engram::render::render_budgeted(&merged, now, &[], args.budget);
+    // 受众过滤与 hot-index 同一口径（见 filter_for_audience）。
+    let (merged, reviewer_hidden) = filter_for_audience(merged);
+    let hidden_note = reviewer_hidden_note(reviewer_hidden);
+    let mut rendered = engram::render::render_budgeted(&merged, now, &[], args.budget);
+    append_hidden_note(&mut rendered, hidden_note.as_deref());
 
     let status = match emit {
         EmitFormat::Text => {
@@ -2395,6 +2425,8 @@ struct HotIndexArgs<'a> {
     prompt: Option<&'a str>,
     /// `--state`；给定时启用状态门控（按作用域根路径比较）。
     state: Option<&'a Path>,
+    /// `--seed-state`；给定时不判门控、注入成功后只把作用域根写进同一份门控（SessionStart 用）。
+    seed_state: Option<&'a Path>,
     /// `--status-file`；给定时每次都把挂载集的一行状态串写入该文件（覆盖）。
     status_file: Option<&'a Path>,
     /// `--status-dir`；给定时按 `<dir>/<session_id>.txt` 分会话写状态串（优先于
@@ -2513,14 +2545,22 @@ fn write_state(path: &Path, scope_root: &str) -> Result<(), String> {
 /// 两个窗口跨项目交替时 scope.root 在单文件里反复翻转、门控失效、每条 prompt 都全量
 /// 重注入。改为按会话分文件后各窗口互不干扰；`--state` 原路径仅作定位基准保留兼容，
 /// 旧单文件不再读写。无 session_id（如手动调试）时回退 `default.state`。
+/// SessionStart 的 `--seed-state` 传同一基准、经本函数落到同一个文件（只写不判）。
 fn session_state_path(state_base: &Path, session_id: Option<&str>) -> PathBuf {
-    let dir = state_base
+    per_session_file(state_base, "active-state", session_id, "state")
+}
+
+/// 按会话分文件的统一推导：`<base 父目录>/<subdir>/<净化后 session_id>.<ext>`；
+/// 无 session_id 时回退 `default`。门控状态与按需记忆去重清单共用这一套，保证同一
+/// 基准、同一会话落在同一处，SessionStart 才能一并重置。
+fn per_session_file(base: &Path, subdir: &str, session_id: Option<&str>, ext: &str) -> PathBuf {
+    let dir = base
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let sid = sanitize_file_stem(session_id.unwrap_or("default"));
-    dir.join("active-state").join(format!("{sid}.state"))
+    dir.join(subdir).join(format!("{sid}.{ext}"))
 }
 
 /// 一条活跃会话登记（`~/.engram/active-sessions/<sid>.json`），UserPromptSubmit
@@ -2767,6 +2807,8 @@ struct PromptRecallArgs<'a> {
     log: Option<&'a Path>,
     /// 当前时间（unix 秒）；`None` 取系统时间。
     now: Option<f64>,
+    /// `--seen-state`；给定时按会话去重强证据档（见 [`recall_seen_path`]）。
+    seen_state: Option<&'a Path>,
 }
 
 /// 按**字符**（而非字节）截断，超长时尾部加省略号。
@@ -2820,18 +2862,23 @@ fn render_inject_hint(outcome: &engram::commands::RecallOutcome<'_>) -> String {
 
 /// 渲染**强证据档**的注入文本：贴出 top-N 条记忆正文。
 ///
-/// `budget` 是整段的字符上限，按条数均分给各条 cue——
+/// `budget` 是整段的字符上限，按 `slots` 条均分给各条 cue——
 /// 宿主对 `additionalContext` 有硬上限且**超出部分静默截断**，
 /// 与其被拦腰截断，不如自己先按条截好、每条都留个完整的开头。
-fn render_inject_full(outcome: &engram::commands::RecallOutcome<'_>, budget: usize) -> String {
-    let n = outcome.candidates.len().max(1);
+/// `slots` 取会话内去重**之前**的候选数：去重只决定贴哪几条，不该让剩下的那条
+/// 因为「名额空出来了」而贴得更长。
+fn render_inject_full(
+    candidates: &[&engram::commands::Candidate<'_>],
+    slots: usize,
+    budget: usize,
+) -> String {
     // 预留约 200 字符给标题与结尾说明，其余均分到各条。
-    let per_cue = budget.saturating_sub(200) / n;
+    let per_cue = budget.saturating_sub(200) / slots.max(1);
     let mut out = String::from(
         "【engram 按需记忆】本轮提问命中下列既有经验（来自 L3/L4.3/冷库，\
          **不在**常驻热索引里，所以这里才贴出来）：\n",
     );
-    for (i, c) in outcome.candidates.iter().enumerate() {
+    for (i, c) in candidates.iter().enumerate() {
         let m = c.memory;
         out.push_str(&format!(
             "{}. [{}] {}\n   {}\n",
@@ -2846,6 +2893,22 @@ fn render_inject_full(outcome: &engram::commands::RecallOutcome<'_>, budget: usi
     }
     out.push_str("真用上了哪条，用 engram_confirm_use 报**完整 id** 加固；没用上就不必理会。");
     out
+}
+
+/// 强证据档的候选**全是本会话前文已整段贴过的**时，注入这一行代替重贴正文。
+///
+/// 只列短标记（同热索引行首的 `#<id首段>`），约百字符，对比重贴一次的 1.5k 左右。
+fn render_inject_seen(outcome: &engram::commands::RecallOutcome<'_>) -> String {
+    let toks: Vec<String> = outcome
+        .candidates
+        .iter()
+        .map(|c| format!("#{}", engram::render::id_tok(&c.memory.id)))
+        .collect();
+    format!(
+        "【engram】本轮命中的按需记忆前文已整段贴过（{}）；若前文已被压缩、找不到了，\
+         用 engram_recall 再取。",
+        toks.join("、")
+    )
 }
 
 /// 执行 `prompt-recall` 子命令：拿本轮 prompt 在按需层里检索一次，按档位注入。
@@ -2933,11 +2996,35 @@ fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
     let outcome = recall_candidates(&merged, &query);
     let tier = engram::retrieval::inject_tier(outcome.abstain.is_some(), outcome.hit_strength);
 
+    // 会话内去重（仅 --seen-state）：强证据档里本会话已整段贴过的记忆不再重贴。
+    // 不去重时，同一条记忆每轮命中就每轮整段重贴——2026-10 实测近 400 场会话里，
+    // 强证据档贴出的正文 71% 是同一会话里的重复。
+    let seen_path = args
+        .seen_state
+        .map(|base| recall_seen_path(base, hook.session_id.as_deref()));
+    let fresh: Vec<&engram::commands::Candidate<'_>> =
+        if tier == engram::retrieval::InjectTier::Full {
+            let seen = seen_path.as_deref().map(read_seen_ids).unwrap_or_default();
+            outcome
+                .candidates
+                .iter()
+                .filter(|c| !seen.contains(&c.memory.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     let context = match tier {
         // 静默档：一个字都不输出。这是绝大多数 prompt 的归宿，也正是它该有的样子。
         engram::retrieval::InjectTier::Silent => return ExitCode::SUCCESS,
         engram::retrieval::InjectTier::Hint => render_inject_hint(&outcome),
-        engram::retrieval::InjectTier::Full => render_inject_full(&outcome, args.budget),
+        // 命中的全是本会话前文已贴过的：正文不再重贴，只留一行指明是哪几条。不完全静默，
+        // 是因为宿主可能已把前文压缩掉（AIChat 感知不到自动压缩、不会重置清单），
+        // 一行提醒就够 agent 判断要不要再取。
+        engram::retrieval::InjectTier::Full if fresh.is_empty() => render_inject_seen(&outcome),
+        engram::retrieval::InjectTier::Full => {
+            render_inject_full(&fresh, outcome.candidates.len(), args.budget)
+        }
     };
     // 兜底再截一次：render_* 已按预算裁过，这里防的是未来有人改渲染时漏算。
     let context = truncate_chars(&context, args.budget);
@@ -2947,9 +3034,10 @@ fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
             path,
             now,
             &format!(
-                "prompt-recall tier={tier:?} strength={:.2} cands={} scope={}",
+                "prompt-recall tier={tier:?} strength={:.2} cands={} 新贴={} scope={}",
                 outcome.hit_strength,
                 outcome.candidates.len(),
+                fresh.len(),
                 scope.name
             ),
         );
@@ -2965,7 +3053,55 @@ fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
             }
         },
     }
+    // 真贴出去之后才记账：没注成却先记上，这几条在本会话里就再也贴不出来了。
+    if tier == engram::retrieval::InjectTier::Full && !fresh.is_empty() {
+        if let Some(path) = &seen_path {
+            let ids: Vec<&str> = fresh.iter().map(|c| c.memory.id.as_str()).collect();
+            append_seen_ids(path, &ids);
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// 按会话的「已整段贴过的按需记忆」清单路径：`<基准父目录>/recall-seen/<sid>.ids`。
+/// 基准与 hot-index 的 `--state` / `--seed-state` 相同，推导规则同 [`session_state_path`]。
+fn recall_seen_path(base: &Path, session_id: Option<&str>) -> PathBuf {
+    per_session_file(base, "recall-seen", session_id, "ids")
+}
+
+/// 读本会话已贴过的记忆 id（一行一个）；文件缺失或读不了按空处理。
+fn read_seen_ids(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把本轮新贴出的 id 追加进本会话清单，顺手按 TTL 清理过期会话的清单。best-effort：
+/// 写失败的代价只是下轮可能重贴，不能连累本轮注入。
+fn append_seen_ids(path: &Path, ids: &[&str]) {
+    use std::io::Write as _;
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        for id in ids {
+            let _ = writeln!(f, "{id}");
+        }
+    }
+    cleanup_stale_files(dir, "ids", ACTIVE_FILE_TTL_SECS);
 }
 
 /// 执行 `hot-index` 子命令：从 cwd 向上锚定作用域（找最近的 `.engram/` 锚点），
@@ -2982,7 +3118,8 @@ fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
 /// 6. `--state` 门控：state 文件存**上次 `scope.root` 的绝对路径字符串**；本次相同则
 ///    输出空、exit 0；不同则写回后继续渲染。
 /// 7. 若 `scope.kind == Workspace`：在注入前言之后追加一行管理目录提示。
-/// 8. 按 `--emit` 渲染输出（前言 + 热索引；门控判空时不打印任何东西）→ 可选追加日志。
+/// 8. 按 `--emit` 渲染输出（前言 + 热索引；门控判空时不打印任何东西）；带 `--seed-state`
+///    时输出成功后再把 `scope.root` 写进同一份门控（不判、只写）→ 可选追加日志。
 ///
 /// 任何 IO/库错误走 stderr + 非 0 退出，不 panic。stdin 解析失败静默当作无。
 ///
@@ -3152,34 +3289,41 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
         ScopeKind::Workspace | ScopeKind::None => Vec::new(),
     };
     let is_workspace = scope.kind == ScopeKind::Workspace;
+    // 受众过滤：公共常驻层里的复盘者专用条目只注入复盘者会话（见 filter_for_audience）。
+    // 放在门控之后——门控判空时这步也省了；状态栏在第 5 步已按真实层分布写过。
+    let (merged, reviewer_hidden) = filter_for_audience(merged);
+    let hidden_note = reviewer_hidden_note(reviewer_hidden);
     // 前缀（前言 + 可选的管理目录提示行，各自后面跟一个换行）在注入体里与渲染产物同占额度，
     // 故从预算里实扣；`--budget 0`（不限）保持不限。saturating_sub 兜住「预算比前缀还小」
     // 的极端取值：此时渲染预算为 0，即不限——与其静默产出超额注入，不如让 0 保持原语义，
-    // 这类取值本就不该出现在注入路径上。
+    // 这类取值本就不该出现在注入路径上。尾部的「复盘者专用已略」说明行同理实扣。
     let prefix_cost = HOT_INDEX_PREAMBLE.chars().count()
         + 1
         + if is_workspace {
             WORKSPACE_NOTE.chars().count() + 1
         } else {
             0
-        };
+        }
+        + hidden_note.as_ref().map_or(0, |n| n.chars().count() + 1);
     let render_budget = if args.budget == 0 {
         0
     } else {
         args.budget.saturating_sub(prefix_cost)
     };
     // 渲染带字符预算（--budget，0=不限）：注入成本封顶，超出部分从低优先级整段截断。
-    let rendered = engram::render::render_budgeted(&merged, now, &active_projects, render_budget);
+    let mut rendered =
+        engram::render::render_budgeted(&merged, now, &active_projects, render_budget);
+    append_hidden_note(&mut rendered, hidden_note.as_deref());
 
     // 8. 输出。
-    let status = match emit {
+    let emitted = match emit {
         EmitFormat::Text => {
             println!("{HOT_INDEX_PREAMBLE}");
             if is_workspace {
                 println!("{WORKSPACE_NOTE}");
             }
             print!("{rendered}");
-            ExitCode::SUCCESS
+            true
         }
         EmitFormat::Json => {
             // additionalContext = 前言（+ 管理目录提示行）+ render 输出。
@@ -3191,22 +3335,93 @@ fn run_hot_index(args: HotIndexArgs<'_>) -> ExitCode {
             match build_hot_index_json(args.hook_event, &context) {
                 Ok(json) => {
                     println!("{json}");
-                    ExitCode::SUCCESS
+                    true
                 }
                 Err(e) => {
                     eprintln!("hot-index 失败：{e}");
-                    ExitCode::FAILURE
+                    false
                 }
             }
         }
     };
+
+    // 8b. `--seed-state` 播种：必须放在输出**成功之后**——没注成却先播了种，紧随其后的
+    //     UserPromptSubmit 会被门控挡掉，整场会话一份热索引都没有。打库失败的降级路径
+    //     早在第 4 步就返回、走不到这里，同理不播种，留给首条 prompt 补注真热索引。
+    if emitted {
+        if let Some(seed_base) = args.seed_state {
+            seed_hot_index_state(seed_base, hook.session_id.as_deref(), &scope_root_str);
+        }
+    }
 
     // 9. 调试日志（best-effort）。
     if let Some(log_path) = args.log {
         append_hot_index_log(log_path, now, args.hook_event, &scope);
     }
 
-    status
+    if emitted {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// 热索引按受众过滤：公共常驻层里的复盘者专用条目（[`engram::render::is_reviewer_only`]）
+/// 只注入复盘者会话，普通会话里略去；返回过滤后的记忆与略去的条数。
+///
+/// 复盘者会话的判据是 `ENGRAM_REVIEWER=1`——各端拉起复盘者时统一设置（Claude Code /
+/// codex / kimi 的 launch-reviewer 脚本、AIChat 的 engram-review），且原本就是各端
+/// hook 防递归的同一个开关。按需层目录不受影响：它只统计非常驻层与冷库，本就不含这些条目。
+fn filter_for_audience(merged: Vec<Memory>) -> (Vec<Memory>, usize) {
+    if std::env::var("ENGRAM_REVIEWER").as_deref() == Ok("1") {
+        return (merged, 0);
+    }
+    let before = merged.len();
+    let kept: Vec<Memory> = merged
+        .into_iter()
+        .filter(|m| !engram::render::is_reviewer_only(m))
+        .collect();
+    let hidden = before - kept.len();
+    (kept, hidden)
+}
+
+/// 受众过滤略去了条目时，附在热索引末尾的一行说明。不留这行，排查时只会看到常驻层
+/// 莫名变空、与 `status` 报的层分布对不上。
+fn reviewer_hidden_note(hidden: usize) -> Option<String> {
+    (hidden > 0)
+        .then(|| format!("（另有 {hidden} 条复盘者专用的常驻记忆只注入复盘者会话，此处未列出）"))
+}
+
+/// 把 [`reviewer_hidden_note`] 的说明行接到渲染产物末尾（自成一行）；`None` 时原样不动。
+fn append_hidden_note(rendered: &mut String, note: Option<&str>) {
+    if let Some(note) = note {
+        if !rendered.is_empty() && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered.push_str(note);
+        rendered.push('\n');
+    }
+}
+
+/// `--seed-state` 的播种：把本次作用域根写进 `--state` 同一份按会话门控（路径推导见
+/// [`session_state_path`]），只写、不判；同时清空本会话的按需记忆去重清单
+/// （[`recall_seen_path`]）——SessionStart 意味着上下文是新的（启动 / resume / clear /
+/// compact），早先整段贴过的按需记忆可能已不在上下文里，必须允许重贴。
+///
+/// 与 `--state` 写失败即让命令失败的语义**刻意不同**：播种失败的代价只是退回「首条
+/// prompt 再注一份」的旧行为，而本次注入此刻已经输出，不能因为门控文件写不进去就把
+/// 整条 SessionStart 判成失败——故只在 stderr 告警。顺手按 TTL 清理门控目录里的过期
+/// 会话状态（与 `--state` 路径一致）。
+fn seed_hot_index_state(seed_base: &Path, session_id: Option<&str>, scope_root: &str) {
+    let _ = std::fs::remove_file(recall_seen_path(seed_base, session_id));
+    let state_path = session_state_path(seed_base, session_id);
+    if let Err(e) = write_state(&state_path, scope_root) {
+        eprintln!("hot-index 警告：播种门控状态失败（{e}），首条 prompt 可能重复注入热索引");
+        return;
+    }
+    if let Some(dir) = state_path.parent() {
+        cleanup_stale_files(dir, "state", ACTIVE_FILE_TTL_SECS);
+    }
 }
 
 /// 把状态栏一行串写入 `path`（**覆盖**），best-effort：父目录不存在先 `create_dir_all`，
@@ -4561,13 +4776,14 @@ struct RewordArgs<'a> {
     cue: Option<&'a str>,
     pointer_reference: Option<&'a str>,
     pointer_detail: Option<&'a str>,
+    tags: Option<&'a str>,
 }
 
-/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针，**其余字段一律保留**。
+/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针 / 标签，**其余字段一律保留**。
 ///
 /// 保留清单（这是本命令存在的全部理由，改动时必须逐条守住）：`access_log`（使用
 /// 历史 = 记忆的加固资产）、`created_at`、`level`、`importance`、`pinned`、
-/// `status`、`tags`、`project`、`superseded_by`、`schema_version`。
+/// `status`、`tags`（未给 `--tags` 时）、`project`、`superseded_by`、`schema_version`。
 ///
 /// **为什么需要它**：cue 纪律（cue 是一句话检索线索、细节放指针，见
 /// [`CUE_WARN_CHARS`]）要能被执行，修正一条已写入的超长 cue 就不能以丢历史为代价。
@@ -4576,13 +4792,23 @@ struct RewordArgs<'a> {
 /// 「守纪律」和「保住加固资产」二选一，结果就是没人改，长 cue 越积越多：2026-08-21
 /// 公共库里 cue 超 240 字符的 active 记忆有 19 条，最长 1370 字符。
 ///
-/// 三个改写参数都不给则报错退出（避免一次无意义的读写）。新 cue 照常过
-/// [`warn_long_cue`] 的长度警告。
+/// 四个改写参数都不给则报错退出（避免一次无意义的读写）。新 cue 照常过
+/// [`warn_long_cue`] 的长度警告。`--tags` 解析后为空（如 `""`、`" , "`）拒绝——
+/// 一个写错的空值不该把整组标签静默清掉。
 fn run_reword(args: RewordArgs) -> ExitCode {
-    if args.cue.is_none() && args.pointer_reference.is_none() && args.pointer_detail.is_none() {
+    if args.cue.is_none()
+        && args.pointer_reference.is_none()
+        && args.pointer_detail.is_none()
+        && args.tags.is_none()
+    {
         eprintln!(
-            "reword 失败：--cue / --pointer-reference / --pointer-detail 至少给一个，否则无事可做"
+            "reword 失败：--cue / --pointer-reference / --pointer-detail / --tags 至少给一个，否则无事可做"
         );
+        return ExitCode::FAILURE;
+    }
+    let new_tags = args.tags.map(|t| parse_tags(Some(t)));
+    if new_tags.as_ref().is_some_and(|t| t.is_empty()) {
+        eprintln!("reword 失败：--tags 解析后为空（要改标签就写全新的一组，逗号分隔）");
         return ExitCode::FAILURE;
     }
     let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
@@ -4621,6 +4847,9 @@ fn run_reword(args: RewordArgs) -> ExitCode {
     if let Some(d) = args.pointer_detail {
         m.pointer.detail = Some(d.to_string());
     }
+    if let Some(t) = new_tags {
+        m.tags = t;
+    }
 
     match dbs.route(m.project.as_deref()) {
         Some(db) => {
@@ -4641,10 +4870,11 @@ fn run_reword(args: RewordArgs) -> ExitCode {
 
     warn_long_cue(&m.cue, m.level);
     println!(
-        "reword: {} cue {} → {} 字符；使用历史 {} 次、created_at、层级 {} 与状态均保留",
+        "reword: {} cue {} → {} 字符；标签 [{}]；使用历史 {} 次、created_at、层级 {} 与状态均保留",
         args.id,
         old_cue_chars,
         m.cue.chars().count(),
+        m.tags.join(","),
         m.access_log.len(),
         level_repr(m.level)
     );

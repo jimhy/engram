@@ -185,6 +185,26 @@ pub const HOT_INDEX_PREAMBLE: &str = concat!(
     "检索：engram recall --query \"直接写自然语句，中文会自动切词\"（库路径用 engram resolve 拿；库里没有时它会明说「无相关记忆」，不会硬凑）」",
 );
 
+/// 复盘者专用标签。公共常驻层里带它的记忆是复盘者自己的方法论 / 工具坑，主 agent
+/// 干活用不上——判定见 [`is_reviewer_only`]。
+pub const REVIEWER_TAG: &str = "reviewer";
+
+/// 这条记忆是否「复盘者专用的常驻条目」：公共库（`project == None`）、Active、落在
+/// 常驻层（[`crate::model::TierParams::resident`]，默认即 L1/L2）、且带 [`REVIEWER_TAG`]。
+///
+/// hot-index 注入路径据此按受众过滤：这类条目只注入复盘者会话（各端 launcher 统一置
+/// `ENGRAM_REVIEWER=1`），普通会话不注——否则它们会进**每个项目每场会话**的热索引
+/// （2026-10 实测公共 L2 五条全是复盘者方法论，占了整份热索引一半）。
+///
+/// 项目库（L4）里带该标签的**不算**：那是具体项目（如 engram 自身开发）的知识，
+/// 照常给主 agent。非常驻层本就不渲正文，也不在此列。
+pub fn is_reviewer_only(m: &Memory) -> bool {
+    m.project.is_none()
+        && m.status == Status::Active
+        && params(m.level).resident
+        && m.tags.iter().any(|t| t == REVIEWER_TAG)
+}
+
 /// 不参与逐条裁尾的渲染片所用的节组 id（见 [`RenderPiece::group`]）。
 const GROUP_NONE: usize = usize::MAX;
 
@@ -661,7 +681,7 @@ fn fmt_eff(eff: f64) -> String {
 /// 映射回 id 去 `confirm-use`——闭合「注入(主通道)→真使用→加固」回路，而不必对
 /// 长 cue 做模糊反查。取首段是因为它由**创建时间派生、单调唯一**；次段是内容哈希，
 /// 同文/近义记忆会撞，不适合当唯一标记。非 `mem-<a>-<b>` 形制的 id 原样返回。
-fn id_tok(id: &str) -> &str {
+pub fn id_tok(id: &str) -> &str {
     id.strip_prefix("mem-")
         .and_then(|rest| rest.split('-').next())
         .filter(|s| !s.is_empty())
@@ -764,6 +784,27 @@ mod tests {
             tags: vec![],
             schema_version: crate::model::MEMORY_SCHEMA_VERSION,
         }
+    }
+
+    #[test]
+    fn reviewer_only_needs_general_resident_active_and_tag() {
+        // 同一条带 reviewer 标签的记忆，只换层级 / 作用域 / 状态，看判定。
+        let check = |level: Level, project: Option<&str>, status: Status| {
+            let mut m = mem("x", level, project, status, 0.5);
+            m.tags = vec!["engram".to_string(), REVIEWER_TAG.to_string()];
+            is_reviewer_only(&m)
+        };
+        // 命中：公共库常驻层（L1/L2）的 active 条目。
+        assert!(check(Level::L1, None, Status::Active));
+        assert!(check(Level::L2, None, Status::Active));
+        // 不命中：项目库 L4——那是具体项目的知识，照常给主 agent。
+        assert!(!check(Level::L4_2, Some("engram"), Status::Active));
+        // 不命中：非常驻层本就不渲正文；非 Active 也不渲。
+        assert!(!check(Level::L3, None, Status::Active));
+        assert!(!check(Level::L2, None, Status::Cold));
+        // 不命中：没带标签。
+        let plain = mem("plain", Level::L2, None, Status::Active, 0.5);
+        assert!(!is_reviewer_only(&plain));
     }
 
     #[test]

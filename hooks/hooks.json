@@ -1,12 +1,12 @@
 {
-  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。ensure-engram.sh 把引擎收敛到公共位置 ~/.engram/bin（全机一份、谁新用谁，静默 best-effort）。UserPromptSubmit 上挂两条、职责分离：hot-index 注入常驻热索引（L1/L2/L4.x 高层），prompt-recall 拿本轮 prompt 去按需层（L3/L4.3/冷库）捞一次、按证据强度分档注入（强→贴正文｜弱→只提醒一句去检索｜无→完全静默）。分开挂而不是合并进 hot-index：热索引是每轮必须的，prompt-recall 是增值的，后者出问题不该拖累前者。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
+  "_note": "命令在 bash 下执行：插件路径用 ${CLAUDE_PLUGIN_ROOT}（安装目录），home 下的运行时文件用 $HOME（Git Bash 会展开成 /c/Users/... 正斜杠路径，引擎接受正斜杠）。公共库默认 ~/.engram/general.redb。ensure-engram.sh 把引擎收敛到公共位置 ~/.engram/bin（全机一份、谁新用谁，静默 best-effort）。UserPromptSubmit 上挂两条、职责分离：hot-index 注入常驻热索引（L1/L2/L4.x 高层），prompt-recall 拿本轮 prompt 去按需层（L3/L4.3/冷库）捞一次、按证据强度分档注入（强→贴正文｜弱→只提醒一句去检索｜无→完全静默）。分开挂而不是合并进 hot-index：热索引是每轮必须的，prompt-recall 是增值的，后者出问题不该拖累前者。SessionStart 的 hot-index 带 --seed-state（与 UserPromptSubmit 的 --state 同一基准）：照常注入，并把作用域写进本会话门控，首条 prompt 判「未变」就不再重注——此前每场会话开场都注两份同样的热索引；|| 之后是同一条命令去掉 --seed-state，只给公共位置还是不认该参数的旧引擎兜底（插件升级后头一场会话，ensure-engram 与它并行、还没收敛完）。prompt-recall 带 --seen-state（同一基准）按会话去重：本会话已整段贴过的按需记忆不再重贴，SessionStart 清空清单；它的 || 兜底同理，而且更要紧——UserPromptSubmit 钩子以退出码 2 结束会拦下用户的提问，旧引擎不认新参数时 clap 恰好就退 2。复盘/补跑走 session-end-review.sh / session-start-catchup.sh 跨平台入口：Windows 下转调同名 .ps1（行为不变），macOS/Linux 下执行等价 POSIX 逻辑。",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --seed-state \"$HOME/.engram/active.state\" --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\" || bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" hot-index --from-hook-stdin --emit json --hook-event SessionStart --status-dir \"$HOME/.engram/status\" --log \"$HOME/.engram/hook.log\""
           },
           {
             "type": "command",
@@ -32,7 +32,7 @@
           },
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" prompt-recall --from-hook-stdin --emit json --hook-event UserPromptSubmit --log \"$HOME/.engram/hook.log\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" prompt-recall --from-hook-stdin --emit json --hook-event UserPromptSubmit --seen-state \"$HOME/.engram/active.state\" --log \"$HOME/.engram/hook.log\" || bash \"${CLAUDE_PLUGIN_ROOT}/bin/engram\" prompt-recall --from-hook-stdin --emit json --hook-event UserPromptSubmit --log \"$HOME/.engram/hook.log\""
           }
         ]
       }
