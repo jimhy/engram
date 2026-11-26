@@ -210,6 +210,8 @@ engram gc --general-db G [--project-db n=p ...] [--dry-run]
 | `supersede --id --by` | 纠错硬拽 |
 | `merge --from --cue` | 合并一簇为粗 gist |
 | `consolidate` | 升降级 / 淘汰状态机（`--dry-run` 预览） |
+| `reword` | 原地改写 cue / 指针 / 标签，也可用 `--level` / `--importance` / `--pinned` 做同轨道校准（保留 `access_log`） |
+| `rename-project` | 目录改名后把项目库内 L4 条目的 `project` 字段批量对齐到新项目名（保留历史并同步 `projects.json`） |
 | `forget --id` | 按 id 物理删除一条记忆（不留 tombstone；已完成 / 已失效的短期开口类记忆核实 ground truth 后用它删，不限定层级） |
 | `gc` | TTL 硬删除（`--dry-run` 预览） |
 | `list` | 可读检视（redb 是二进制，用它看内容） |

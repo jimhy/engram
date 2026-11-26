@@ -514,6 +514,38 @@ pub fn inject_tier(abstained: bool, hit_strength: f64) -> InjectTier {
     }
 }
 
+/// 面向 `prompt-recall` 的带上下文注入分档判定（优化短动作指令的 `ThinQuery` 静默）。
+///
+/// 保持 [`judge`] 对显式 `engram recall` 的弃权判据不变，仅在 `UserPromptSubmit` 的
+/// `prompt-recall` 路径中对 `AbstainReason::ThinQuery` 做受控放行（**绝不升到 `Full`**）：
+/// - 未弃权（`abstain == None`）：委托 [`inject_tier`]；
+/// - `ThinQuery` 且满足以下任一证据 → 放行 [`InjectTier::Hint`]：
+///   1. `has_tag_match` 为真（长度 ≥ 2 的 query 词元直接命中某候选记忆的人工 `tags`，
+///      如 `"发版"`、`"发布插件"`、`"设计UI"`、`"修bug"`）；
+///   2. `hit_strength >= ABSTAIN_MIN_HIT_STRENGTH && top_max_importance >= crate::model::IMPORTANCE_GATE`
+///      （高强度命中且 top-3 含高重要度铁律/关键决策，如 `"热更"` 命中 `importance = 0.95` 铁律）；
+/// - 其余 `ThinQuery` 以及 `EmptyQuery` / `EmptyCorpus` / `NoCandidate` / `WeakMatch` → [`InjectTier::Silent`]。
+pub fn inject_tier_for_prompt(
+    abstain: Option<&AbstainReason>,
+    hit_strength: f64,
+    has_tag_match: bool,
+    top_max_importance: f64,
+) -> InjectTier {
+    match abstain {
+        None => inject_tier(false, hit_strength),
+        Some(AbstainReason::ThinQuery { .. }) => {
+            let strong_high_imp = hit_strength >= ABSTAIN_MIN_HIT_STRENGTH
+                && top_max_importance >= crate::model::IMPORTANCE_GATE;
+            if has_tag_match || strong_high_imp {
+                InjectTier::Hint
+            } else {
+                InjectTier::Silent
+            }
+        }
+        Some(_) => InjectTier::Silent,
+    }
+}
+
 /// 便捷入口：对一批记忆按 query 打分并排序，同时给出弃权判定。
 ///
 /// 返回 `(按分数降序的 (下标, 分数) 列表, 弃权理由)`。
@@ -842,5 +874,66 @@ mod tests {
             "命中详情必须按 IDF 降序，实得 {hits:?}"
         );
         assert_eq!(hits[0].token, "稀有", "稀有词该排在前面");
+    }
+
+    #[test]
+    fn inject_tier_for_prompt_rescues_actionable_thin_query_to_hint_only() {
+        let thin = AbstainReason::ThinQuery {
+            info: 0.46,
+            floor: ABSTAIN_MIN_QUERY_INFO,
+        };
+        // ThinQuery + tag 命中 → 放行 Hint，且即便 hit_strength 很高也不直接进 Full。
+        assert_eq!(
+            inject_tier_for_prompt(Some(&thin), INJECT_FULL_MIN_STRENGTH + 1.0, true, 0.3),
+            InjectTier::Hint
+        );
+        // ThinQuery + 无 tag 命中，但高强度命中高重要度铁律 → 放行 Hint。
+        assert_eq!(
+            inject_tier_for_prompt(
+                Some(&thin),
+                ABSTAIN_MIN_HIT_STRENGTH,
+                false,
+                crate::model::IMPORTANCE_GATE
+            ),
+            InjectTier::Hint
+        );
+        // ThinQuery + 无 tag + 强度不足（哪怕 importance 高，如闲聊偶碰）→ 必须 Silent。
+        assert_eq!(
+            inject_tier_for_prompt(
+                Some(&thin),
+                ABSTAIN_MIN_HIT_STRENGTH - 0.05,
+                false,
+                0.95
+            ),
+            InjectTier::Silent
+        );
+        // ThinQuery + 无 tag + 普通重要度（模拟“好的”“收到”“继续”）→ 必须 Silent。
+        assert_eq!(
+            inject_tier_for_prompt(Some(&thin), 1.5, false, 0.72),
+            InjectTier::Silent
+        );
+        // 非 ThinQuery 的其他弃权理由（如 WeakMatch / NoCandidate）一律 Silent。
+        let weak = AbstainReason::WeakMatch {
+            strength: 0.9,
+            floor: ABSTAIN_MIN_HIT_STRENGTH,
+            top_token: Some("发版".to_string()),
+        };
+        assert_eq!(
+            inject_tier_for_prompt(Some(&weak), 0.9, true, 0.95),
+            InjectTier::Silent
+        );
+        assert_eq!(
+            inject_tier_for_prompt(Some(&AbstainReason::NoCandidate), 0.0, true, 0.95),
+            InjectTier::Silent
+        );
+        // 未弃权时与 inject_tier 一致。
+        assert_eq!(
+            inject_tier_for_prompt(None, INJECT_FULL_MIN_STRENGTH, false, 0.3),
+            InjectTier::Full
+        );
+        assert_eq!(
+            inject_tier_for_prompt(None, ABSTAIN_MIN_HIT_STRENGTH, false, 0.3),
+            InjectTier::Hint
+        );
     }
 }

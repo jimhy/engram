@@ -509,6 +509,17 @@ pub struct RecallOutcome<'a> {
     /// 重建既浪费又会引入「两处各算一遍、悄悄算得不一样」的分叉风险。
     /// 无候选（或用 legacy 打分器）时为 `0.0`。
     pub hit_strength: f64,
+    /// 命中候选里被长度 ≥ 2 的 query 词元直接击中标签（`tags`）的去重主题名（最多 4 个）。
+    ///
+    /// 用于 `prompt-recall` 在 `ThinQuery` 场景识别「短动作/主题词指令」（如 `"发版"`、`"设计UI"`）：
+    /// 单字词元不参与（防单字碰撞），仅长度 ≥ 2 的词元精确匹配 tag 或其分词词元时收集，
+    /// 既作为放行 `Hint` 的证据，也优先展示在提示行主题词中。
+    pub tag_matched_topics: Vec<String>,
+    /// 截断前 top-3 命中候选中最高的 `importance`（`pinned == true` 视作 `1.0`；无候选时为 `0.0`）。
+    ///
+    /// 供 `prompt-recall` 判断短指令是否命中了高重要度铁律/关键决策（如 `"热更"` 命中
+    /// 英文 tag 但 `importance = 0.95` 的铁律）。
+    pub top_max_importance: f64,
 }
 
 /// recall 的查询参数。
@@ -681,13 +692,63 @@ pub fn recall_candidates<'a>(mems: &'a [Memory], q: &RecallQuery<'_>) -> RecallO
         None => 0.0,
     };
 
+    // 在 truncate 之前统计：
+    // 1. 长度 >= 2 的 query 词元直接击中候选记忆 tags 的去重主题名（最多 4 个）；
+    // 2. top-3 命中候选的最高 importance（pinned 视作 1.0）。
+    let multi_char_tokens: Vec<&str> = q
+        .tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|t| t.chars().count() >= 2)
+        .collect();
+    let mut tag_matched_topics: Vec<String> = Vec::new();
+    if !multi_char_tokens.is_empty() {
+        'outer: for c in &cands {
+            for tag in &c.memory.tags {
+                let tag_trim = tag.trim();
+                if tag_trim.is_empty() {
+                    continue;
+                }
+                let tag_lower = tag_trim.to_lowercase();
+                let tag_toks = retrieval::tokenize_doc(tag_trim);
+                let matched = multi_char_tokens
+                    .iter()
+                    .any(|&tok| tag_lower == tok || tag_toks.iter().any(|tt| tt == tok));
+                if matched && !tag_matched_topics.iter().any(|x| x == tag_trim) {
+                    tag_matched_topics.push(tag_trim.to_string());
+                    if tag_matched_topics.len() >= 4 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let top_max_importance = cands
+        .iter()
+        .take(3)
+        .map(|c| {
+            if c.memory.pinned {
+                1.0
+            } else {
+                c.memory.importance
+            }
+        })
+        .fold(0.0_f64, f64::max);
+
     cands.truncate(q.limit);
     let suggestions = if abstain.is_some() {
         top_topics(&pool, 8)
     } else {
         Vec::new()
     };
-    RecallOutcome { candidates: cands, abstain, suggestions, hit_strength }
+    RecallOutcome {
+        candidates: cands,
+        abstain,
+        suggestions,
+        hit_strength,
+        tag_matched_topics,
+        top_max_importance,
+    }
 }
 
 /// 在一批记忆里按 status/level/project 过滤后，按 `effective(now)` 降序排序。
@@ -2532,5 +2593,34 @@ mod tests {
         let s = oneline_status(&mems, now);
         assert!(s.starts_with("● Engram | "), "应以 UTF-8 实心圆点前缀开头");
         assert!(s.contains(" | engram:1"), "应含 engram 项目段，实得：{s}");
+    }
+
+    #[test]
+    fn recall_candidates_collects_tag_matched_topics_excluding_single_char_tokens() {
+        let now = 1_000_000_000.0;
+        let mut m1 = mem("m1", Level::L3, None, Status::Active, "插件发版流程");
+        m1.tags = vec!["发版".to_string(), "release".to_string(), "好".to_string()];
+        m1.importance = 0.85;
+        let mut m2 = mem("m2", Level::L3, None, Status::Active, "普通好习惯");
+        m2.tags = vec!["好".to_string()];
+        m2.importance = 0.2;
+        let mems = vec![m1, m2];
+
+        // 长度 >= 2 词元 "发版" 击中标签 "发版"
+        let toks = tokenize_query("发版");
+        let q = RecallQuery::new(&toks, false, 10, now);
+        let out = recall_candidates(&mems, &q);
+        assert_eq!(out.tag_matched_topics, vec!["发版".to_string()]);
+        assert!((out.top_max_importance - 0.85).abs() < 1e-9);
+
+        // 单字词元 "好" 不参与 tag_matched_topics，防止单字碰撞
+        let toks_single = tokenize_query("好");
+        let q_single = RecallQuery::new(&toks_single, false, 10, now);
+        let out_single = recall_candidates(&mems, &q_single);
+        assert!(
+            out_single.tag_matched_topics.is_empty(),
+            "单字词元不应触发 tag_matched_topics，实得：{:?}",
+            out_single.tag_matched_topics
+        );
     }
 }

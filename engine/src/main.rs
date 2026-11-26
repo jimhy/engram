@@ -238,7 +238,7 @@ enum Command {
         #[arg(long)]
         from_json_dir: PathBuf,
     },
-    /// 原地改写 cue / 指针 / 标签：**只**改这几个字段，使用历史与层级状态原样保留。
+    /// 原地改写 cue / 指针 / 标签 / 层级 / 重要度 / 置顶：**只**改这几个字段，使用历史、创建时间与状态原样保留。
     Reword {
         /// 公共库 redb 文件路径（必填）。
         #[arg(long)]
@@ -262,6 +262,15 @@ enum Command {
         /// 用来补标 / 纠标而不丢使用历史——例如给漏标的复盘者专用条目补上 `reviewer`。
         #[arg(long)]
         tags: Option<String>,
+        /// 原地校准层级（须同轨道：通用 L1|L2|L3 或项目 L4.1|L4.2|L4.3；跨轨道请用 graduate）。
+        #[arg(long)]
+        level: Option<String>,
+        /// 原地校准重要度，取值 [0,1]；不给则保持原值。
+        #[arg(long)]
+        importance: Option<f64>,
+        /// 原地校准置顶状态（true/false）；不给则保持原值。
+        #[arg(long)]
+        pinned: Option<bool>,
     },
     /// 确认真使用：给候选记忆追加一次真使用时间戳（加固）；若为 Cold 则复活。
     ConfirmUse {
@@ -677,7 +686,7 @@ enum Command {
         now: Option<f64>,
     },
     /// 只读健康体检：报告库版本、层分布、schema 分布、坏行、超预算层、未来时间戳、
-    /// 悬空 `superseded_by`、importance 偏离层锚、疑似重复、孤儿。**绝不写库**。
+    /// 悬空 `superseded_by`、importance 偏离层锚、疑似重复、孤儿、项目名漂移。**绝不写库**。
     Doctor {
         /// 公共库 redb 文件路径（必填）。
         #[arg(long)]
@@ -691,6 +700,25 @@ enum Command {
         /// 当前时间（unix 秒）；缺省取系统时间（未来时间戳判定用）。
         #[arg(long)]
         now: Option<f64>,
+    },
+    /// 项目改名对齐：把某项目库内 L4 条目的 `project` 字段批量对齐到新项目名（保留全部历史与状态），
+    /// 并同步刷新注册表 `~/.engram/projects.json` 中的项目名。
+    RenameProject {
+        /// 目标项目库 redb 文件路径（必填，仅改该单库，不碰公共库）。
+        #[arg(long)]
+        project_db: PathBuf,
+        /// 对齐后的新项目名（必填，非空）。
+        #[arg(long)]
+        to: String,
+        /// 可选：仅改写当前 `project` 等于该旧项目名的条目；缺省则对齐库内所有与 `--to` 不同的 L4 条目。
+        #[arg(long)]
+        from: Option<String>,
+        /// 可选公共库路径（用于同步更新同目录下 `projects.json` 注册表中的项目名；缺省自动探测）。
+        #[arg(long)]
+        general_db: Option<PathBuf>,
+        /// 仅预览将修改的条数与旧项目名分布，不写库、不改注册表。
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1121,6 +1149,9 @@ fn dispatch_direct() -> ExitCode {
             pointer_reference,
             pointer_detail,
             tags,
+            level,
+            importance,
+            pinned,
         } => run_reword(RewordArgs {
             general_db: &general_db,
             project_db: &project_db,
@@ -1129,6 +1160,9 @@ fn dispatch_direct() -> ExitCode {
             pointer_reference: pointer_reference.as_deref(),
             pointer_detail: pointer_detail.as_deref(),
             tags: tags.as_deref(),
+            level: level.as_deref(),
+            importance,
+            pinned,
         }),
         Command::ConfirmUse {
             general_db,
@@ -1371,6 +1405,19 @@ fn dispatch_direct() -> ExitCode {
             project_db: &project_db,
             json,
             now,
+        }),
+        Command::RenameProject {
+            project_db,
+            to,
+            from,
+            general_db,
+            dry_run,
+        } => run_rename_project(RenameProjectArgs {
+            project_db: &project_db,
+            to: &to,
+            from: from.as_deref(),
+            general_db: general_db.as_deref(),
+            dry_run,
         }),
     }
 }
@@ -2152,11 +2199,14 @@ fn run_consolidate_done(pending_path: &Path, watermark: &Path) -> ExitCode {
     let mut transition_count = 0usize;
     {
         let mut pmap: BTreeMap<String, PathBuf> = BTreeMap::new();
-        if !pending.project_name.is_empty() && !pending.project_db.is_empty() {
-            pmap.insert(
-                pending.project_name.clone(),
-                PathBuf::from(&pending.project_db),
-            );
+        let proj_path = Path::new(&pending.project_db);
+        // 仅当项目库文件真实存在时才纳入确定性巩固，防止损坏/已改名/乱码的 project_db
+        // 路径被 store::open 的 create_dir_all 凭空建出脏目录与空库。
+        if !pending.project_name.is_empty()
+            && !pending.project_db.is_empty()
+            && proj_path.is_file()
+        {
+            pmap.insert(pending.project_name.clone(), proj_path.to_path_buf());
         }
         match consolidate_libs(Path::new(&pending.general_db), &pmap, now, false) {
             Ok(ts) => {
@@ -2838,9 +2888,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// 它不要求检索**准**，只要求判断出「这儿可能有东西」，
 /// 而把「提醒」这个动作从用户手里挪到了 hook 上。
 fn render_inject_hint(outcome: &engram::commands::RecallOutcome<'_>) -> String {
-    // 主题词取 top-3 候选的 tags 去重——tags 是人工标注的主题名（release / windows …），
-    // 比 BM25 命中的二字 ngram（「先推」「版铁」）更适合当检索词喂回去。
+    // 优先使用长度 >= 2 词元直接命中的标签（短指令放行时最精确），再补 top-3 候选的其他 tags。
     let mut topics: Vec<&str> = Vec::new();
+    for t in &outcome.tag_matched_topics {
+        if !topics.contains(&t.as_str()) {
+            topics.push(t.as_str());
+        }
+    }
     for c in outcome.candidates.iter().take(3) {
         for t in &c.memory.tags {
             if !topics.contains(&t.as_str()) {
@@ -2994,7 +3048,12 @@ fn run_prompt_recall(args: PromptRecallArgs<'_>) -> ExitCode {
         exclude_levels: &engram::retrieval::INJECT_SKIP_RESIDENT_LEVELS,
     };
     let outcome = recall_candidates(&merged, &query);
-    let tier = engram::retrieval::inject_tier(outcome.abstain.is_some(), outcome.hit_strength);
+    let tier = engram::retrieval::inject_tier_for_prompt(
+        outcome.abstain.as_ref(),
+        outcome.hit_strength,
+        !outcome.tag_matched_topics.is_empty(),
+        outcome.top_max_importance,
+    );
 
     // 会话内去重（仅 --seen-state）：强证据档里本会话已整段贴过的记忆不再重贴。
     // 不去重时，同一条记忆每轮命中就每轮整段重贴——2026-10 实测近 400 场会话里，
@@ -4777,32 +4836,30 @@ struct RewordArgs<'a> {
     pointer_reference: Option<&'a str>,
     pointer_detail: Option<&'a str>,
     tags: Option<&'a str>,
+    level: Option<&'a str>,
+    importance: Option<f64>,
+    pinned: Option<bool>,
 }
 
-/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针 / 标签，**其余字段一律保留**。
+/// 执行 `reword` 子命令：原地改写一条记忆的 cue / 指针 / 标签 / 层级 / 重要度 / 置顶，
+/// **其余字段一律保留**。
 ///
 /// 保留清单（这是本命令存在的全部理由，改动时必须逐条守住）：`access_log`（使用
-/// 历史 = 记忆的加固资产）、`created_at`、`level`、`importance`、`pinned`、
-/// `status`、`tags`（未给 `--tags` 时）、`project`、`superseded_by`、`schema_version`。
+/// 历史 = 记忆的加固资产）、`created_at`、`status`、`project`、`superseded_by`、`schema_version`。
 ///
-/// **为什么需要它**：cue 纪律（cue 是一句话检索线索、细节放指针，见
-/// [`CUE_WARN_CHARS`]）要能被执行，修正一条已写入的超长 cue 就不能以丢历史为代价。
-/// 在本命令之前，改 cue 只有两条路——`write --overwrite`（整条 `store::put` 覆盖）
-/// 与 `write` 新条 + `supersede` 旧条——**两条都会把 access_log 清零**，等于让
-/// 「守纪律」和「保住加固资产」二选一，结果就是没人改，长 cue 越积越多：2026-08-21
-/// 公共库里 cue 超 240 字符的 active 记忆有 19 条，最长 1370 字符。
-///
-/// 四个改写参数都不给则报错退出（避免一次无意义的读写）。新 cue 照常过
-/// [`warn_long_cue`] 的长度警告。`--tags` 解析后为空（如 `""`、`" , "`）拒绝——
-/// 一个写错的空值不该把整组标签静默清掉。
+/// **同轨道校验**：`--level` 只允许在同轨道内调整（通用 L1/L2/L3 之间、或项目 L4.1/L4.2/L4.3
+/// 之间）；跨轨道（如 L4 升通用）必须用 `graduate`（涉及跨库移动与 `superseded` 指针）。
 fn run_reword(args: RewordArgs) -> ExitCode {
     if args.cue.is_none()
         && args.pointer_reference.is_none()
         && args.pointer_detail.is_none()
         && args.tags.is_none()
+        && args.level.is_none()
+        && args.importance.is_none()
+        && args.pinned.is_none()
     {
         eprintln!(
-            "reword 失败：--cue / --pointer-reference / --pointer-detail / --tags 至少给一个，否则无事可做"
+            "reword 失败：--cue / --pointer-reference / --pointer-detail / --tags / --level / --importance / --pinned 至少给一个，否则无事可做"
         );
         return ExitCode::FAILURE;
     }
@@ -4810,6 +4867,22 @@ fn run_reword(args: RewordArgs) -> ExitCode {
     if new_tags.as_ref().is_some_and(|t| t.is_empty()) {
         eprintln!("reword 失败：--tags 解析后为空（要改标签就写全新的一组，逗号分隔）");
         return ExitCode::FAILURE;
+    }
+    let new_level = match args.level {
+        None => None,
+        Some(s) => match parse_level(s) {
+            Ok(lv) => Some(lv),
+            Err(e) => {
+                eprintln!("reword 失败：{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if let Some(imp) = args.importance {
+        if !(0.0..=1.0).contains(&imp) || !imp.is_finite() {
+            eprintln!("reword 失败：importance={imp} 超出范围 [0,1]");
+            return ExitCode::FAILURE;
+        }
     }
     let Some(project_dbs) = resolve_project_dbs(args.project_db) else {
         return ExitCode::FAILURE;
@@ -4832,6 +4905,25 @@ fn run_reword(args: RewordArgs) -> ExitCode {
         eprintln!("reword 失败：未找到 id {}", args.id);
         return ExitCode::FAILURE;
     };
+
+    if let Some(lv) = new_level {
+        if commands::is_l4(lv) != commands::is_l4(m.level) {
+            eprintln!(
+                "reword 失败：{} 当前为 {}，不可用 reword 跨轨道改到 {}（跨轨道请用 graduate）",
+                args.id,
+                level_repr(m.level),
+                level_repr(lv)
+            );
+            return ExitCode::FAILURE;
+        }
+        m.level = lv;
+    }
+    if let Some(imp) = args.importance {
+        m.importance = imp;
+    }
+    if let Some(pin) = args.pinned {
+        m.pinned = pin;
+    }
 
     let old_cue_chars = m.cue.chars().count();
     if let Some(c) = args.cue {
@@ -4870,13 +4962,15 @@ fn run_reword(args: RewordArgs) -> ExitCode {
 
     warn_long_cue(&m.cue, m.level);
     println!(
-        "reword: {} cue {} → {} 字符；标签 [{}]；使用历史 {} 次、created_at、层级 {} 与状态均保留",
+        "reword: {} cue {} → {} 字符；标签 [{}]；使用历史 {} 次、created_at、层级 {}、imp={:.2}、pinned={} 与状态均保留/已更新",
         args.id,
         old_cue_chars,
         m.cue.chars().count(),
         m.tags.join(","),
         m.access_log.len(),
-        level_repr(m.level)
+        level_repr(m.level),
+        m.importance,
+        m.pinned
     );
     ExitCode::SUCCESS
 }
@@ -6013,6 +6107,7 @@ fn run_doctor(args: DoctorArgs<'_>) -> ExitCode {
     let mut versions: Vec<(String, u32)> = Vec::new();
     let mut bad_rows = 0usize;
     let mut merged: Vec<Memory> = Vec::new();
+    let mut project_mismatches: Vec<health::ProjectMismatch> = Vec::new();
     match (
         store::read_data_version(&gdb),
         store::raw_len(&gdb),
@@ -6028,7 +6123,7 @@ fn run_doctor(args: DoctorArgs<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    // 各项目库同理。
+    // 各项目库同理，并顺手核查库内 L4 条目的 project 字段是否与挂载名对齐。
     for (name, path) in &project_dbs {
         let db = match store::open(path) {
             Ok(d) => d,
@@ -6048,6 +6143,20 @@ fn run_doctor(args: DoctorArgs<'_>) -> ExitCode {
             (Ok(v), Ok(raw), Ok(mut mems)) => {
                 versions.push((name.clone(), v));
                 bad_rows += (raw as usize).saturating_sub(mems.len());
+                let mut mismatch_counts: BTreeMap<String, usize> = BTreeMap::new();
+                for m in &mems {
+                    if commands::is_l4(m.level) && m.project.as_deref() != Some(name.as_str()) {
+                        let stored = m.project.as_deref().unwrap_or("(none)").to_string();
+                        *mismatch_counts.entry(stored).or_insert(0) += 1;
+                    }
+                }
+                for (stored_project, count) in mismatch_counts {
+                    project_mismatches.push(health::ProjectMismatch {
+                        mounted_project: name.clone(),
+                        stored_project,
+                        count,
+                    });
+                }
                 merged.append(&mut mems);
             }
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
@@ -6059,6 +6168,7 @@ fn run_doctor(args: DoctorArgs<'_>) -> ExitCode {
 
     let mut report = health::scan(&merged, &EngramConfig::default(), now);
     report.bad_rows = bad_rows;
+    report.project_mismatches = project_mismatches;
     let min_version = versions
         .iter()
         .map(|(_, v)| *v)
@@ -6193,6 +6303,20 @@ fn print_doctor_text(
         h.orphans.len(),
         fmt_id_tail(&h.orphans)
     );
+
+    if h.project_mismatches.is_empty() {
+        println!("项目名漂移: 0 条");
+    } else {
+        let total_mismatches: usize = h.project_mismatches.iter().map(|m| m.count).sum();
+        println!("⚠ 项目名漂移: {total_mismatches} 条（如目录更名后旧 project 字段未同步）");
+        for m in &h.project_mismatches {
+            println!(
+                "  挂载为 [{}] 的库内有 {} 条记录的 project 字段仍为 [{}]",
+                m.mounted_project, m.count, m.stored_project
+            );
+        }
+        println!("  修法：跑一次 `engram rename-project --project-db <库路径> --to <新项目名>` 对齐归属。");
+    }
 }
 
 /// 把一小串 id 格式化成「（id1, id2, ...）」尾巴，空则返回空串。
@@ -6281,6 +6405,17 @@ fn print_doctor_json(
         .iter()
         .map(|g| serde_json::json!({ "cue": g.cue, "ids": g.ids }))
         .collect();
+    let mismatches: Vec<serde_json::Value> = h
+        .project_mismatches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "mounted_project": m.mounted_project,
+                "stored_project": m.stored_project,
+                "count": m.count,
+            })
+        })
+        .collect();
 
     let obj = serde_json::json!({
         "now": now,
@@ -6298,11 +6433,159 @@ fn print_doctor_json(
         "off_anchor_importance": off_anchor,
         "duplicate_cues": duplicates,
         "orphans": h.orphans,
+        "project_mismatches": mismatches,
     });
     match serde_json::to_string(&obj) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("doctor: 序列化 JSON 失败：{e}"),
     }
+}
+
+/// `rename-project` 命令的全部参数。
+struct RenameProjectArgs<'a> {
+    project_db: &'a Path,
+    to: &'a str,
+    from: Option<&'a str>,
+    general_db: Option<&'a Path>,
+    dry_run: bool,
+}
+
+/// 同步更新 `<general_db 同目录>/projects.json`（或 `~/.engram/projects.json`）里指向同一库文件的项目名。
+///
+/// best-effort：注册表不存在或格式异常时静默跳过，绝不影响主库对齐结果。
+fn sync_projects_registry_name(
+    general_db: Option<&Path>,
+    project_db: &Path,
+    new_name: &str,
+) -> usize {
+    let reg_path = match general_db.and_then(|p| p.parent()).map(Path::to_path_buf) {
+        Some(dir) => dir.join("projects.json"),
+        None => match home_dir(real_env_lookup) {
+            Ok(h) => h.join(ENGRAM_DIR).join("projects.json"),
+            Err(_) => return 0,
+        },
+    };
+    let Ok(text) = std::fs::read_to_string(&reg_path) else {
+        return 0;
+    };
+    let Ok(mut arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return 0;
+    };
+    let target_canon = canonicalize_cwd(project_db);
+    let mut updated = 0usize;
+    for item in &mut arr {
+        let Some(p_str) = item.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if canonicalize_cwd(Path::new(p_str)) == target_canon {
+            let cur_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if cur_name != new_name {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(new_name.to_string()),
+                    );
+                    updated += 1;
+                }
+            }
+        }
+    }
+    if updated > 0 {
+        if let Ok(new_text) = serde_json::to_string_pretty(&arr) {
+            let _ = write_atomic_str(&reg_path, &new_text);
+        }
+    }
+    updated
+}
+
+/// 执行 `rename-project` 子命令：把指定项目库内 L4 记忆的 `project` 字段批量对齐到 `--to`。
+fn run_rename_project(args: RenameProjectArgs<'_>) -> ExitCode {
+    let to_name = args.to.trim();
+    if to_name.is_empty() {
+        eprintln!("rename-project 失败：--to 不能为空");
+        return ExitCode::FAILURE;
+    }
+    if !args.project_db.is_file() {
+        eprintln!(
+            "rename-project 失败：项目库 {} 不存在（拒绝凭空建空库）",
+            args.project_db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let db = match store::open(args.project_db) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "rename-project 失败：打开项目库 {} 失败：{e}",
+                args.project_db.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mems = match store::all(&db) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rename-project 失败：读取项目库失败：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut by_old: BTreeMap<String, usize> = BTreeMap::new();
+    let mut changed: Vec<Memory> = Vec::new();
+    for mut m in mems {
+        if !commands::is_l4(m.level) {
+            continue;
+        }
+        if m.project.as_deref() == Some(to_name) {
+            continue;
+        }
+        if let Some(from_filter) = args.from {
+            if m.project.as_deref() != Some(from_filter) {
+                continue;
+            }
+        }
+        let old_label = m.project.as_deref().unwrap_or("(none)").to_string();
+        *by_old.entry(old_label).or_insert(0) += 1;
+        m.project = Some(to_name.to_string());
+        changed.push(m);
+    }
+
+    if changed.is_empty() {
+        let reg_updated = if args.dry_run {
+            0
+        } else {
+            sync_projects_registry_name(args.general_db, args.project_db, to_name)
+        };
+        println!(
+            "rename-project: 库 {} 内无需修改（所有匹配 L4 条目已对齐到 [{to_name}]；注册表更新 {reg_updated} 项）",
+            args.project_db.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let detail: Vec<String> = by_old.iter().map(|(k, v)| format!("{k}×{v}")).collect();
+    if args.dry_run {
+        println!(
+            "rename-project (dry-run): 将把 {} 内 {} 条 L4 记忆（{}）的 project 对齐到 [{to_name}]",
+            args.project_db.display(),
+            changed.len(),
+            detail.join(", ")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Err(e) = store::put_many(&db, &changed) {
+        eprintln!("rename-project 失败：写回项目库失败：{e}");
+        return ExitCode::FAILURE;
+    }
+    let reg_updated = sync_projects_registry_name(args.general_db, args.project_db, to_name);
+    println!(
+        "rename-project: 已将 {} 内 {} 条 L4 记忆（{}）对齐到 [{to_name}]（保留全部使用历史、层级与状态；注册表更新 {reg_updated} 项）",
+        args.project_db.display(),
+        changed.len(),
+        detail.join(", ")
+    );
+    ExitCode::SUCCESS
 }
 
 /// SessionStart 自动触发迁移（best-effort，绝不阻断热索引注入）。

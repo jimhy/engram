@@ -7828,3 +7828,350 @@ fn without_host_env_behaviour_is_unchanged() {
     cleanup_file(&general_path);
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+// 62. 短指令按需召回：在语料 >= ABSTAIN_MIN_CORPUS (80) 下，短动作指令 "发版"、"发布插件"
+//     在 ThinQuery 时通过标签命中放行到 Hint，而闲聊/确认词 "好的"/"收到"/"继续" 仍完全静默。
+#[test]
+fn prompt_recall_short_action_triggers_hint_while_chitchat_stays_silent() {
+    let _guard = test_guard();
+    let now = 1_000_000_000.0;
+    let mut mems = Vec::new();
+    let mut target = make(
+        "pr_short_release",
+        Level::L3,
+        None,
+        Status::Active,
+        0.72,
+        now,
+        vec![now],
+    );
+    target.cue = "插件发版突然发布不了、当前引擎没有开发者中心接口走 Codex 委托".to_string();
+    target.tags = vec!["发版".to_string(), "插件".to_string(), "release".to_string()];
+    mems.push(target);
+
+    let mut chitchat_hit = make(
+        "pr_chitchat_noise",
+        Level::L3,
+        None,
+        Status::Active,
+        0.5,
+        now,
+        vec![now],
+    );
+    chitchat_hit.cue = "收到反馈后好的继续处理下一步任务".to_string();
+    mems.push(chitchat_hit);
+
+    // 填充到 >= 80 条以激活统计型弃权判据（ABSTAIN_MIN_CORPUS = 80）。
+    for i in 0..85 {
+        let mut f = make(
+            &format!("pr_fill_{i}"),
+            Level::L3,
+            None,
+            Status::Active,
+            0.3,
+            now,
+            vec![now],
+        );
+        f.cue = format!("第{i}条独立工程背景条目 编号{i} 互不重叠");
+        mems.push(f);
+    }
+
+    let general_path = seed_db("pr_short_g", &mems);
+    let g = general_path.to_string_lossy().to_string();
+    let ws = unique_workspace_root("pr_short_ws");
+    std::fs::create_dir_all(&ws).expect("建工作目录");
+
+    for q in ["发版", "发布插件"] {
+        let out = engram_cmd("prompt-recall")
+            .args([
+                "--general-db",
+                &g,
+                "--workspace-root",
+                ws.to_string_lossy().as_ref(),
+                "--prompt",
+                q,
+                "--emit",
+                "text",
+                "--now",
+                "1000000000",
+            ])
+            .output()
+            .expect("运行 prompt-recall 失败");
+        assert!(out.status.success(), "prompt-recall 应 exit 0");
+        let stdout = String::from_utf8(out.stdout).expect("stdout 非 UTF-8");
+        assert!(
+            stdout.contains("【engram】本轮提问可能与按需层记忆有关")
+                && !stdout.contains("【engram 按需记忆】"),
+            "短指令 {q:?} 应放行 Hint 档（非 Full 也非静默），实得：\n{stdout}"
+        );
+    }
+
+    for noise in ["好的", "收到", "继续", "好"] {
+        let out = engram_cmd("prompt-recall")
+            .args([
+                "--general-db",
+                &g,
+                "--workspace-root",
+                ws.to_string_lossy().as_ref(),
+                "--prompt",
+                noise,
+                "--emit",
+                "text",
+                "--now",
+                "1000000000",
+            ])
+            .output()
+            .expect("运行 prompt-recall 失败");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.is_empty(),
+            "闲聊确认词 {noise:?} 必须保持静默，实得：{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    cleanup_file(&general_path);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// 63. reword 原地校准层级与重要度：同轨道校准（如 L4.3 -> L4.2）保留 access_log 与 created_at；
+//     跨轨道修改（L4 -> L2）必须报错拒绝。
+#[test]
+fn reword_calibrates_level_and_importance_in_place_preserving_history() {
+    let _guard = test_guard();
+    let now = 1_795_000_000.0;
+    let created = now - 5.0 * 86400.0;
+    let logs = vec![now - 3.0 * 86400.0, now - 86400.0, now - 3600.0];
+    let mem_src = make(
+        "rw_cal",
+        Level::L4_3,
+        Some("demo"),
+        Status::Active,
+        0.72,
+        created,
+        logs.clone(),
+    );
+    let general_path = seed_db("rw_cal_g", &[]);
+    let proj_path = seed_db("rw_cal_p", &[mem_src]);
+    let g = general_path.to_string_lossy().to_string();
+    let p_kv = format!("demo={}", proj_path.display());
+
+    let out = engram_cmd("reword")
+        .args([
+            "--general-db",
+            &g,
+            "--project-db",
+            &p_kv,
+            "--id",
+            "rw_cal",
+            "--level",
+            "L4.2",
+            "--importance",
+            "0.80",
+        ])
+        .output()
+        .expect("运行 reword 失败");
+    assert!(
+        out.status.success(),
+        "同轨道校准应成功，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pdb = store::open(&proj_path).expect("打开项目库");
+    let got = store::get(&pdb, "rw_cal")
+        .expect("get")
+        .expect("应存在");
+    assert_eq!(got.level, Level::L4_2, "层级应原地升至 L4.2");
+    assert!((got.importance - 0.80).abs() < 1e-9, "重要度应更新为 0.80");
+    assert_eq!(got.access_log, logs, "access_log 必须原样保留");
+    assert!((got.created_at - created).abs() < 1e-6, "created_at 必须原样保留");
+    drop(pdb);
+
+    // 跨轨道（L4.2 -> L2）必须拒绝
+    let bad = engram_cmd("reword")
+        .args([
+            "--general-db",
+            &g,
+            "--project-db",
+            &p_kv,
+            "--id",
+            "rw_cal",
+            "--level",
+            "L2",
+        ])
+        .output()
+        .expect("运行 reword 失败");
+    assert!(!bad.status.success(), "跨轨道改层级必须报错退出");
+
+    cleanup_file(&general_path);
+    cleanup_file(&proj_path);
+}
+
+// 64. rename-project 与 doctor 漂移检测：更名项目库内全状态 L4 条目批量对齐到新项目名，
+//     并同步更新 projects.json；此前 doctor 能报出项目名漂移。
+#[test]
+fn rename_project_aligns_all_statuses_and_doctor_detects_mismatch() {
+    let _guard = test_guard();
+    let now = 1_795_000_000.0;
+    let ws = unique_workspace_root("rp_ws");
+    let general_path = ws.join("general.redb");
+    drop(store::open(&general_path).expect("建公共库"));
+
+    let proj_dir = ws.join("newName");
+    let proj_db = seed_engram_db(
+        &proj_dir,
+        &[
+            make("rp_act", Level::L4_2, Some("oldName"), Status::Active, 0.7, now, vec![now]),
+            make("rp_sup", Level::L4_3, Some("oldName"), Status::Superseded, 0.4, now, vec![]),
+            make("rp_new", Level::L4_2, Some("newName"), Status::Active, 0.7, now, vec![now]),
+        ],
+    );
+    std::fs::write(
+        ws.join("projects.json"),
+        serde_json::to_string_pretty(&vec![serde_json::json!({
+            "name": "oldName",
+            "kind": "project",
+            "path": proj_db.to_string_lossy(),
+        })])
+        .unwrap(),
+    )
+    .expect("写 projects.json");
+
+    let g = general_path.to_string_lossy().to_string();
+    let p_kv = format!("newName={}", proj_db.display());
+
+    // 1. 改名前 doctor 必须报出项目名漂移（2 条 oldName）
+    let doc_before = engram_cmd("doctor")
+        .args(["--general-db", &g, "--project-db", &p_kv, "--json"])
+        .output()
+        .expect("运行 doctor 失败");
+    assert!(doc_before.status.success());
+    let doc_json: serde_json::Value =
+        serde_json::from_slice(&doc_before.stdout).expect("doctor json");
+    let mismatches = doc_json["project_mismatches"].as_array().expect("数组");
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(mismatches[0]["stored_project"], "oldName");
+    assert_eq!(mismatches[0]["count"], 2);
+
+    // 2. dry-run 不改库
+    let dry = engram_cmd("rename-project")
+        .args([
+            "--project-db",
+            proj_db.to_string_lossy().as_ref(),
+            "--to",
+            "newName",
+            "--general-db",
+            &g,
+            "--dry-run",
+        ])
+        .output()
+        .expect("运行 rename-project dry-run 失败");
+    assert!(dry.status.success());
+    assert!(String::from_utf8_lossy(&dry.stdout).contains("2 条"));
+
+    // 3. 正式对齐
+    let apply = engram_cmd("rename-project")
+        .args([
+            "--project-db",
+            proj_db.to_string_lossy().as_ref(),
+            "--to",
+            "newName",
+            "--general-db",
+            &g,
+        ])
+        .output()
+        .expect("运行 rename-project 失败");
+    assert!(
+        apply.status.success(),
+        "rename-project 应成功，stderr={}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    // 4. 验证全部状态均已对齐且 doctor 漂移清零
+    let list_new = run_list(&[
+        "--general-db",
+        &g,
+        "--project-db",
+        &p_kv,
+        "--project",
+        "newName",
+        "--status",
+        "all",
+        "--json",
+    ]);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&list_new).expect("list json");
+    assert_eq!(arr.len(), 3, "active 与 superseded 全部 3 条都应归属 newName");
+
+    let reg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ws.join("projects.json")).unwrap()).unwrap();
+    assert_eq!(reg[0]["name"], "newName", "projects.json 应同步更新为 newName");
+
+    let doc_after = engram_cmd("doctor")
+        .args(["--general-db", &g, "--project-db", &p_kv, "--json"])
+        .output()
+        .expect("运行 doctor 失败");
+    let doc_after_json: serde_json::Value =
+        serde_json::from_slice(&doc_after.stdout).expect("doctor json");
+    assert!(
+        doc_after_json["project_mismatches"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "对齐后不应再有项目名漂移"
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// 65. consolidate-done 遇到不存在/已更名/乱码的 project_db 路径时跳过项目库巩固，绝不凭空建目录或空库。
+#[test]
+fn consolidate_done_skips_missing_project_db_without_creating_dir() {
+    let _guard = test_guard();
+    let ws = unique_workspace_root("cd_missing_pdb");
+    let general_path = ws.join("general.redb");
+    drop(store::open(&general_path).expect("建公共库"));
+
+    let ghost_dir = ws.join("ghost_garbled_dir");
+    let ghost_db = ghost_dir.join(".engram").join("engram.redb");
+    let transcript = ws.join("t.jsonl");
+    std::fs::write(&transcript, "a\nb\n").unwrap();
+    let slice = ws.join("s.slice.jsonl");
+    std::fs::write(&slice, "a\n").unwrap();
+    let pending_path = ws.join("sid.json");
+    let wm_path = ws.join("watermark.json");
+
+    let pending = serde_json::json!({
+        "session_id": "sid",
+        "transcript": transcript.to_string_lossy(),
+        "slice": slice.to_string_lossy(),
+        "start_line": 0,
+        "end_line": 2,
+        "general_db": general_path.to_string_lossy(),
+        "project_db": ghost_db.to_string_lossy(),
+        "project_name": "ghost_garbled_dir",
+        "created_at": 1795000000.0
+    });
+    std::fs::write(&pending_path, serde_json::to_string_pretty(&pending).unwrap()).unwrap();
+
+    let out = engram_cmd("consolidate-done")
+        .args([
+            "--pending",
+            pending_path.to_string_lossy().as_ref(),
+            "--watermark",
+            wm_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("运行 consolidate-done 失败");
+    assert!(
+        out.status.success(),
+        "缺失 project_db 时 consolidate-done 仍应正常收尾，stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ghost_dir.exists(),
+        "缺失的 project_db 绝不能被 store::open 凭空建出目录！"
+    );
+    assert!(!pending_path.exists(), "pending 应已被清理");
+
+    let _ = std::fs::remove_dir_all(&ws);
+}

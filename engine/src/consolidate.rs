@@ -214,22 +214,35 @@ fn is_higher(a: Level, b: Level) -> bool {
     depth(a) < depth(b)
 }
 
-/// 一个作用域分组键：通用记忆用 `None`，项目记忆用其项目名。
+/// 一个作用域分组键：通用普通/用户记忆、通用复盘者常驻记忆、项目记忆。
 ///
-/// 容量统计以此分组——通用层（L1/L2/L3）跨所有 `project==None` 的记忆，
-/// L4 层按各自 `project` 分组，互不影响。
+/// 容量统计以此分组——
+/// - 通用常驻层（`resident = true`，即 L1/L2）按受众拆成两桶：普通记忆（[`ScopeKey::General`]）
+///   与复盘者专用记忆（[`ScopeKey::GeneralReviewer`]，带 `reviewer` 标签）。因为 `hot-index`
+///   对普通会话与复盘者会话是按受众过滤注入的，两类记忆绝不该在同一个 3600 字符预算桶里互挤；
+///   否则几条 `pinned` 的复盘者方法论会把普通会话的高重要度通用铁律全部挤回 L3。
+/// - 通用非常驻层（L3，`resident = false`）不进热索引注入，统一走 [`ScopeKey::General`]。
+/// - L4 层按各自 `project` 分组，互不影响（项目库带 `reviewer` 也是该项目知识，不拆桶）。
 #[derive(PartialEq, Eq, Hash, Clone)]
 enum ScopeKey {
-    /// 通用作用域（L1/L2/L3）。
+    /// 通用作用域（普通会话及非常驻层 L3）。
     General,
+    /// 通用常驻层（L1/L2）里带 `reviewer` 标签的复盘者专用记忆。
+    GeneralReviewer,
     /// 某项目作用域（L4.x）。
     Project(String),
 }
 
-/// 取一条记忆的作用域分组键。
-fn scope_key(m: &Memory) -> ScopeKey {
+/// 取一条记忆在指定层（`resident` 是否为常驻层）上的作用域分组键。
+fn scope_key(m: &Memory, resident: bool) -> ScopeKey {
     match &m.project {
-        None => ScopeKey::General,
+        None => {
+            if resident && m.tags.iter().any(|t| t == crate::render::REVIEWER_TAG) {
+                ScopeKey::GeneralReviewer
+            } else {
+                ScopeKey::General
+            }
+        }
         Some(p) => ScopeKey::Project(p.clone()),
     }
 }
@@ -302,9 +315,10 @@ fn step_overflow(
             if m.status != Status::Active || m.level != level {
                 continue;
             }
-            // BTreeMap 的键用字符串：General 用空串前缀区分，Project 用 "p:" 前缀。
-            let key = match scope_key(m) {
+            // BTreeMap 的键用字符串：General 用 "g:"，GeneralReviewer 用 "g:reviewer"，Project 用 "p:" 前缀。
+            let key = match scope_key(m, tier.resident) {
                 ScopeKey::General => "g:".to_string(),
+                ScopeKey::GeneralReviewer => "g:reviewer".to_string(),
                 ScopeKey::Project(p) => format!("p:{p}"),
             };
             groups.entry(key).or_default().push(i);
@@ -1274,6 +1288,52 @@ mod tests {
                 .iter()
                 .any(|t| t.id == long_b && t.kind == TransitionKind::Overflow),
             "b 的下推应记为 Overflow 变迁"
+        );
+    }
+
+    // 23. 受众隔离：公共 L2 里占满预算的 reviewer 条目不得把普通用户的高重要度条目挤回 L3。
+    #[test]
+    fn general_resident_budget_isolates_reviewer_from_user_entries() {
+        let now = 1_000_000_000.0;
+        let l2_budget = params(Level::L2).char_budget;
+        // 两条 reviewer L2 占满几乎全部 3600 字符预算（每条 ~1750 字符）。
+        // importance=0.85 豁免阈值降级、10 天前访问使 promotion_score < PROMOTE_L1（稳留 L2）。
+        let mut mems = Vec::new();
+        for i in 0..2 {
+            let mut r = make(
+                &format!("rev{i}"),
+                Level::L2,
+                0.85,
+                now - 10.0 * DAY,
+                vec![now - 10.0 * DAY],
+            );
+            r.tags = vec!["engram".to_string(), crate::render::REVIEWER_TAG.to_string()];
+            r.cue = "审".repeat((l2_budget / 2).saturating_sub(80));
+            mems.push(r);
+        }
+        // 一条普通高重要度条目（importance=0.95，当前误在 L3），长度 200 字符。
+        let mut user_rule = make("user_rule", Level::L3, 0.95, now - 2.0 * DAY, vec![now]);
+        user_rule.cue = "规".repeat(200);
+        mems.push(user_rule);
+
+        // 前置：若混在同一桶，reviewer 已占去大部分预算，加 user_rule 必超 L2 char_budget。
+        let combined_cost: usize = mems.iter().map(|m| memory_render_cost(m, true)).sum();
+        assert!(
+            combined_cost > l2_budget,
+            "前置：混合累计成本({combined_cost})应超出 L2 预算({l2_budget})"
+        );
+
+        let _ts = consolidate(&mut mems, now);
+
+        let r0 = mems.iter().find(|m| m.id == "rev0").unwrap();
+        let r1 = mems.iter().find(|m| m.id == "rev1").unwrap();
+        let u = mems.iter().find(|m| m.id == "user_rule").unwrap();
+        assert_eq!(r0.level, Level::L2, "rev0 应在自己的复盘者桶中留在 L2");
+        assert_eq!(r1.level, Level::L2, "rev1 应在自己的复盘者桶中留在 L2");
+        assert_eq!(
+            u.level,
+            Level::L2,
+            "普通高重要度条目应空降并留在普通 L2 桶中，不得被 reviewer 挤回 L3"
         );
     }
 }

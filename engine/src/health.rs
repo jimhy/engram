@@ -46,6 +46,11 @@ pub const FUTURE_SKEW_SECS: f64 = 60.0;
 /// `doctor` / `migrate` 用来标识「通用作用域」的作用域标签（区别于具体项目名）。
 pub const GENERAL_SCOPE_LABEL: &str = "(general)";
 
+/// `doctor` / `migrate` 用来标识「通用常驻层的复盘者专用桶」的作用域标签。
+///
+/// 与 `consolidate::step_overflow` 的 `GeneralReviewer` 分桶保持完全同源。
+pub const GENERAL_REVIEWER_SCOPE_LABEL: &str = "(general:reviewer)";
+
 /// 一层「Active 条目渲染字符累计超出该层字符预算」的报告项（容量治理视角）。
 ///
 /// 解读按层分流（见 [`crate::model::TierParams::char_budget`]）：常驻层
@@ -99,6 +104,17 @@ pub struct DuplicateGroup {
     pub ids: Vec<String>,
 }
 
+/// 一组「项目库内记忆的 `project` 字段与挂载项目名不一致」的报告项（如目录更名遗留）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMismatch {
+    /// `--project-db name=path` 挂载时使用的项目名（预期项目名）。
+    pub mounted_project: String,
+    /// 库内 L4 条目实际存储的 `project` 字段（若缺失则记 `"(none)"`）。
+    pub stored_project: String,
+    /// 该不一致 `stored_project` 的条目数（含全部状态）。
+    pub count: usize,
+}
+
 /// 一批记忆的健康体检结果。字段即 `doctor` 报告的各诊断维度。
 ///
 /// 语义性子集（迁移只标记不改）：[`Self::off_anchor_importance`] /
@@ -137,6 +153,8 @@ pub struct HealthReport {
     /// 孤儿：状态为 `Superseded` 却无 `superseded_by` 后继指针的记忆 id
     /// （已按 id 升序）——「被取代却没记录被谁取代」的不一致。
     pub orphans: Vec<String>,
+    /// 项目库内 L4 条目的 `project` 字段与挂载项目名不一致的分组统计（由 `doctor` 按库填充）。
+    pub project_mismatches: Vec<ProjectMismatch>,
 }
 
 impl HealthReport {
@@ -237,11 +255,17 @@ pub fn scan(mems: &[Memory], cfg: &EngramConfig, now: f64) -> HealthReport {
         if m.status != Status::Active {
             continue;
         }
-        let scope = m
-            .project
-            .clone()
-            .unwrap_or_else(|| GENERAL_SCOPE_LABEL.to_string());
         let tier = cfg.tier(m.level);
+        let scope = match &m.project {
+            Some(p) => p.clone(),
+            None => {
+                if tier.resident && m.tags.iter().any(|t| t == crate::render::REVIEWER_TAG) {
+                    GENERAL_REVIEWER_SCOPE_LABEL.to_string()
+                } else {
+                    GENERAL_SCOPE_LABEL.to_string()
+                }
+            }
+        };
         let cost = memory_render_cost(m, tier.load_full);
         let e = budget_acc
             .entry((scope, level_index(m.level)))
@@ -334,6 +358,7 @@ pub fn scan(mems: &[Memory], cfg: &EngramConfig, now: f64) -> HealthReport {
         off_anchor_importance,
         duplicate_cues,
         orphans,
+        project_mismatches: Vec::new(),
     }
 }
 
@@ -511,5 +536,27 @@ mod tests {
         assert!(rep.dangling_superseded.is_empty());
         assert!(rep.orphans.is_empty());
         assert_eq!(rep.bad_rows, 0);
+    }
+
+    // 9. 公共 L2 受众分桶计算预算：普通条目与 reviewer 条目各自未超 3600 时不误报超预算。
+    #[test]
+    fn split_general_resident_budget_avoids_false_over_budget() {
+        let now = 1_000_000_000.0;
+        let l2_budget = EngramConfig::default().l2.char_budget;
+        let half_len = (l2_budget / 2) + 200; // 单条约占 55% 预算，两条合起来必超 100%
+
+        let mut rev = make("rev", Level::L2, Status::Active, 0.6);
+        rev.tags = vec![crate::render::REVIEWER_TAG.to_string()];
+        rev.cue = "审".repeat(half_len);
+
+        let mut usr = make("usr", Level::L2, Status::Active, 0.6);
+        usr.cue = "用".repeat(half_len);
+
+        let rep = scan(&[rev, usr], &EngramConfig::default(), now);
+        assert!(
+            rep.over_budget_layers.is_empty(),
+            "分桶后各自均未超 L2 预算，不应报超预算：{:?}",
+            rep.over_budget_layers
+        );
     }
 }
